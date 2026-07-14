@@ -1,7 +1,7 @@
 import logging
 
 from hardware.config import HARDWARE
-from hardware.devices.rotation.brushed_stage import RotationStage
+from hardware.devices.rotation.brushed_stageOLD import RotationStage
 
 logging.basicConfig(
     level=logging.INFO,

@@ -1,4 +1,4 @@
-from hardware.devices.base import HardwareDevice
+from hardware.devices.baseOLD import HardwareDevice
 
 
 class Dummy(HardwareDevice):
