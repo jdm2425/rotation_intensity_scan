@@ -40,6 +40,36 @@ class ShutterConfig:
     serial: str
     name: str = "Beam Shutter"
 
+# =============================================================================
+# Shutter timing
+# =============================================================================
+
+@dataclass(frozen=True)
+class ShutterTimingConfig:
+    """
+    Timing parameters for beam shutter operation.
+    """
+
+    open_delay_s: float = 0.10
+
+    close_delay_s: float = 0.02
+
+# =============================================================================
+# Spectrometer
+# =============================================================================
+
+@dataclass(frozen=True)
+class SpectrometerConfig:
+    """
+    Ocean Insight spectrometer configuration.
+    """
+
+    serial: str
+
+    integration_time_ms: float = 10.0
+
+    name: str = "Ocean SR"
+
 
 # =============================================================================
 # Installed hardware
@@ -71,6 +101,12 @@ SHUTTER = ShutterConfig(
     serial="37008491",
 )
 
+SHUTTER_TIMING = ShutterTimingConfig()
+
+SPECTROMETER = SpectrometerConfig(
+    serial="SR600415",
+    integration_time_ms=10.0,
+)
 
 # =============================================================================
 # Motion defaults

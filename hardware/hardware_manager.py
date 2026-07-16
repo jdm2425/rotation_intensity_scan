@@ -18,10 +18,12 @@ from hardware.config import (
     WAVEPLATE,
     SAMPLE_STAGE,
     SHUTTER,
+    SPECTROMETER,
 )
 
 from hardware.devices.rotation import RotationStage
 from hardware.devices.shutter import BeamShutter
+from hardware.devices.spectrometer.ocean_sr import OceanSR
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,11 @@ class HardwareManager:
             name=SHUTTER.name,
         )
 
+        self.spectrometer = OceanSR(
+            serial=SPECTROMETER.serial,
+            integration_time_ms=SPECTROMETER.integration_time_ms,
+        )
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
@@ -86,6 +93,7 @@ class HardwareManager:
         self.waveplate.connect()
         self.sample.connect()
         self.shutter.connect()
+        self.spectrometer.connect()
 
         logger.info("All hardware connected.")
 
@@ -98,6 +106,7 @@ class HardwareManager:
         #
 
         for device in (
+            self.spectrometer,
             self.shutter,
             self.sample,
             self.waveplate,
@@ -138,8 +147,8 @@ class HardwareManager:
             "waveplate": self.waveplate,
             "sample": self.sample,
             "shutter": self.shutter,
+            "spectrometer": self.spectrometer,
         }
-
     # ------------------------------------------------------------------
 
     def info(self):

@@ -1,13 +1,17 @@
 """
 acquisition.py
 
-Safe spectrum acquisition.
+High-level acquisition interface.
 
-This class is responsible for ensuring the laser shutter is only open
-during the spectrometer exposure.
+This class coordinates the spectrometer and beam shutter so that
+experiments never need to manipulate either device directly.
 
-The experiment code should call Acquisition.acquire() rather than
-talking directly to the shutter or spectrometer.
+Safety philosophy
+-----------------
+The beam should remain blocked whenever possible.
+
+The shutter is opened only immediately before acquisition and closed
+immediately afterwards.
 """
 
 from __future__ import annotations
@@ -15,73 +19,177 @@ from __future__ import annotations
 import logging
 import time
 
+from hardware.devices.spectrometer.spectrum import Spectrum
+
 logger = logging.getLogger(__name__)
 
 
 class Acquisition:
     """
-    Safe spectrum acquisition.
+    Coordinates spectrum acquisition.
 
-    Responsibilities
-    ----------------
-    - Open shutter
-    - Wait for shutter to settle
-    - Acquire spectrum
-    - Close shutter immediately
+    Parameters
+    ----------
+    spectrometer
+        Spectrometer driver.
+
+    shutter
+        Beam shutter.
+
+    shutter_delay
+        Delay after opening the shutter before beginning acquisition.
     """
 
     def __init__(
         self,
+        *,
         spectrometer,
         shutter,
-        shutter_delay: float = 0.020,
+        shutter_open_delay: float = 0.10,
+        shutter_close_delay: float = 0.00,
     ):
-        self.spectrometer = spectrometer
-        self.shutter = shutter
-        self.shutter_delay = shutter_delay
 
+        self.spectrometer = spectrometer
+
+        self.shutter = shutter
+
+        #
+        # Delay after opening the shutter before acquisition.
+        #
+        self.shutter_open_delay = float(
+            shutter_open_delay
+        )
+
+        #
+        # Optional delay before closing the shutter after
+        # acquisition has completed.
+        #
+        self.shutter_close_delay = float(
+            shutter_close_delay
+        )
     # ------------------------------------------------------------------
 
-    def acquire(self):
+    def acquire(
+        self,
+        *,
+        averages: int = 1,
+    ) -> Spectrum:
         """
-        Acquire one spectrum safely.
+        Acquire a single illuminated spectrum.
+
+        The shutter is always closed afterwards,
+        even if an exception occurs.
         """
 
-        logger.info("Opening shutter...")
+        logger.debug("Opening shutter.")
 
         self.shutter.open()
 
         try:
 
             #
-            # Allow shutter blades to finish moving.
+            # Allow the shutter to finish moving.
             #
 
-            time.sleep(self.shutter_delay)
+            if self.shutter_open_delay > 0:
 
-            logger.info("Acquiring spectrum...")
+                time.sleep(
+                    self.shutter_open_delay
+                )
 
-            spectrum = self.spectrometer.acquire()
+            spectrum = self.spectrometer.acquire(
+                averages=averages,
+            )
 
-            logger.info("Spectrum acquired.")
+            #
+            # Optional hold time before closing.
+            #
+
+            if self.shutter_close_delay > 0:
+
+                time.sleep(
+                    self.shutter_close_delay
+                )
 
             return spectrum
 
         finally:
 
-            logger.info("Closing shutter...")
+            logger.debug("Closing shutter.")
 
             self.shutter.close()
-
     # ------------------------------------------------------------------
 
-    def dark(self):
+    def acquire_dark(
+        self,
+        *,
+        averages: int = 1,
+    ) -> Spectrum:
         """
         Acquire a dark spectrum.
 
-        The shutter remains closed.
+        The shutter is forced closed before acquisition.
         """
 
-        logger.info("Acquiring dark spectrum...")
+        self.shutter.close()
 
-        return self.spectrometer.acquire()
+        return self.spectrometer.acquire(
+            averages=averages,
+        )
+
+    # ------------------------------------------------------------------
+
+    def acquire_pair(
+        self,
+        *,
+        averages: int = 1,
+    ):
+        """
+        Acquire both a dark and illuminated spectrum.
+
+        Returns
+        -------
+        (dark, light)
+        """
+
+        dark = self.acquire_dark(
+            averages=averages,
+        )
+
+        light = self.acquire(
+            averages=averages,
+        )
+
+        return dark, light
+
+    # ------------------------------------------------------------------
+
+    def acquire_background_corrected(
+        self,
+        *,
+        averages: int = 1,
+    ) -> Spectrum:
+        """
+        Acquire a dark spectrum followed by an illuminated spectrum.
+
+        Returns a new background-subtracted Spectrum.
+        """
+
+        dark, light = self.acquire_pair(
+            averages=averages,
+        )
+
+        corrected = light.copy()
+
+        corrected.intensities -= dark.intensities
+
+        return corrected
+
+    # ------------------------------------------------------------------
+
+    def __repr__(self):
+
+        return (
+            "<Acquisition "
+            f"{self.spectrometer.serial}>"
+        )

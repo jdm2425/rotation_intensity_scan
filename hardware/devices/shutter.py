@@ -23,7 +23,7 @@ import logging
 import time
 import warnings
 
-from hardware.devices.baseOLD import HardwareDevice, HardwareError
+from hardware.devices.base import HardwareDevice, HardwareError
 
 logger = logging.getLogger(__name__)
 

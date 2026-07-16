@@ -3,66 +3,33 @@ rotation_intensity_scan.py
 
 Core rotation + intensity experiment.
 
-This class coordinates the hardware required to perform a complete
-measurement.
+This class defines what a single measurement is.
 
-No file saving or analysis is performed here; the experiment simply
-returns the acquired data.
+It does not connect hardware, save data or perform analysis.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+
+from analysis.measurement import Measurement
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Result
-# =============================================================================
-
-@dataclass(slots=True)
-class RotationIntensityResult:
-    """
-    Result from a single measurement.
-    """
-
-    timestamp: float
-
-    waveplate_angle_deg: float
-
-    sample_angle_deg: float
-
-    spectrum: object
-
-
-# =============================================================================
-# Experiment
-# =============================================================================
 
 class RotationIntensityExperiment:
     """
     Rotation + intensity experiment.
 
-    Parameters
-    ----------
-    hardware
-        HardwareManager instance.
-
-    acquisition
-        Acquisition object.
+    Hardware and acquisition are supplied by the
+    ExperimentController immediately before the scan begins.
     """
 
-    def __init__(
-        self,
-        hardware,
-        acquisition,
-    ):
+    def __init__(self):
 
-        self.hw = hardware
-        self.acquisition = acquisition
+        self.hardware = None
+        self.acquisition = None
 
     # ------------------------------------------------------------------
 
@@ -71,10 +38,20 @@ class RotationIntensityExperiment:
         *,
         waveplate_angle: float,
         sample_angle: float,
-    ) -> RotationIntensityResult:
+    ) -> Measurement:
         """
         Perform one complete measurement.
         """
+
+        if self.hardware is None:
+            raise RuntimeError(
+                "Hardware has not been attached."
+            )
+
+        if self.acquisition is None:
+            raise RuntimeError(
+                "Acquisition has not been attached."
+            )
 
         logger.info(
             "Measurement: waveplate %.3f°, sample %.3f°",
@@ -83,18 +60,14 @@ class RotationIntensityExperiment:
         )
 
         #
-        # Move waveplate first.
+        # Move hardware.
         #
 
-        self.hw.waveplate.move_to(
+        self.hardware.waveplate.move_to(
             waveplate_angle
         )
 
-        #
-        # Then rotate sample.
-        #
-
-        self.hw.sample.move_to(
+        self.hardware.sample.move_to(
             sample_angle
         )
 
@@ -104,12 +77,24 @@ class RotationIntensityExperiment:
 
         spectrum = self.acquisition.acquire()
 
-        return RotationIntensityResult(
+        #
+        # Build measurement.
+        #
+
+        measurement = Measurement(
             timestamp=time.time(),
             waveplate_angle_deg=waveplate_angle,
             sample_angle_deg=sample_angle,
             spectrum=spectrum,
         )
+
+        #
+        # Compute simple statistics immediately.
+        #
+
+        measurement.compute_statistics()
+
+        return measurement
 
     # ------------------------------------------------------------------
 
@@ -118,8 +103,15 @@ class RotationIntensityExperiment:
         Home both stages.
         """
 
-        logger.info("Homing rotation stages...")
+        if self.hardware is None:
+            raise RuntimeError(
+                "Hardware has not been attached."
+            )
 
-        self.hw.waveplate.home()
+        logger.info(
+            "Homing rotation stages..."
+        )
 
-        self.hw.sample.home()
+        self.hardware.waveplate.home()
+
+        self.hardware.sample.home()
