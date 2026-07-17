@@ -1,19 +1,19 @@
 """
 data_writer.py
 
-Handles writing experiment data to disk.
+Writes complete experiments to disk.
 
 Directory structure
 -------------------
 
-experiment_folder/
+Experiment_YYYYMMDD_HHMMSS/
 
     metadata.json
-
+    config.json
+    hardware.json
     measurements.csv
 
     spectra/
-
         spectrum_000001.npz
         spectrum_000002.npz
         ...
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -31,34 +30,39 @@ import numpy as np
 
 
 class DataWriter:
-    """
-    Writes experiment data.
-
-    One DataWriter corresponds to one experiment.
-    """
-
-    # ------------------------------------------------------------------
 
     def __init__(
         self,
-        output_directory="data",
-        experiment_name="rotation_intensity_scan",
+        *,
+        output_directory: str,
+        experiment_name: str,
     ):
 
+        self.output_directory = Path(output_directory)
+
         timestamp = datetime.now().strftime(
-            "%Y-%m-%d_%H-%M-%S"
+            "%Y%m%d_%H%M%S"
         )
 
-        self.directory = (
-            Path(output_directory)
-            / f"{timestamp}_{experiment_name}"
+        self.root = (
+            self.output_directory
+            / f"{experiment_name}_{timestamp}"
         )
 
         self.spectra_directory = (
-            self.directory / "spectra"
+            self.root / "spectra"
         )
 
-        self.directory.mkdir(
+        self._measurement_number = 0
+
+        self._csv = None
+        self._writer = None
+
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+
+        self.root.mkdir(
             parents=True,
             exist_ok=True,
         )
@@ -67,116 +71,204 @@ class DataWriter:
             exist_ok=True,
         )
 
-        self.csv_file = open(
-            self.directory / "measurements.csv",
+        self._csv = open(
+            self.root / "measurements.csv",
             "w",
             newline="",
+            encoding="utf-8",
         )
 
-        self.writer = csv.writer(self.csv_file)
+        fieldnames = [
 
-        self.writer.writerow(
-            [
-                "measurement",
-                "timestamp",
-                "waveplate_angle_deg",
-                "sample_angle_deg",
-                "spectrum_file",
-            ]
+            "measurement",
+
+            "timestamp",
+
+            "sample_angle_deg",
+
+            "waveplate_angle_deg",
+
+            "power_mw",
+
+            "fluence_mj_cm2",
+
+            "intensity_w_cm2",
+
+            "integration_time_ms",
+
+            "peak_counts",
+
+            "integrated_counts",
+
+            "spectrum_file",
+
+        ]
+
+        self._writer = csv.DictWriter(
+            self._csv,
+            fieldnames=fieldnames,
         )
 
-        self.measurement_number = 0
+        self._writer.writeheader()
+
+        return self
+
+    # ------------------------------------------------------------------
+
+    def __exit__(
+        self,
+        exc_type,
+        exc,
+        tb,
+    ):
+
+        if self._csv is not None:
+
+            self._csv.close()
+
+        return False
+
+    # ------------------------------------------------------------------
+
+    @property
+    def experiment_directory(self):
+
+        return self.root
 
     # ------------------------------------------------------------------
 
     def save_metadata(
         self,
+        *,
         config,
         hardware_info,
     ):
-        """
-        Save experiment metadata.
-        """
 
-        if is_dataclass(config):
+        metadata = {
+
+            "experiment_name":
+                self.root.name,
+
+            "created":
+                datetime.now().isoformat(),
+
+            "software":
+
+                "Rotation Intensity Scan",
+
+        }
+
+        self._write_json(
+            "metadata.json",
+            metadata,
+        )
+
+        self._write_json(
+            "hardware.json",
+            hardware_info,
+        )
+
+        #
+        # Config may be a dataclass.
+        #
+
+        try:
+
+            from dataclasses import asdict
 
             config = asdict(config)
 
-        metadata = {
-            "created": datetime.now().isoformat(),
-            "config": config,
-            "hardware": hardware_info,
-        }
+        except Exception:
 
-        with open(
-            self.directory / "metadata.json",
-            "w",
-        ) as f:
+            pass
 
-            json.dump(
-                metadata,
-                f,
-                indent=4,
-                default=str,
-            )
+        self._write_json(
+            "config.json",
+            config,
+        )
 
     # ------------------------------------------------------------------
 
     def save_result(
         self,
-        result,
+        measurement,
     ):
-        """
-        Save one experiment result.
-        """
 
-        self.measurement_number += 1
+        self._measurement_number += 1
 
         filename = (
-            f"spectrum_{self.measurement_number:06d}.npz"
-        )
-
-        filepath = (
-            self.spectra_directory / filename
+            f"spectrum_"
+            f"{self._measurement_number:06d}.npz"
         )
 
         np.savez_compressed(
-            filepath,
-            wavelengths=result.spectrum.wavelengths,
-            intensities=result.spectrum.intensities,
+
+            self.spectra_directory / filename,
+
+            wavelengths=
+                measurement.wavelengths_nm,
+
+            intensities=
+                measurement.spectrum,
+
         )
 
-        self.writer.writerow(
-            [
-                self.measurement_number,
-                result.timestamp,
-                result.waveplate_angle_deg,
-                result.sample_angle_deg,
+        self._writer.writerow({
+
+            "measurement":
+                self._measurement_number,
+
+            "timestamp":
+                measurement.timestamp,
+
+            "sample_angle_deg":
+                measurement.sample_angle_deg,
+
+            "waveplate_angle_deg":
+                measurement.waveplate_angle_deg,
+
+            "power_mw":
+                measurement.power_mw,
+
+            "fluence_mj_cm2":
+                measurement.fluence_mj_cm2,
+
+            "intensity_w_cm2":
+                measurement.intensity_w_cm2,
+
+            "integration_time_ms":
+                measurement.integration_time_ms,
+
+            "peak_counts":
+                measurement.peak_counts,
+
+            "integrated_counts":
+                measurement.integrated_counts,
+
+            "spectrum_file":
                 filename,
-            ]
-        )
 
-        self.csv_file.flush()
+        })
 
-    # ------------------------------------------------------------------
-
-    def close(self):
-
-        self.csv_file.close()
+        self._csv.flush()
 
     # ------------------------------------------------------------------
 
-    def __enter__(self):
-
-        return self
-
-    def __exit__(
+    def _write_json(
         self,
-        exc_type,
-        exc_val,
-        exc_tb,
+        filename,
+        data,
     ):
 
-        self.close()
+        with open(
+            self.root / filename,
+            "w",
+            encoding="utf-8",
+        ) as f:
 
-        return False
+            json.dump(
+                data,
+                f,
+                indent=4,
+                default=str,
+            )

@@ -73,7 +73,7 @@ class SavingConfig:
     Output settings.
     """
 
-    output_directory: Path = Path("data")
+    output_directory: Path = Path("results")
 
     experiment_name: str = "rotation_intensity_scan"
 
