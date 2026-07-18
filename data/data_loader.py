@@ -1,238 +1,631 @@
 """
 data_loader.py
 
-Load a previously saved experiment from disk.
+Load experiments previously written by DataWriter.
 
-The loader reconstructs an ExperimentDataset, including every
-Measurement and associated spectrum.
+The loader reconstructs the project's canonical object hierarchy:
+
+    ExperimentDataset
+        └── Measurement
+                └── Spectrum
+
+NumPy files are loaded with allow_pickle=False so experiment data never
+depends on unsafe Python object deserialization.
 """
 
 from __future__ import annotations
 
+import csv
 import json
-from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-from data.experiment_dataset import ExperimentDataset
 from analysis.measurement import Measurement
+from data.experiment_dataset import ExperimentDataset
+from hardware.devices.spectrometer.spectrum import Spectrum
 
 
 class DataLoader:
     """
-    Load experiments from disk.
+    Load a complete saved experiment.
     """
 
     def load(
         self,
-        directory: str | Path,
+        experiment_directory: str | Path,
     ) -> ExperimentDataset:
+        """
+        Load an experiment directory.
 
-        root = Path(directory)
+        Parameters
+        ----------
+        experiment_directory
+            Directory containing metadata.json, measurements.csv,
+            and the spectra directory.
+
+        Returns
+        -------
+        ExperimentDataset
+            Fully reconstructed experiment.
+        """
+
+        root = Path(
+            experiment_directory
+        ).expanduser().resolve()
 
         if not root.exists():
-            raise FileNotFoundError(root)
+            raise FileNotFoundError(
+                f"Experiment directory does not exist: {root}"
+            )
 
-        #
-        # ------------------------------------------------------------------
-        # Metadata
-        # ------------------------------------------------------------------
-        #
+        if not root.is_dir():
+            raise NotADirectoryError(
+                f"Experiment path is not a directory: {root}"
+            )
 
-        metadata = self._load_json(
-            root / "metadata.json",
-            default={},
+        measurements_file = (
+            root / "measurements.csv"
         )
 
-        config = self._load_json(
-            root / "config.json",
-            default={},
+        if not measurements_file.exists():
+            raise FileNotFoundError(
+                "Could not find measurements.csv in "
+                f"experiment directory: {root}"
+            )
+
+        metadata = self._read_optional_json(
+            root / "metadata.json"
         )
 
-        hardware = self._load_json(
-            root / "hardware.json",
-            default={},
+        config = self._read_optional_json(
+            root / "config.json"
         )
 
-        dataset = ExperimentDataset(
+        hardware = self._read_optional_json(
+            root / "hardware.json"
+        )
 
+        measurements = self._load_measurements(
             root=root,
+            measurements_file=measurements_file,
+        )
 
-            experiment_name=metadata.get(
+        experiment_name = str(
+            metadata.get(
                 "experiment_name",
                 root.name,
-            ),
-
-            created=metadata.get(
-                "created",
-                datetime.fromtimestamp(
-                    root.stat().st_mtime
-                ).isoformat(),
-            ),
-
-            metadata=metadata,
-
-            config=config,
-
-            hardware=hardware,
+            )
         )
 
-        #
-        # ------------------------------------------------------------------
-        # Measurements
-        # ------------------------------------------------------------------
-        #
+        created = str(
+            metadata.get(
+                "created",
+                "",
+            )
+        )
 
-        csv_file = root / "measurements.csv"
+        return ExperimentDataset(
+            root=root,
+            experiment_name=experiment_name,
+            created=created,
+            config=config,
+            hardware=hardware,
+            metadata=metadata,
+            measurements=measurements,
+        )
 
-        if not csv_file.exists():
+    # ------------------------------------------------------------------
+    # Measurement loading
+    # ------------------------------------------------------------------
 
-            return dataset
+    def _load_measurements(
+        self,
+        *,
+        root: Path,
+        measurements_file: Path,
+    ) -> list[Measurement]:
+        """
+        Load every measurement listed in measurements.csv.
+        """
 
-        spectra_directory = root / "spectra"
+        measurements: list[Measurement] = []
 
-        import csv
-
-        with csv_file.open(
+        with measurements_file.open(
+            "r",
             newline="",
             encoding="utf-8",
-        ) as f:
+        ) as file:
 
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(file)
 
-            for row in reader:
-
-                wavelengths = None
-                spectrum = None
-
-                filename = row.get(
-                    "spectrum_file",
-                    "",
+            if reader.fieldnames is None:
+                raise ValueError(
+                    f"CSV file has no header: {measurements_file}"
                 )
 
-                if filename:
+            for row_number, row in enumerate(
+                reader,
+                start=2,
+            ):
 
-                    spectrum_path = (
-                        spectra_directory
-                        / filename
+                measurement = self._load_measurement(
+                    root=root,
+                    row=row,
+                    row_number=row_number,
+                )
+
+                measurements.append(measurement)
+
+        return measurements
+
+    def _load_measurement(
+        self,
+        *,
+        root: Path,
+        row: dict[str, str],
+        row_number: int,
+    ) -> Measurement:
+        """
+        Reconstruct one Measurement from its CSV row and NPZ file.
+        """
+
+        spectrum_filename = (
+            row.get("spectrum_file", "").strip()
+        )
+
+        if not spectrum_filename:
+            raise ValueError(
+                "Missing spectrum_file value in "
+                f"measurements.csv row {row_number}."
+            )
+
+        spectrum_path = self._resolve_spectrum_path(
+            root=root,
+            filename=spectrum_filename,
+        )
+
+        spectrum = self._load_spectrum(
+            path=spectrum_path,
+            row=row,
+        )
+
+        measurement = Measurement(
+            timestamp=self._required_float(
+                row,
+                "timestamp",
+                row_number,
+            ),
+            waveplate_angle_deg=self._required_float(
+                row,
+                "waveplate_angle_deg",
+                row_number,
+            ),
+            sample_angle_deg=self._required_float(
+                row,
+                "sample_angle_deg",
+                row_number,
+            ),
+            power_mw=self._optional_float(
+                row.get("power_mw")
+            ),
+            fluence_mj_cm2=self._optional_float(
+                row.get("fluence_mj_cm2")
+            ),
+            intensity_w_cm2=self._optional_float(
+                row.get("intensity_w_cm2")
+            ),
+            spectrum=spectrum,
+            peak_counts=self._optional_float(
+                row.get("peak_counts")
+            ),
+            integrated_counts=self._optional_float(
+                row.get("integrated_counts")
+            ),
+            saturated=self._parse_bool(
+                row.get("saturated"),
+                default=False,
+            ),
+        )
+
+        # Older datasets may not contain the derived statistics.
+        # Recalculate them when either value is absent.
+        if (
+            measurement.peak_counts is None
+            or measurement.integrated_counts is None
+        ):
+            measurement.compute_statistics()
+
+        return measurement
+
+    # ------------------------------------------------------------------
+    # Spectrum loading
+    # ------------------------------------------------------------------
+
+    def _load_spectrum(
+        self,
+        *,
+        path: Path,
+        row: dict[str, str],
+    ) -> Spectrum:
+        """
+        Reconstruct a Spectrum from one compressed NumPy file.
+        """
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Spectrum file does not exist: {path}"
+            )
+
+        try:
+            with np.load(
+                path,
+                allow_pickle=False,
+            ) as arrays:
+
+                wavelengths = self._required_array(
+                    arrays,
+                    "wavelengths",
+                    path,
+                )
+
+                intensities = self._required_array(
+                    arrays,
+                    "intensities",
+                    path,
+                )
+
+                if wavelengths.ndim != 1:
+                    raise ValueError(
+                        "Wavelength data must be one-dimensional "
+                        f"in {path}."
                     )
 
-                    if spectrum_path.exists():
+                if intensities.ndim != 1:
+                    raise ValueError(
+                        "Intensity data must be one-dimensional "
+                        f"in {path}."
+                    )
 
-                        arrays = np.load(
-                            spectrum_path
-                        )
+                if wavelengths.shape != intensities.shape:
+                    raise ValueError(
+                        "Wavelength and intensity arrays have "
+                        f"different shapes in {path}: "
+                        f"{wavelengths.shape} and "
+                        f"{intensities.shape}."
+                    )
 
-                        wavelengths = arrays[
-                            "wavelengths"
-                        ]
-
-                        spectrum = arrays[
-                            "intensities"
-                        ]
-
-                measurement = Measurement(
-
-                    timestamp=float(
-                        row.get(
-                            "timestamp",
-                            0.0,
-                        )
-                    ),
-
-                    waveplate_angle_deg=float(
-                        row.get(
-                            "waveplate_angle_deg",
-                            0.0,
-                        )
-                    ),
-
-                    sample_angle_deg=float(
-                        row.get(
-                            "sample_angle_deg",
-                            0.0,
-                        )
-                    ),
-
-                    power_mw=self._optional_float(
-                        row.get("power_mw")
-                    ),
-
-                    fluence_mj_cm2=self._optional_float(
-                        row.get(
-                            "fluence_mj_cm2"
-                        )
-                    ),
-
-                    intensity_w_cm2=self._optional_float(
-                        row.get(
-                            "intensity_w_cm2"
-                        )
-                    ),
-
-                    integration_time_ms=self._optional_float(
-                        row.get(
-                            "integration_time_ms"
-                        )
-                    ),
-
-                    wavelengths_nm=wavelengths,
-
-                    spectrum=spectrum,
+                integration_time_ms = float(
+                    self._npz_scalar(
+                        arrays,
+                        "integration_time_ms",
+                        self._optional_float(
+                            row.get("integration_time_ms")
+                        ),
+                    )
                 )
 
-                measurement.compute_statistics()
-
-                dataset.add(
-                    measurement
+                serial = str(
+                    self._npz_scalar(
+                        arrays,
+                        "serial",
+                        row.get(
+                            "spectrometer_serial",
+                            "",
+                        ),
+                    )
                 )
 
-        return dataset
+                averages = int(
+                    self._npz_scalar(
+                        arrays,
+                        "averages",
+                        self._optional_int(
+                            row.get("averages"),
+                            default=1,
+                        ),
+                    )
+                )
 
+                dark_corrected = self._parse_bool(
+                    self._npz_scalar(
+                        arrays,
+                        "dark_corrected",
+                        row.get("dark_corrected"),
+                    ),
+                    default=False,
+                )
+
+                nonlinearity_corrected = self._parse_bool(
+                    self._npz_scalar(
+                        arrays,
+                        "nonlinearity_corrected",
+                        row.get(
+                            "nonlinearity_corrected"
+                        ),
+                    ),
+                    default=False,
+                )
+
+                spectrum_timestamp = self._optional_float(
+                    self._npz_scalar(
+                        arrays,
+                        "timestamp",
+                        None,
+                    )
+                )
+
+        except ValueError as error:
+            if "Object arrays cannot be loaded" in str(error):
+                raise ValueError(
+                    f"{path} contains a Python object array. "
+                    "It was probably created by the older "
+                    "DataWriter that saved the Spectrum object "
+                    "instead of its numerical arrays."
+                ) from error
+
+            raise
+
+        spectrum = Spectrum(
+            wavelengths=wavelengths,
+            intensities=intensities,
+            integration_time_ms=integration_time_ms,
+            serial=serial,
+            averages=averages,
+            dark_corrected=dark_corrected,
+            nonlinearity_corrected=(
+                nonlinearity_corrected
+            ),
+        )
+
+        # Preserve the spectrum acquisition timestamp when the
+        # Spectrum implementation allows it to be updated.
+        if (
+            spectrum_timestamp is not None
+            and hasattr(spectrum, "timestamp")
+        ):
+            try:
+                spectrum.timestamp = spectrum_timestamp
+            except (AttributeError, TypeError):
+                pass
+
+        return spectrum
+
+    # ------------------------------------------------------------------
+    # Path helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_json(
-        filename: Path,
+    def _resolve_spectrum_path(
         *,
-        default,
-    ):
+        root: Path,
+        filename: str,
+    ) -> Path:
+        """
+        Resolve either a bare filename or an experiment-relative path.
+        """
 
-        if not filename.exists():
+        relative_path = Path(filename)
 
-            return default
+        if relative_path.is_absolute():
+            return relative_path
 
-        with filename.open(
+        if (
+            relative_path.parts
+            and relative_path.parts[0] == "spectra"
+        ):
+            return root / relative_path
+
+        return root / "spectra" / relative_path
+
+    # ------------------------------------------------------------------
+    # JSON helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_optional_json(
+        path: Path,
+    ) -> dict[str, Any]:
+        """
+        Read a JSON dictionary, returning an empty dictionary
+        when the file is absent.
+        """
+
+        if not path.exists():
+            return {}
+
+        with path.open(
             "r",
             encoding="utf-8",
-        ) as f:
+        ) as file:
 
-            return json.load(f)
+            data = json.load(file)
 
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Expected a JSON object in {path}."
+            )
+
+        return data
+
+    # ------------------------------------------------------------------
+    # NumPy helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _optional_float(value):
+    def _required_array(
+        arrays,
+        key: str,
+        path: Path,
+    ) -> np.ndarray:
+        """
+        Read a required one-dimensional numeric array.
+        """
 
-        if value in (
-            None,
-            "",
-        ):
+        if key not in arrays.files:
+            raise KeyError(
+                f"Missing '{key}' array in {path}."
+            )
 
+        return np.asarray(
+            arrays[key],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _npz_scalar(
+        arrays,
+        key: str,
+        default,
+    ):
+        """
+        Read a scalar value from an NPZ archive.
+        """
+
+        if key not in arrays.files:
+            return default
+
+        value = np.asarray(
+            arrays[key]
+        )
+
+        if value.size == 0:
+            return default
+
+        return value.reshape(-1)[0].item()
+
+    # ------------------------------------------------------------------
+    # CSV conversion helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _required_float(
+        cls,
+        row: dict[str, str],
+        key: str,
+        row_number: int,
+    ) -> float:
+        """
+        Read a required floating-point value from a CSV row.
+        """
+
+        value = cls._optional_float(
+            row.get(key)
+        )
+
+        if value is None:
+            raise ValueError(
+                f"Missing or invalid '{key}' value in "
+                f"measurements.csv row {row_number}."
+            )
+
+        return value
+
+    @staticmethod
+    def _optional_float(
+        value,
+    ) -> float | None:
+        """
+        Convert an optional value to float.
+        """
+
+        if value is None:
             return None
+
+        if isinstance(value, str):
+            value = value.strip()
+
+            if value.lower() in {
+                "",
+                "none",
+                "null",
+                "nan",
+            }:
+                return None
 
         return float(value)
 
+    @staticmethod
+    def _optional_int(
+        value,
+        *,
+        default: int,
+    ) -> int:
+        """
+        Convert an optional value to int.
+        """
 
-#
-# Convenience function
-#
+        if value is None:
+            return default
+
+        if isinstance(value, str):
+            value = value.strip()
+
+            if value.lower() in {
+                "",
+                "none",
+                "null",
+                "nan",
+            }:
+                return default
+
+        return int(value)
+
+    @staticmethod
+    def _parse_bool(
+        value,
+        *,
+        default: bool,
+    ) -> bool:
+        """
+        Convert common boolean representations.
+        """
+
+        if value is None:
+            return default
+
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+
+        if isinstance(value, (int, np.integer)):
+            return bool(value)
+
+        text = str(value).strip().lower()
+
+        if text in {
+            "true",
+            "1",
+            "yes",
+            "y",
+            "on",
+        }:
+            return True
+
+        if text in {
+            "false",
+            "0",
+            "no",
+            "n",
+            "off",
+            "",
+            "none",
+            "null",
+        }:
+            return False
+
+        raise ValueError(
+            f"Cannot interpret boolean value: {value!r}"
+        )
+
 
 def load_experiment(
-    directory: str | Path,
+    experiment_directory: str | Path,
 ) -> ExperimentDataset:
+    """
+    Convenience function for loading one experiment.
+    """
 
     return DataLoader().load(
-        directory
+        experiment_directory
     )

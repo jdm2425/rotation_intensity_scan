@@ -1,51 +1,177 @@
+"""
+test_round_trip.py
+
+Verify that measurements can be saved and loaded again without
+losing spectrum data or metadata.
+"""
+
+from __future__ import annotations
+
+import shutil
+import tempfile
+from pathlib import Path
+
 import numpy as np
 
-from hardware.devices.spectrometer.spectrum import Spectrum
 from analysis.measurement import Measurement
+from data.data_loader import load_experiment
+from data.data_writer import DataWriter
+from hardware.devices.spectrometer.spectrum import Spectrum
 
 
 def create_fake_measurement(index: int) -> Measurement:
     """
-    Create a fake measurement for round-trip testing.
+    Create deterministic synthetic data for persistence testing.
+
+    Fake data are used so this test does not require laboratory hardware.
     """
 
     wavelengths = np.linspace(
-        200,
-        900,
+        200.0,
+        900.0,
         2048,
     )
 
     intensities = (
-        np.random.random(2048) * 4000
-        + index * 100
+        5000.0
+        + index * 100.0
+        + 1000.0 * np.sin(wavelengths / 20.0)
     )
 
     spectrum = Spectrum(
         wavelengths=wavelengths,
         intensities=intensities,
         integration_time_ms=10.0,
-        serial="SR600415",
-        averages=1,
+        serial="TEST-SPECTROMETER",
+        averages=2,
         dark_corrected=False,
         nonlinearity_corrected=False,
     )
 
     measurement = Measurement(
         timestamp=float(index),
-
         waveplate_angle_deg=index * 5.0,
-
         sample_angle_deg=index * 10.0,
-
-        power_mw=100.0,
-
+        power_mw=100.0 + index,
         fluence_mj_cm2=0.25,
-
         intensity_w_cm2=1.2e8,
-
         spectrum=spectrum,
     )
 
     measurement.compute_statistics()
 
     return measurement
+
+
+def main() -> None:
+
+    print()
+    print("=" * 60)
+    print("Round-trip save/load test")
+    print("=" * 60)
+
+    temporary_root = Path(
+        tempfile.mkdtemp(
+            prefix="rotation_intensity_round_trip_"
+        )
+    )
+
+    try:
+
+        originals: list[Measurement] = []
+
+        with DataWriter(
+            output_directory=temporary_root,
+            experiment_name="RoundTripTest",
+        ) as writer:
+
+            writer.save_metadata(
+                config={"test": True},
+                hardware_info={
+                    "spectrometer": {
+                        "serial": "TEST-SPECTROMETER",
+                    }
+                },
+            )
+
+            for index in range(5):
+
+                measurement = create_fake_measurement(index)
+
+                originals.append(measurement)
+
+                writer.save_result(measurement)
+
+            experiment_directory = writer.experiment_directory
+
+        print(f"Saved to: {experiment_directory}")
+
+        dataset = load_experiment(
+            experiment_directory
+        )
+
+        print(f"Loaded {len(dataset)} measurements.")
+
+        assert len(dataset) == len(originals)
+
+        for index, (original, loaded) in enumerate(
+            zip(originals, dataset.measurements),
+            start=1,
+        ):
+
+            assert loaded.spectrum is not None
+
+            assert np.allclose(
+                original.spectrum.wavelengths,
+                loaded.spectrum.wavelengths,
+            )
+
+            assert np.allclose(
+                original.spectrum.intensities,
+                loaded.spectrum.intensities,
+            )
+
+            assert (
+                original.waveplate_angle_deg
+                == loaded.waveplate_angle_deg
+            )
+
+            assert (
+                original.sample_angle_deg
+                == loaded.sample_angle_deg
+            )
+
+            assert (
+                original.integration_time_ms
+                == loaded.integration_time_ms
+            )
+
+            assert original.averages == loaded.averages
+
+            assert np.isclose(
+                original.peak_counts,
+                loaded.peak_counts,
+            )
+
+            assert np.isclose(
+                original.integrated_counts,
+                loaded.integrated_counts,
+            )
+
+            print(f"Measurement {index}: OK")
+
+        print()
+        print("=" * 60)
+        print("ROUND-TRIP TEST PASSED")
+        print("=" * 60)
+
+    finally:
+
+        shutil.rmtree(
+            temporary_root,
+            ignore_errors=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
