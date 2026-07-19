@@ -227,6 +227,10 @@ class DataLoader:
                 row.get("saturated"),
                 default=False,
             ),
+            metadata=self._parse_metadata(
+                row.get("measurement_metadata"),
+                row_number=row_number,
+            ),
         )
 
         # Older datasets may not contain the derived statistics.
@@ -617,6 +621,33 @@ class DataLoader:
         raise ValueError(
             f"Cannot interpret boolean value: {value!r}"
         )
+
+    @staticmethod
+    def _parse_metadata(
+        value,
+        *,
+        row_number: int,
+    ) -> dict[str, Any]:
+        """Parse optional per-measurement metadata from the CSV index."""
+
+        if value is None or not str(value).strip():
+            return {}
+
+        try:
+            metadata = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "Invalid measurement_metadata JSON in "
+                f"measurements.csv row {row_number}."
+            ) from error
+
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Expected measurement_metadata to contain a JSON object "
+                f"in measurements.csv row {row_number}."
+            )
+
+        return metadata
 
 
 def load_experiment(

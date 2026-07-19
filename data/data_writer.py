@@ -45,6 +45,8 @@ class DataWriter:
         Human-readable name used in the experiment directory.
     """
 
+    FORMAT_VERSION = 2
+
     CSV_FIELDS = [
         "measurement",
         "timestamp",
@@ -61,6 +63,7 @@ class DataWriter:
         "peak_counts",
         "integrated_counts",
         "saturated",
+        "measurement_metadata",
         "spectrum_file",
     ]
 
@@ -199,6 +202,10 @@ class DataWriter:
                 )
             )
 
+        # The writer, rather than caller-provided metadata, owns the
+        # authoritative on-disk format version.
+        metadata["format_version"] = self.FORMAT_VERSION
+
         self._write_json(
             "metadata.json",
             metadata,
@@ -267,6 +274,10 @@ class DataWriter:
                 "Spectrum wavelength and intensity arrays "
                 "must have matching shapes."
             )
+
+        measurement_metadata = self._metadata_json(
+            measurement.metadata
+        )
 
         self._measurement_number += 1
 
@@ -365,6 +376,9 @@ class DataWriter:
 
                 "saturated":
                     measurement.saturated,
+
+                "measurement_metadata":
+                    measurement_metadata,
 
                 "spectrum_file":
                     filename,
@@ -472,3 +486,24 @@ class DataWriter:
             return ""
 
         return value
+
+    @classmethod
+    def _metadata_json(
+        cls,
+        metadata,
+    ) -> str:
+        """Serialise one measurement's metadata for the CSV index."""
+
+        if metadata is None:
+            return "{}"
+
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Measurement metadata must be a dictionary."
+            )
+
+        return json.dumps(
+            cls._to_json_compatible(metadata),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )

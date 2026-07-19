@@ -90,16 +90,61 @@ class HardwareManager:
 
         logger.info("Connecting all hardware...")
 
-        self.waveplate.connect()
-        self.sample.connect()
-        self.shutter.connect()
-        self.spectrometer.connect()
+        connected_devices = []
+
+        try:
+            for device in (
+                self.waveplate,
+                self.sample,
+                self.shutter,
+            ):
+                device.connect()
+                connected_devices.append(device)
+
+            # Establish the safe optical state as soon as the shutter is
+            # available, before connecting the remaining hardware.
+            self.shutter.close()
+
+            self.spectrometer.connect()
+            connected_devices.append(self.spectrometer)
+
+        except Exception:
+            logger.exception(
+                "Hardware connection failed; cleaning up connected devices."
+            )
+
+            if self.shutter.connected:
+                try:
+                    self.shutter.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close beam shutter during connection cleanup."
+                    )
+
+            for device in reversed(connected_devices):
+                try:
+                    device.disconnect()
+                except Exception:
+                    logger.exception(
+                        "Error disconnecting %s after connection failure.",
+                        device.name,
+                    )
+
+            raise
 
         logger.info("All hardware connected.")
 
     def disconnect_all(self):
 
         logger.info("Disconnecting hardware...")
+
+        if self.shutter.connected:
+            try:
+                self.shutter.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close beam shutter before disconnecting."
+                )
 
         #
         # Disconnect in reverse order.

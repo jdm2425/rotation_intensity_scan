@@ -314,6 +314,11 @@ results/
         └── ...
 ```
 
+The current format version is `2`, recorded as `format_version` in
+`metadata.json`. The CSV index includes a `measurement_metadata` field holding
+a JSON object for per-measurement analysis and correction provenance. Loaders
+treat the absent field in older datasets as an empty dictionary.
+
 ### `DataWriter`
 
 `DataWriter` should:
@@ -326,6 +331,7 @@ results/
 * Reject measurements without a spectrum.
 * Validate array dimensions and matching shapes.
 * Avoid pickle and Python object arrays.
+* Persist `Measurement.metadata` as JSON-compatible data.
 
 A spectrum archive should use fields such as:
 
@@ -350,6 +356,9 @@ timestamp
 4. Reconstruct a `Spectrum`.
 5. Reconstruct a `Measurement` containing that `Spectrum`.
 6. Return an `ExperimentDataset`.
+
+Per-measurement metadata is decoded from the CSV JSON field. Missing metadata
+in an older dataset is reconstructed as `{}`.
 
 Do not enable pickle to support obsolete archives.
 

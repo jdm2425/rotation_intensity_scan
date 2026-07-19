@@ -213,6 +213,13 @@ results/
 
 Each `.npz` file contains numerical spectrum arrays and scalar acquisition metadata.
 
+The current saved-data format is version 2. `metadata.json` records the
+format version, and `measurements.csv` stores each measurement's JSON metadata.
+This metadata can record analysis bounds, filtering choices, background use,
+and other correction provenance without changing the core data model. Older
+CSV files without per-measurement metadata continue to load with an empty
+metadata dictionary.
+
 ## Documentation
 
 Read these files before making architectural changes:

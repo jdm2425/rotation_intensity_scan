@@ -7,6 +7,7 @@ losing spectrum data or metadata.
 
 from __future__ import annotations
 
+import csv
 import shutil
 import tempfile
 from pathlib import Path
@@ -56,6 +57,16 @@ def create_fake_measurement(index: int) -> Measurement:
         fluence_mj_cm2=0.25,
         intensity_w_cm2=1.2e8,
         spectrum=spectrum,
+        metadata={
+            "analysis": {
+                "integration_bounds_nm": [400.0, 500.0],
+                "method": "sum",
+            },
+            "corrections": {
+                "background_applied": False,
+                "filter": None,
+            },
+        },
     )
 
     measurement.compute_statistics()
@@ -86,11 +97,17 @@ def main() -> None:
         ) as writer:
 
             writer.save_metadata(
-                config={"test": True},
+                config={
+                    "test": True,
+                    "waveplate_angles_deg": [0.0, 5.0, 10.0],
+                },
                 hardware_info={
                     "spectrometer": {
                         "serial": "TEST-SPECTROMETER",
                     }
+                },
+                extra_metadata={
+                    "operator": "round-trip-test",
                 },
             )
 
@@ -113,6 +130,19 @@ def main() -> None:
         print(f"Loaded {len(dataset)} measurements.")
 
         assert len(dataset) == len(originals)
+
+        assert dataset.metadata["format_version"] == 2
+        assert dataset.metadata["operator"] == "round-trip-test"
+        assert dataset.config["test"] is True
+        assert dataset.config["waveplate_angles_deg"] == [
+            0.0,
+            5.0,
+            10.0,
+        ]
+        assert (
+            dataset.hardware["spectrometer"]["serial"]
+            == "TEST-SPECTROMETER"
+        )
 
         for index, (original, loaded) in enumerate(
             zip(originals, dataset.measurements),
@@ -148,6 +178,37 @@ def main() -> None:
 
             assert original.averages == loaded.averages
 
+            assert (
+                original.spectrum.serial
+                == loaded.spectrum.serial
+            )
+
+            assert (
+                original.spectrum.dark_corrected
+                == loaded.spectrum.dark_corrected
+            )
+
+            assert (
+                original.spectrum.nonlinearity_corrected
+                == loaded.spectrum.nonlinearity_corrected
+            )
+
+            assert np.isclose(
+                original.spectrum.timestamp,
+                loaded.spectrum.timestamp,
+            )
+
+            assert np.isclose(
+                original.timestamp,
+                loaded.timestamp,
+            )
+
+            assert original.power_mw == loaded.power_mw
+            assert original.fluence_mj_cm2 == loaded.fluence_mj_cm2
+            assert original.intensity_w_cm2 == loaded.intensity_w_cm2
+            assert original.saturated == loaded.saturated
+            assert original.metadata == loaded.metadata
+
             assert np.isclose(
                 original.peak_counts,
                 loaded.peak_counts,
@@ -158,7 +219,65 @@ def main() -> None:
                 loaded.integrated_counts,
             )
 
+            spectrum_path = (
+                experiment_directory
+                / "spectra"
+                / f"spectrum_{index:06d}.npz"
+            )
+
+            with np.load(
+                spectrum_path,
+                allow_pickle=False,
+            ) as archive:
+                assert all(
+                    archive[key].dtype != object
+                    for key in archive.files
+                )
+
             print(f"Measurement {index}: OK")
+
+        # Verify that datasets written before format version 2, which do
+        # not have the measurement_metadata column, still load safely.
+        measurements_path = (
+            experiment_directory / "measurements.csv"
+        )
+
+        with measurements_path.open(
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+            legacy_rows = list(csv.DictReader(file))
+
+        legacy_fields = [
+            field
+            for field in DataWriter.CSV_FIELDS
+            if field != "measurement_metadata"
+        ]
+
+        with measurements_path.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=legacy_fields,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(legacy_rows)
+
+        legacy_dataset = load_experiment(
+            experiment_directory
+        )
+
+        assert all(
+            measurement.metadata == {}
+            for measurement in legacy_dataset
+        )
+
+        print("Legacy metadata-free CSV: OK")
 
         print()
         print("=" * 60)

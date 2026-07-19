@@ -71,6 +71,8 @@ The writer:
 * Avoids pickle.
 * Writes CSV index rows.
 * Saves metadata, configuration, and hardware information.
+* Records saved-data format version `2`.
+* Persists JSON-compatible per-measurement analysis and correction metadata.
 
 The loader:
 
@@ -78,12 +80,18 @@ The loader:
 * Reconstructs `Spectrum`.
 * Reconstructs `Measurement`.
 * Returns an `ExperimentDataset`.
+* Restores per-measurement metadata.
+* Loads older CSV indexes without that metadata as an empty dictionary.
 
 The hardware-free round-trip test passes:
 
 ```powershell
 python -m tests.test_round_trip
 ```
+
+It now verifies the complete supported spectrum and measurement fields,
+experiment/config/hardware metadata, pickle-free numeric archives, provenance
+metadata, and backward compatibility with metadata-free CSV indexes.
 
 ### Results directory separation
 
