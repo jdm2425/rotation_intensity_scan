@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from analysis.measurement import Measurement
+from data.background_spectrum import BackgroundSpectrum
 from data.experiment_dataset import ExperimentDataset
 from hardware.devices.spectrometer.spectrum import Spectrum
 
@@ -92,6 +93,10 @@ class DataLoader:
             measurements_file=measurements_file,
         )
 
+        backgrounds = self._load_backgrounds(
+            root=root,
+        )
+
         experiment_name = str(
             metadata.get(
                 "experiment_name",
@@ -114,7 +119,73 @@ class DataLoader:
             hardware=hardware,
             metadata=metadata,
             measurements=measurements,
+            backgrounds=backgrounds,
         )
+
+    def _load_backgrounds(
+        self,
+        *,
+        root: Path,
+    ) -> list[BackgroundSpectrum]:
+        """Load optional named background spectra saved with an experiment."""
+
+        index_path = root / "backgrounds.json"
+        if not index_path.exists():
+            return []
+
+        index = self._read_optional_json(index_path)
+        records = index.get("backgrounds", [])
+
+        if not isinstance(records, list):
+            raise ValueError(
+                f"Expected a background list in {index_path}."
+            )
+
+        backgrounds: list[BackgroundSpectrum] = []
+
+        for record_number, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "Expected each background index entry to be an object "
+                    f"in {index_path} (entry {record_number})."
+                )
+
+            name = str(record.get("name", "")).strip()
+            filename = str(record.get("spectrum_file", "")).strip()
+            background_metadata = record.get("metadata", {})
+
+            if not name or not filename:
+                raise ValueError(
+                    "Background entries require name and spectrum_file "
+                    f"in {index_path} (entry {record_number})."
+                )
+            if not isinstance(background_metadata, dict):
+                raise ValueError(
+                    "Background metadata must be a JSON object "
+                    f"in {index_path} (entry {record_number})."
+                )
+
+            path = (root / filename).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as error:
+                raise ValueError(
+                    f"Background path escapes the experiment directory: {path}"
+                ) from error
+
+            backgrounds.append(
+                BackgroundSpectrum(
+                    name=name,
+                    spectrum=self._load_spectrum(
+                        path=path,
+                        row={},
+                    ),
+                    metadata=background_metadata,
+                    source_path=path,
+                )
+            )
+
+        return backgrounds
 
     # ------------------------------------------------------------------
     # Measurement loading
@@ -209,6 +280,15 @@ class DataLoader:
             ),
             power_mw=self._optional_float(
                 row.get("power_mw")
+            ),
+            target_power_mw=self._optional_float(
+                row.get("target_power_mw")
+            ),
+            power_rms_mw=self._optional_float(
+                row.get("power_rms_mw")
+            ),
+            power_measurement_duration_s=self._optional_float(
+                row.get("power_measurement_duration_s")
             ),
             fluence_mj_cm2=self._optional_float(
                 row.get("fluence_mj_cm2")

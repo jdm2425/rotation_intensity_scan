@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +46,7 @@ class DataWriter:
         Human-readable name used in the experiment directory.
     """
 
-    FORMAT_VERSION = 2
+    FORMAT_VERSION = 4
 
     CSV_FIELDS = [
         "measurement",
@@ -53,6 +54,9 @@ class DataWriter:
         "sample_angle_deg",
         "waveplate_angle_deg",
         "power_mw",
+        "target_power_mw",
+        "power_rms_mw",
+        "power_measurement_duration_s",
         "fluence_mj_cm2",
         "intensity_w_cm2",
         "integration_time_ms",
@@ -90,7 +94,13 @@ class DataWriter:
             self.root / "spectra"
         )
 
+        self.backgrounds_directory = (
+            self.root / "backgrounds"
+        )
+
         self._measurement_number = 0
+        self._background_number = 0
+        self._background_records: list[dict[str, Any]] = []
 
         self._csv_file = None
         self._csv_writer = None
@@ -339,6 +349,21 @@ class DataWriter:
                         measurement.power_mw
                     ),
 
+                "target_power_mw":
+                    self._optional_value(
+                        measurement.target_power_mw
+                    ),
+
+                "power_rms_mw":
+                    self._optional_value(
+                        measurement.power_rms_mw
+                    ),
+
+                "power_measurement_duration_s":
+                    self._optional_value(
+                        measurement.power_measurement_duration_s
+                    ),
+
                 "fluence_mj_cm2":
                     self._optional_value(
                         measurement.fluence_mj_cm2
@@ -391,6 +416,105 @@ class DataWriter:
 
         return filepath
 
+    def save_background(
+        self,
+        spectrum,
+        *,
+        name: str = "pre_scan_dark",
+        metadata: dict[str, Any] | None = None,
+    ) -> Path:
+        """Save one named raw background spectrum and update its index."""
+
+        self._require_open()
+
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Background name must not be empty.")
+        if any(
+            record["name"] == name
+            for record in self._background_records
+        ):
+            raise ValueError(
+                f"A background named {name!r} has already been saved."
+            )
+
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError("Background metadata must be a dictionary.")
+
+        metadata = self._to_json_compatible(metadata)
+        # Validate serialisability before creating the spectrum file.
+        json.dumps(metadata, ensure_ascii=False)
+
+        wavelengths = np.asarray(
+            spectrum.wavelengths,
+            dtype=float,
+        )
+        intensities = np.asarray(
+            spectrum.intensities,
+            dtype=float,
+        )
+
+        if wavelengths.ndim != 1 or intensities.ndim != 1:
+            raise ValueError(
+                "Background wavelength and intensity data must be "
+                "one-dimensional."
+            )
+        if wavelengths.shape != intensities.shape:
+            raise ValueError(
+                "Background wavelength and intensity arrays must have "
+                "matching shapes."
+            )
+
+        self._background_number += 1
+        filename = f"background_{self._background_number:06d}.npz"
+
+        self.backgrounds_directory.mkdir(
+            parents=False,
+            exist_ok=True,
+        )
+
+        filepath = self.backgrounds_directory / filename
+
+        np.savez_compressed(
+            filepath,
+            wavelengths=wavelengths,
+            intensities=intensities,
+            integration_time_ms=np.asarray(
+                spectrum.integration_time_ms,
+                dtype=float,
+            ),
+            serial=np.asarray(spectrum.serial, dtype=str),
+            averages=np.asarray(spectrum.averages, dtype=int),
+            dark_corrected=np.asarray(
+                spectrum.dark_corrected,
+                dtype=bool,
+            ),
+            nonlinearity_corrected=np.asarray(
+                spectrum.nonlinearity_corrected,
+                dtype=bool,
+            ),
+            timestamp=np.asarray(spectrum.timestamp, dtype=float),
+        )
+
+        self._background_records.append(
+            {
+                "name": name,
+                "spectrum_file": (
+                    Path("backgrounds") / filename
+                ).as_posix(),
+                "metadata": metadata,
+            }
+        )
+
+        self._write_json(
+            "backgrounds.json",
+            {"backgrounds": self._background_records},
+        )
+
+        return filepath
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
@@ -434,7 +558,11 @@ class DataWriter:
 
         filepath = self.root / filename
 
-        with filepath.open(
+        temporary_path = filepath.with_suffix(
+            filepath.suffix + ".tmp"
+        )
+
+        with temporary_path.open(
             "w",
             encoding="utf-8",
         ) as file:
@@ -446,6 +574,11 @@ class DataWriter:
                 ensure_ascii=False,
                 default=str,
             )
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        temporary_path.replace(filepath)
 
     @classmethod
     def _to_json_compatible(

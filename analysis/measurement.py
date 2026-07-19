@@ -24,7 +24,9 @@ class Measurement:
     Represents one completed measurement.
 
     This is the canonical data structure used throughout the
-    project.
+    project. ``power_mw`` is the canonical achieved mean power associated
+    with the spectrum, not the requested setpoint. A requested setpoint and
+    power-meter sampling statistics are stored separately when available.
     """
 
     # ==========================================================
@@ -45,7 +47,21 @@ class Measurement:
     # Beam model (optional)
     # ==========================================================
 
+    # Canonical achieved mean power for this measurement. This field keeps its
+    # existing name for saved-data and analysis compatibility.
     power_mw: float | None = None
+
+    # Optional power-meter context. These are keyword-only so adding them does
+    # not change the positional constructor layout of the established model.
+    target_power_mw: float | None = field(default=None, kw_only=True)
+
+    # RMS statistic reported over the associated power-meter sampling interval.
+    power_rms_mw: float | None = field(default=None, kw_only=True)
+
+    power_measurement_duration_s: float | None = field(
+        default=None,
+        kw_only=True,
+    )
 
     fluence_mj_cm2: float | None = None
 
@@ -72,6 +88,14 @@ class Measurement:
     # ==========================================================
 
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # ----------------------------------------------------------
+
+    @property
+    def achieved_power_mw(self) -> float | None:
+        """Explicit read-only name for the achieved mean ``power_mw``."""
+
+        return self.power_mw
 
     # ----------------------------------------------------------
 
@@ -178,6 +202,18 @@ class Measurement:
 
             "power_mw":
                 self.power_mw,
+
+            "achieved_power_mw":
+                self.power_mw,
+
+            "target_power_mw":
+                self.target_power_mw,
+
+            "power_rms_mw":
+                self.power_rms_mw,
+
+            "power_measurement_duration_s":
+                self.power_measurement_duration_s,
 
             "peak_counts":
                 self.peak_counts,

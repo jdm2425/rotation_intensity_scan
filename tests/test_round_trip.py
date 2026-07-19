@@ -54,6 +54,9 @@ def create_fake_measurement(index: int) -> Measurement:
         waveplate_angle_deg=index * 5.0,
         sample_angle_deg=index * 10.0,
         power_mw=100.0 + index,
+        target_power_mw=102.0 + index,
+        power_rms_mw=0.5 + index * 0.01,
+        power_measurement_duration_s=0.25,
         fluence_mj_cm2=0.25,
         intensity_w_cm2=1.2e8,
         spectrum=spectrum,
@@ -111,6 +114,26 @@ def main() -> None:
                 },
             )
 
+            background = Spectrum(
+                wavelengths=np.linspace(200.0, 900.0, 2048),
+                intensities=np.full(2048, 125.0),
+                integration_time_ms=10.0,
+                serial="TEST-SPECTROMETER",
+                averages=5,
+                dark_corrected=False,
+                nonlinearity_corrected=False,
+                timestamp=999.0,
+            )
+
+            background_path = writer.save_background(
+                background,
+                name="pre_scan_dark",
+                metadata={
+                    "kind": "shutter_closed_dark",
+                    "filter_installed": "FBH400-40",
+                },
+            )
+
             for index in range(5):
 
                 measurement = create_fake_measurement(index)
@@ -131,7 +154,10 @@ def main() -> None:
 
         assert len(dataset) == len(originals)
 
-        assert dataset.metadata["format_version"] == 2
+        assert (
+            dataset.metadata["format_version"]
+            == DataWriter.FORMAT_VERSION
+        )
         assert dataset.metadata["operator"] == "round-trip-test"
         assert dataset.config["test"] is True
         assert dataset.config["waveplate_angles_deg"] == [
@@ -139,10 +165,47 @@ def main() -> None:
             5.0,
             10.0,
         ]
+        assert dataset.powers == [measurement.power_mw for measurement in originals]
+        assert dataset.target_powers == [
+            measurement.target_power_mw for measurement in originals
+        ]
+        assert dataset.power_rms_values == [
+            measurement.power_rms_mw for measurement in originals
+        ]
+        assert dataset.power_measurement_durations == [
+            measurement.power_measurement_duration_s
+            for measurement in originals
+        ]
         assert (
             dataset.hardware["spectrometer"]["serial"]
             == "TEST-SPECTROMETER"
         )
+
+        assert len(dataset.backgrounds) == 1
+        loaded_background = dataset.get_background("pre_scan_dark")
+        assert np.array_equal(
+            loaded_background.spectrum.wavelengths,
+            background.wavelengths,
+        )
+        assert np.array_equal(
+            loaded_background.spectrum.intensities,
+            background.intensities,
+        )
+        assert loaded_background.spectrum.averages == 5
+        assert loaded_background.spectrum.timestamp == 999.0
+        assert loaded_background.metadata == {
+            "kind": "shutter_closed_dark",
+            "filter_installed": "FBH400-40",
+        }
+
+        with np.load(
+            background_path,
+            allow_pickle=False,
+        ) as archive:
+            assert all(
+                archive[key].dtype != object
+                for key in archive.files
+            )
 
         for index, (original, loaded) in enumerate(
             zip(originals, dataset.measurements),
@@ -204,6 +267,14 @@ def main() -> None:
             )
 
             assert original.power_mw == loaded.power_mw
+            assert original.achieved_power_mw == original.power_mw
+            assert loaded.achieved_power_mw == loaded.power_mw
+            assert original.target_power_mw == loaded.target_power_mw
+            assert original.power_rms_mw == loaded.power_rms_mw
+            assert (
+                original.power_measurement_duration_s
+                == loaded.power_measurement_duration_s
+            )
             assert original.fluence_mj_cm2 == loaded.fluence_mj_cm2
             assert original.intensity_w_cm2 == loaded.intensity_w_cm2
             assert original.saturated == loaded.saturated
@@ -236,8 +307,8 @@ def main() -> None:
 
             print(f"Measurement {index}: OK")
 
-        # Verify that datasets written before format version 2, which do
-        # not have the measurement_metadata column, still load safely.
+        # Verify that an older CSV without measurement metadata or the new
+        # optional power-meter columns still loads safely.
         measurements_path = (
             experiment_directory / "measurements.csv"
         )
@@ -249,10 +320,16 @@ def main() -> None:
         ) as file:
             legacy_rows = list(csv.DictReader(file))
 
+        newly_optional_fields = {
+            "target_power_mw",
+            "power_rms_mw",
+            "power_measurement_duration_s",
+        }
         legacy_fields = [
             field
             for field in DataWriter.CSV_FIELDS
             if field != "measurement_metadata"
+            and field not in newly_optional_fields
         ]
 
         with measurements_path.open(
@@ -277,7 +354,30 @@ def main() -> None:
             for measurement in legacy_dataset
         )
 
+        assert all(
+            measurement.target_power_mw is None
+            and measurement.power_rms_mw is None
+            and measurement.power_measurement_duration_s is None
+            for measurement in legacy_dataset
+        )
+
+        assert [measurement.power_mw for measurement in legacy_dataset] == [
+            measurement.power_mw for measurement in originals
+        ]
+
+        assert len(legacy_dataset.backgrounds) == 1
+
         print("Legacy metadata-free CSV: OK")
+
+        # Experiments saved before background indexing was introduced
+        # continue to load with an empty background collection.
+        (experiment_directory / "backgrounds.json").unlink()
+        no_background_dataset = load_experiment(
+            experiment_directory
+        )
+        assert no_background_dataset.backgrounds == []
+
+        print("Legacy background-free dataset: OK")
 
         print()
         print("=" * 60)

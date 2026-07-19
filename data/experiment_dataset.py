@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from analysis.measurement import Measurement
+from data.background_spectrum import BackgroundSpectrum
 
 
 @dataclass(slots=True)
@@ -62,6 +63,10 @@ class ExperimentDataset:
         default_factory=list
     )
 
+    backgrounds: list[BackgroundSpectrum] = field(
+        default_factory=list
+    )
+
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
@@ -92,6 +97,30 @@ class ExperimentDataset:
 
         self.measurements.append(measurement)
 
+    def get_background(
+        self,
+        name: str = "pre_scan_dark",
+    ) -> BackgroundSpectrum:
+        """Return one uniquely named saved background."""
+
+        matches = [
+            background
+            for background in self.backgrounds
+            if background.name == name
+        ]
+
+        if not matches:
+            raise KeyError(
+                f"No background named {name!r} is available."
+            )
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple backgrounds are named {name!r}."
+            )
+
+        return matches[0]
+
     # ------------------------------------------------------------------
     # Convenience properties
     # ------------------------------------------------------------------
@@ -114,9 +143,37 @@ class ExperimentDataset:
 
     @property
     def powers(self):
+        """Achieved mean powers in mW, when recorded."""
 
         return [
             m.power_mw
+            for m in self.measurements
+        ]
+
+    @property
+    def target_powers(self):
+        """Requested power setpoints in mW, when recorded."""
+
+        return [
+            m.target_power_mw
+            for m in self.measurements
+        ]
+
+    @property
+    def power_rms_values(self):
+        """Power RMS statistics in mW, when recorded."""
+
+        return [
+            m.power_rms_mw
+            for m in self.measurements
+        ]
+
+    @property
+    def power_measurement_durations(self):
+        """Power-meter sampling durations in seconds, when recorded."""
+
+        return [
+            m.power_measurement_duration_s
             for m in self.measurements
         ]
 
@@ -163,6 +220,8 @@ class ExperimentDataset:
             "created": self.created,
 
             "measurements": len(self),
+
+            "backgrounds": len(self.backgrounds),
 
             "directory": str(self.root),
 

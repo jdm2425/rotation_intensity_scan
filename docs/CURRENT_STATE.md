@@ -3,7 +3,7 @@
 ```markdown
 # Current State
 
-Last reviewed: 18 July 2026
+Last reviewed: 19 July 2026
 
 Update this file whenever a feature is verified, abandoned, or materially redesigned.
 
@@ -71,8 +71,11 @@ The writer:
 * Avoids pickle.
 * Writes CSV index rows.
 * Saves metadata, configuration, and hardware information.
-* Records saved-data format version `2`.
+* Records saved-data format version `4`.
 * Persists JSON-compatible per-measurement analysis and correction metadata.
+* Saves named raw background spectra separately from signal measurements.
+* Persists optional requested power, achieved mean power, meter-reported RMS,
+  and power-sampling duration fields.
 
 The loader:
 
@@ -82,6 +85,9 @@ The loader:
 * Returns an `ExperimentDataset`.
 * Restores per-measurement metadata.
 * Loads older CSV indexes without that metadata as an empty dictionary.
+* Loads older CSV indexes without the v4 power-meter columns as `None`.
+* Reconstructs named `BackgroundSpectrum` records when present.
+* Loads older experiments without backgrounds as an empty collection.
 
 The hardware-free round-trip test passes:
 
@@ -91,7 +97,8 @@ python -m tests.test_round_trip
 
 It now verifies the complete supported spectrum and measurement fields,
 experiment/config/hardware metadata, pickle-free numeric archives, provenance
-metadata, and backward compatibility with metadata-free CSV indexes.
+metadata, and backward compatibility with metadata-free and pre-v4 CSV
+indexes.
 
 ### Results directory separation
 
@@ -132,17 +139,16 @@ Do not mark it fully verified until it has been run with the real spectrometer.
 
 ### Persistent live background
 
-Planned structure:
+Implemented directly in the live spectrometer utility using:
 
 ```text
-tools/spectrum_background.py
 tools/live_spectrometer_background.npz
 ```
 
 Desired controls:
 
 * `B`: capture or replace the saved background.
-* `T`: toggle subtraction.
+* `G`: toggle subtraction.
 * Keep one background between sessions.
 * Start with subtraction disabled unless intentionally configured otherwise.
 * Scale for integration time where appropriate.
@@ -151,6 +157,91 @@ Desired controls:
 * Save raw and corrected spectra distinctly.
 
 The background calibration file should normally be excluded from Git.
+
+### Experiment background and offline harmonic analysis
+
+The experiment controller now acquires one shutter-closed pre-scan background
+using configurable averaging and settling time. It saves the raw background in
+the experiment directory before any scan-point motion.
+
+Hardware-independent analysis now supports:
+
+* One or multiple named harmonic wavelength windows.
+* Strict optional saved-background subtraction.
+* Explicit scalar or wavelength-dependent filter-transmission correction.
+* Trapezoidal integration with exact requested bounds.
+* Harmonic signal versus waveplate angle, measured power, fluence, or
+  intensity.
+* Cartesian and polar rotation dependence at a fixed value of any of those four
+  input coordinates.
+* Reusable `AnalysedRun`, `excitation_scan_data()`, `rotation_scan_data()`,
+  `save_figure_data_csv()`, and `plot_figure_data()` APIs.
+* Multi-run overlays with separate run/harmonic series.
+* One complete `harmonic_signals.csv` plus exact same-stem CSV data for each
+  requested PNG/PDF figure.
+* A figure manifest in `analysis_recipe.json` linking every PNG, PDF, and CSV.
+* An `analysis_recipe.sha256` checksum and human-readable
+  `analysis_summary.md`.
+* A recorded correction pipeline, software versions, source/data checksums,
+  quality counts, and actionable warnings.
+* Default correction annotations on quick-look figures, with
+  `--no-annotate-corrections` available for clean visual output.
+* CSV, recipe, summary, PNG and PDF outputs without modifying source spectra.
+
+The data-product layer preserves repeated measurements without averaging them.
+It rejects same-named harmonics with different integration windows by default.
+Requesting `power_mw`, `fluence_mj_cm2`, or `intensity_w_cm2` requires real
+values in the saved measurements; analysis does not infer them or silently use
+waveplate angle instead.
+
+`--no-background` and `--no-transmission-correction` now record deliberate
+no-correction choices. Omitting both sides of either choice leaves its mode as
+`not_specified`; saved background availability or installed-filter metadata
+then produces a warning rather than silently applying a correction.
+
+Fixed-value rotation selection records an absolute tolerance. When
+`power_mw` is selected, matching uses achieved mean power, not target power.
+The tolerance is present in every figure CSV and manifest record; the manifest
+and summary also show the minimum and maximum achieved values that matched.
+For `--plot-all`, complete target-power coverage supplies nominal automatic
+centres, but the selector still matches achieved power; otherwise achieved
+values supply the centres. The recipe records that automatic source.
+
+The hardware-free analysis regressions include:
+
+```powershell
+python -m tests.test_harmonic_analysis
+python -m tests.test_data_products
+python -m tests.test_analysis_reporting
+python -m tests.test_analysis_cli
+```
+
+The reporting regression exercises human- and machine-readable provenance.
+The CLI regression creates a complete synthetic saved experiment in a
+temporary directory and checks its master table, explicit/unspecified
+correction modes, warnings, correction pipeline, recipe checksum, summary,
+software/checksum records, figure manifest, and same-stem PNG/PDF/CSV products
+without connecting hardware.
+
+### Power-meter-ready model
+
+The canonical measurement and persistence models now distinguish:
+
+* `target_power_mw`: requested setpoint.
+* `power_mw`: achieved mean and canonical power-analysis coordinate.
+* `power_rms_mw`: RMS statistic reported by the meter over the sampling
+  interval; this is not a standard deviation unless the future verified meter
+  implementation defines it that way.
+* `power_measurement_duration_s`: duration of the meter sampling interval.
+
+`Measurement.achieved_power_mw` is a read-only alias for `power_mw`. These
+fields propagate through `HarmonicResult`, the master harmonic CSV, and figure
+CSVs.
+
+No power-meter hardware is configured or integrated. There is no power-meter
+driver, serial, hardware-manager member, experiment sampling step, or verified
+waveplate-to-power calibration. Normal experiments therefore leave these fields
+unset. Synthetic tests populate them only to verify persistence and analysis.
 
 ### Laboratory utilities
 
@@ -177,31 +268,20 @@ A future test should:
 
 This test is hardware-dependent and must not run automatically.
 
-### Harmonic analysis
+### Further analysis extensions
 
-Not yet implemented as a stable analysis layer.
+The first stable harmonic-integration and plotting layer is implemented.
+Remaining extensions include:
 
-Needed capabilities include:
+* Optional local sideband/baseline estimation.
+* Replicate aggregation and uncertainty estimates.
+* Publication-specific polar formatting.
+* Explicit policies for invalid or saturated measurements.
+* Detector-response and broader optical-system corrections.
 
-* Select wavelength range.
-* Estimate or subtract baseline.
-* Integrate selected harmonic.
-* Record integration bounds.
-* Plot integrated signal against sample angle.
-* Compare intensity settings.
-* Handle saturated or invalid measurements.
-
-### Transmission correction
-
-Not yet implemented.
-
-A future correction should:
-
-* Load a transmission or response curve.
-* Interpolate safely to the spectrum wavelength grid.
-* Reject invalid or zero correction values.
-* Record the correction source.
-* Distinguish raw and corrected data.
+Scalar and wavelength-dependent filter-transmission corrections are available
+offline. They reject invalid/zero transmission and out-of-range curves, record
+their source in the analysis recipe, and preserve raw data.
 
 ### Beam model
 
@@ -237,6 +317,10 @@ measurement = Measurement(
     timestamp=...,
     waveplate_angle_deg=...,
     sample_angle_deg=...,
+    power_mw=...,                       # optional achieved mean
+    target_power_mw=...,                # optional requested setpoint
+    power_rms_mw=...,                   # optional meter-reported RMS
+    power_measurement_duration_s=...,
     spectrum=spectrum,
 )
 ```
@@ -255,19 +339,28 @@ Do not treat `measurement.spectrum` as an array.
 * OneDrive-synchronised project paths may introduce filesystem timing or locking issues.
 * Standalone tools may need adjustment to match the exact current driver APIs.
 * Absolute optical intensity is not yet calibrated.
+* The power-ready data fields could be mistaken for an implemented power-meter
+  acquisition path; no such hardware integration exists yet.
 
 ## Immediate recommended sequence
 
-1. Add this documentation pack and `AGENTS.md`.
-2. Commit a Git checkpoint.
-3. Let Codex inspect the repository without editing.
-4. Reconcile documentation with actual code.
-5. Run only hardware-free tests.
-6. Finish and verify live spectrometer background support.
-7. Add a hardware status utility.
-8. Add controlled stage movement tools.
-9. Design the harmonic-analysis API.
-10. Add calibration and correction models.
+1. Run and keep green the complete hardware-free persistence/analysis suite:
+   `tests.test_round_trip`, `tests.test_harmonic_analysis`,
+   `tests.test_data_products`, `tests.test_analysis_reporting`, and
+   `tests.test_analysis_cli`.
+2. Review the v4 power-field semantics, achieved-power tolerance selection,
+   correction reports, and saved checksums before introducing another data
+   representation.
+3. Only after those tests pass, identify and verify the actual laboratory power
+   meter, interface, units, sampling/RMS semantics, and serial.
+4. Design the final power-meter driver and acquisition integration without
+   changing shutter or motion safety. Any connection test requires explicit
+   operator approval and should begin with the smallest read-only device test.
+5. Populate target/achieved/RMS/duration fields from that verified acquisition
+   path, then repeat persistence and offline-analysis regressions before a full
+   experiment.
+6. Continue local-baseline, uncertainty, and publication-format work after the
+   measurement provenance is stable.
 
 ## Codex onboarding prompt
 

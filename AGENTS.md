@@ -43,9 +43,12 @@ Do not perform any of the following unless the user explicitly approves a hardwa
 - Move a stage.
 - Open or toggle the shutter.
 - Connect to the spectrometer.
+- Connect to or read from a future power meter.
 - Run a complete experiment.
 - Run any test marked as hardware-dependent.
 - Change hardware serial numbers or state mappings.
+- Add or change power-meter calibration/statistic semantics without verified
+  device information.
 - Change stage limits or homing behaviour.
 
 The safe default shutter state is closed.
@@ -76,6 +79,10 @@ The following work is normally safe without hardware:
 - Tests using synthetic `Spectrum` objects.
 - Tests using mocks or fakes.
 - `python -m tests.test_round_trip`
+- `python -m tests.test_harmonic_analysis`
+- `python -m tests.test_data_products`
+- `python -m tests.test_analysis_reporting`
+- `python -m tests.test_analysis_cli`
 - Persistence tests that write only to temporary directories.
 - Pure analysis, plotting, and configuration validation tests.
 
@@ -108,7 +115,10 @@ Measurement(
     timestamp=...,
     waveplate_angle_deg=...,
     sample_angle_deg=...,
-    power_mw=...,
+    power_mw=...,                       # achieved mean power
+    target_power_mw=...,                # requested setpoint
+    power_rms_mw=...,                   # meter-reported RMS
+    power_measurement_duration_s=...,
     fluence_mj_cm2=...,
     intensity_w_cm2=...,
     spectrum=Spectrum(...),
@@ -116,6 +126,18 @@ Measurement(
 ```
 
 Convenience properties on `Measurement`, such as `integration_time_ms`, may forward to the embedded `Spectrum`.
+
+`Measurement.power_mw` remains the canonical achieved mean power for backward
+compatibility. `achieved_power_mw` is a read-only alias. Do not use
+`target_power_mw` as though it were achieved power. Treat `power_rms_mw` as the
+RMS statistic reported by the eventual power meter over
+`power_measurement_duration_s`; it is not a standard deviation unless the
+verified meter API and acquisition implementation explicitly define it that
+way.
+
+The data model and format are power-meter-ready, but no power-meter driver,
+serial, calibration, or experiment integration currently exists. Leave these
+fields `None` rather than deriving or inventing values.
 
 ## Persistence requirements
 
@@ -129,6 +151,10 @@ The persistence layer must:
 * Keep generated experiment data under `results/`, not inside the Python `data/` package.
 * Preserve completed measurements if a later acquisition fails.
 * Flush the measurement index after each successful save.
+
+The current experiment persistence format is version `4`. The three optional
+power-meter context fields are columns in `measurements.csv`; loaders must
+continue to accept older tables in which those columns are absent.
 
 The hardware-free round-trip test is a core regression test:
 
@@ -173,12 +199,19 @@ Read `docs/CURRENT_STATE.md` for the live status.
 
 The likely next priorities are:
 
-1. Validate and finish persistent background subtraction in the live spectrometer utility.
-2. Add safe utility scripts for hardware status and controlled stage movement.
-3. Add a one-spectrum hardware-backed save/load test, only when explicitly approved.
-4. Implement harmonic selection and integration.
-5. Add transmission correction.
-6. Add waveplate-angle-to-power or intensity calibration.
+1. Keep the complete hardware-free persistence and analysis suite passing,
+   especially `tests.test_round_trip`, `tests.test_harmonic_analysis`,
+   `tests.test_data_products`, `tests.test_analysis_reporting`, and
+   `tests.test_analysis_cli`.
+2. Only after those tests pass, design the final power-meter hardware
+   integration: verify the actual meter, interface, units, sampling semantics,
+   and serial before adding a driver or populating power fields. Any device
+   connection still requires explicit user approval.
+3. Hardware-validate the saved pre-scan experiment background workflow.
+4. Refine harmonic analysis with optional local baselines, replicate
+   uncertainty, and publication-specific plot formatting.
+5. Add detector/optical response corrections where calibration exists.
+6. Add safe utility scripts for hardware status and controlled stage movement.
 
 ## Git expectations
 

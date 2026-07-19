@@ -69,7 +69,10 @@ A measurement includes:
 * Measurement timestamp.
 * Waveplate angle.
 * Sample angle.
-* Optional measured or calculated power.
+* Optional requested power setpoint (`target_power_mw`).
+* Optional achieved mean power (`power_mw`).
+* Optional meter-reported power RMS (`power_rms_mw`) and its sampling duration
+  (`power_measurement_duration_s`).
 * Optional fluence.
 * Optional intensity.
 * Detector spectrum.
@@ -94,18 +97,29 @@ The current project scope includes:
 * Experiment monitoring.
 * Immediate persistence of completed measurements.
 * Reloading experiments for later analysis.
+* Explicit offline background and filter-transmission corrections.
+* Reusable single- and multi-run harmonic data products.
+* Human- and machine-readable analysis provenance, warnings, and checksums.
 * Hardware-independent regression tests.
 
-## Planned analysis
+## Offline analysis
 
-Future analysis will likely include:
+Implemented analysis includes:
 
 * Selecting a wavelength interval containing a harmonic.
-* Baseline or background subtraction.
+* Explicit saved-background subtraction.
 * Integration over a wavelength range.
 * Peak location and peak height.
+* Scalar or wavelength-dependent filter-transmission correction.
+* Signal-versus-input and Cartesian/polar rotation plots.
+* Exact per-figure CSV products and multi-run overlays.
+* Correction pipelines, quality warnings, software versions, and checksums in
+  the analysis recipe and `analysis_summary.md`.
+
+Further analysis may include:
+
+* Local baseline or sideband estimation.
 * Conversion from wavelength to photon energy where useful.
-* Transmission correction.
 * Detector response correction where calibration data are available.
 * Normalisation by incident power or intensity.
 * Angular dependence plots.
@@ -113,6 +127,12 @@ Future analysis will likely include:
 * Extraction of harmonic anisotropy or symmetry.
 
 Analysis code should operate on saved `ExperimentDataset` objects and should not require hardware.
+
+For quick analysis, background and transmission decisions remain explicit.
+Choosing `--no-background` or `--no-transmission-correction` records a deliberate
+choice. Leaving a relevant choice unspecified records a warning rather than
+silently applying a correction. Quick figures are correction-annotated by
+default; the annotation may be disabled without changing numerical provenance.
 
 ## Background spectra
 
@@ -138,9 +158,13 @@ It should be possible to:
 
 ### Experiment background
 
-A full experiment may later acquire explicit background measurements as part of the scan protocol.
+A full experiment acquires a shutter-closed background before scan-point motion
+when background acquisition is enabled in `ExperimentConfig`.
 
 Those backgrounds should be saved as experiment data rather than relying only on the live-view background file.
+
+The raw background is saved separately from illuminated `Measurement` objects.
+Subtraction remains an explicit offline analysis choice.
 
 Do not treat the live-view background as a complete replacement for reproducible experimental background acquisition.
 
@@ -170,6 +194,26 @@ The final model may depend on:
 
 Until that model is implemented and verified, power, fluence, and intensity fields should remain optional.
 
+The version-4 data model already reserves distinct power fields:
+
+* `target_power_mw` is the requested setpoint.
+* `power_mw` is the achieved mean and canonical analysis coordinate.
+* `power_rms_mw` is the RMS statistic reported by the power meter over
+  `power_measurement_duration_s`. It is not a standard deviation unless the
+  eventual verified meter/API explicitly defines it that way.
+
+Offline fixed-power selection matches achieved `power_mw` using an explicit
+absolute tolerance and records both that tolerance and the actual matched
+range. It does not use target power as a substitute.
+For quick `--plot-all` analysis, complete target-power values can define the
+nominal automatic centres, but selection still matches achieved power. The
+analysis recipe records whether target or achieved values supplied the
+centres.
+
+No power meter is currently configured, connected by `HardwareManager`, or
+sampled by the experiment. No waveplate-to-power calibration has been
+implemented. The fields are schema-ready, not populated acquisition data.
+
 Do not invent missing physical quantities.
 
 ## Design priorities
@@ -186,6 +230,11 @@ The project should prioritise:
 8. Hardware-independent testing.
 9. Traceability of configuration and hardware metadata.
 10. Maintainable code over clever abstractions.
+
+The next power-related development step is final power-meter hardware
+integration, but only after the hardware-free persistence and analysis tests
+pass. The real device, interface, units, sampling duration, and RMS semantics
+must be verified before a driver or calibration is added.
 
 ## Out of scope unless explicitly added
 

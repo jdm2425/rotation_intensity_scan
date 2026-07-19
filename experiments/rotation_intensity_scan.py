@@ -30,6 +30,7 @@ class RotationIntensityExperiment:
 
         self.hardware = None
         self.acquisition = None
+        self.averages = 1
 
     # ------------------------------------------------------------------
 
@@ -75,7 +76,9 @@ class RotationIntensityExperiment:
         # Acquire spectrum.
         #
 
-        spectrum = self.acquisition.acquire()
+        spectrum = self.acquisition.acquire(
+            averages=self.averages,
+        )
 
         #
         # Build measurement.

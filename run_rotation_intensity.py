@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import logging
 
-from experiments.experiment_config import ExperimentConfig
+from experiments.experiment_config import (
+    ExperimentConfig,
+    OpticalFilterConfig,
+)
 from experiments.rotation_intensity_scan import (
     RotationIntensityExperiment,
 )
@@ -32,6 +35,8 @@ def main():
     #
 
     config = ExperimentConfig()
+
+    collect_experimental_metadata(config)
 
     #
     # Create experiment.
@@ -67,6 +72,60 @@ def main():
     controller.run(
         sample_angles=sample_angles,
         waveplate_angles=waveplate_angles,
+    )
+
+
+def collect_experimental_metadata(
+    config: ExperimentConfig,
+) -> None:
+    """Collect run notes before any laboratory hardware is connected."""
+
+    print()
+    print("Experimental metadata (press Enter to leave a field blank)")
+    print("-" * 60)
+
+    config.metadata.run_label = input(
+        "Run label: "
+    ).strip()
+    config.metadata.sample_name = input(
+        "Sample name: "
+    ).strip()
+
+    filter_names = [
+        value.strip()
+        for value in input(
+            "Installed filters, comma separated (for example FBH400-40): "
+        ).split(",")
+        if value.strip()
+    ]
+
+    harmonics = [
+        value.strip()
+        for value in input(
+            "Intended harmonics, comma separated (for example H5,H7): "
+        ).split(",")
+        if value.strip()
+    ]
+
+    config.metadata.intended_harmonics = harmonics
+
+    for filter_name in filter_names:
+        config.metadata.filters.append(
+            OpticalFilterConfig(
+                name=filter_name,
+                intended_harmonics=harmonics.copy(),
+            )
+        )
+
+    config.metadata.notes = input(
+        "Experiment notes: "
+    ).strip()
+
+    print("-" * 60)
+    print(
+        "A shutter-closed pre-scan background will be acquired and saved."
+        if config.background.enabled
+        else "Pre-scan background acquisition is disabled."
     )
 
 

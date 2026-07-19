@@ -22,6 +22,31 @@ Any new hardware discovery should be verified with the real device and then docu
 
 The exact class names and configuration object names in `hardware/config.py` remain authoritative.
 
+### Power meter status: not integrated
+
+There is currently no configured power meter. The repository contains no
+verified meter model, serial number, driver/library choice, configuration
+object, `HardwareManager` member, or experiment sampling call. The optional
+power fields in the version-4 data format do not imply that power was measured.
+
+When a real meter is added, preserve these meanings:
+
+* `target_power_mw`: requested setpoint.
+* `power_mw`: achieved mean power measured for the spectrum.
+* `power_rms_mw`: the RMS statistic reported by the meter over
+  `power_measurement_duration_s`.
+
+Do not describe `power_rms_mw` as standard deviation unless the authoritative
+meter documentation/API and verified acquisition implementation explicitly
+define it that way. Record the meter model, serial, interface, units, sampling
+method, and statistic definitions before using the values for publication.
+
+Power-meter hardware integration must wait until the persistence and analysis
+regressions pass. A first device test still requires explicit operator approval
+and should connect only to the meter, query identity, take the smallest useful
+read-only sample, and disconnect cleanly. Do not move stages or open the shutter
+merely to test meter communication.
+
 ## Waveplate stage
 
 ### Purpose
@@ -217,6 +242,10 @@ The hardware manager should own:
 * Shutter.
 * Spectrometer.
 
+It does not currently own a power meter. Add one only after its real
+configuration and lifecycle have been verified; keep partial-connection cleanup
+and the safe closed-shutter state intact.
+
 Connection should be coordinated so that partial failures are cleaned up.
 
 Suggested safe strategy:
@@ -243,6 +272,15 @@ Suggested safe strategy:
 * Live spectrometer utility.
 * Single-spectrum acquisition test.
 * Spectrometer metadata test.
+
+### Future power-meter hardware
+
+* Meter identity/configuration test.
+* One read-only sample and units/statistics verification.
+* Sampling-duration and meter-reported RMS verification.
+
+These require explicit approval even if no stage motion or shutter operation is
+intended. They must not be included in automatic hardware-free test runs.
 
 ### Motion hardware
 

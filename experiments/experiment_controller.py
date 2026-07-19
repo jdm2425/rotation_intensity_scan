@@ -16,12 +16,12 @@ Responsibilities
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 
 from acquisition.acquisition import Acquisition
 from data.data_writer import DataWriter
 from experiments.scan_runner import ScanRunner
-from hardware.config import SHUTTER_TIMING
 from hardware.hardware_manager import HardwareManager
 from monitor.experiment_monitor import ExperimentMonitor
 from plotting.plot_manager import PlotManager
@@ -60,21 +60,22 @@ class ExperimentController:
 
         with HardwareManager() as hardware:
 
+            hardware.spectrometer.set_integration_time(
+                self.config.spectrometer.integration_time_ms
+            )
+
             acquisition = Acquisition(
                 spectrometer=hardware.spectrometer,
                 shutter=hardware.shutter,
-                shutter_open_delay=SHUTTER_TIMING.open_delay_s,
-                shutter_close_delay=SHUTTER_TIMING.close_delay_s,
+                shutter_open_delay=self.config.shutter.open_delay_s,
+                shutter_close_delay=self.config.shutter.close_delay_s,
             )
 
             self.experiment.hardware = hardware
             self.experiment.acquisition = acquisition
+            self.experiment.averages = self.config.spectrometer.averages
 
             monitor = ExperimentMonitor()
-
-            plotter = PlotManager(
-                enabled=True,
-            )
 
             monitor.start(
                 total_measurements=total_measurements,
@@ -89,6 +90,44 @@ class ExperimentController:
                 writer.save_metadata(
                     config=self.config,
                     hardware_info=hardware.summary(),
+                    extra_metadata={
+                        "experimental_metadata": asdict(
+                            self.config.metadata
+                        ),
+                    },
+                )
+
+                should_save = (
+                    not self.config.test.enabled
+                    or self.config.test.save_data
+                )
+
+                if self.config.background.enabled and should_save:
+                    logger.info(
+                        "Acquiring pre-scan background %r with shutter closed.",
+                        self.config.background.name,
+                    )
+
+                    background = acquisition.acquire_dark(
+                        averages=self.config.background.averages,
+                        settle_time_s=(
+                            self.config.background.settle_time_s
+                        ),
+                    )
+
+                    writer.save_background(
+                        background,
+                        name=self.config.background.name,
+                        metadata={
+                            "kind": "shutter_closed_dark",
+                            "purpose": "pre_scan_background_correction",
+                            "shutter_state": "closed",
+                            "notes": self.config.background.notes,
+                        },
+                    )
+
+                plotter = PlotManager(
+                    enabled=True,
                 )
 
                 runner = ScanRunner(
@@ -127,16 +166,11 @@ class ExperimentController:
                         # Save data
                         #
 
-                        if (
-                            not self.config.test.enabled
-                            or self.config.test.save_data
-                        ):
+                        if should_save:
 
                             writer.save_result(
                                 measurement
                             )
-
-                    monitor.finish()
 
                 except KeyboardInterrupt:
 
@@ -174,7 +208,7 @@ class ExperimentController:
 
                     plotter.close()
 
-                    monitor.finish()
+                monitor.finish()
 
     # ------------------------------------------------------------------
 

@@ -124,6 +124,7 @@ class Acquisition:
         self,
         *,
         averages: int = 1,
+        settle_time_s: float = 0.0,
     ) -> Spectrum:
         """
         Acquire a dark spectrum.
@@ -132,6 +133,9 @@ class Acquisition:
         """
 
         self.shutter.close()
+
+        if settle_time_s > 0:
+            time.sleep(float(settle_time_s))
 
         return self.spectrometer.acquire(
             averages=averages,

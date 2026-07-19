@@ -168,7 +168,10 @@ Measurement(
     timestamp=...,
     waveplate_angle_deg=...,
     sample_angle_deg=...,
-    power_mw=...,
+    power_mw=...,                       # achieved mean power
+    target_power_mw=...,                # requested setpoint
+    power_rms_mw=...,                   # meter-reported RMS
+    power_measurement_duration_s=...,
     fluence_mj_cm2=...,
     intensity_w_cm2=...,
     spectrum=...,
@@ -187,8 +190,21 @@ Convenience properties may expose:
 * `measurement.intensities`
 * `measurement.integration_time_ms`
 * `measurement.averages`
+* `measurement.achieved_power_mw`
 
 These properties should forward to the embedded `Spectrum`; they should not create a second independent copy of the same state.
+
+`power_mw` is intentionally the canonical achieved mean power and remains the
+field used by power-coordinate analysis. `achieved_power_mw` is a read-only
+alias. `target_power_mw` is the requested setpoint and must not be substituted
+for achieved power. `power_rms_mw` stores the RMS statistic reported by the
+meter over `power_measurement_duration_s`; it is not defined as standard
+deviation unless a future verified hardware integration explicitly establishes
+that convention.
+
+These optional fields make the model ready for a power meter, but the current
+hardware and experiment layers do not construct, connect, sample, or calibrate
+one. `RotationIntensityExperiment` currently leaves all power fields unset.
 
 ### Historical incompatibility
 
@@ -308,16 +324,30 @@ results/
     ├── metadata.json
     ├── config.json
     ├── hardware.json
+    ├── backgrounds.json
+    ├── backgrounds/
+    │   └── background_000001.npz
     ├── measurements.csv
     └── spectra/
         ├── spectrum_000001.npz
         └── ...
 ```
 
-The current format version is `2`, recorded as `format_version` in
+The current format version is `4`, recorded as `format_version` in
 `metadata.json`. The CSV index includes a `measurement_metadata` field holding
 a JSON object for per-measurement analysis and correction provenance. Loaders
 treat the absent field in older datasets as an empty dictionary.
+
+Version 4 adds optional `target_power_mw`, `power_rms_mw`, and
+`power_measurement_duration_s` columns while retaining `power_mw` as achieved
+mean power. The loader treats any of these columns as absent/`None` for older
+datasets. This is a persistence schema capability, not evidence that a power
+meter was connected during acquisition.
+
+Named raw background spectra are stored separately under `backgrounds/` and
+indexed by `backgrounds.json`. `ExperimentDataset.backgrounds` exposes them as
+`BackgroundSpectrum` objects. An absent background index in an older dataset is
+interpreted as an empty background collection.
 
 ### `DataWriter`
 
@@ -375,8 +405,131 @@ If an old archive contains object arrays, report that it was produced by an inco
 * Hardware information.
 * General metadata.
 * A list of `Measurement` objects.
+* A list of named `BackgroundSpectrum` objects.
 
 It should support iteration, indexing, length, and useful convenience summaries.
+
+## Offline harmonic analysis
+
+`analysis/harmonic_analysis.py` consumes a loaded `ExperimentDataset` and one
+or more named `HarmonicWindow` definitions. It can explicitly apply a compatible
+saved background and either a scalar transmission fraction or wavelength-
+dependent transmission curve before trapezoidal integration.
+
+Acquisition always preserves the full raw detector spectrum, even when a
+physical filter isolates one harmonic. Selecting a single window limits only
+the derived analysis output. Corrections never overwrite source measurements.
+
+The quantitative result flow is:
+
+```text
+ExperimentDataset
+        |
+        v
+analyse_dataset(...)
+        |
+        +-- harmonic_signals.csv     complete derived result table
+        |
+        v
+AnalysedRun
+        |
+        +-- excitation_scan_data(...)
+        +-- rotation_scan_data(...)
+        |
+        v
+FigureData
+        +-- save_figure_data_csv(...)
+        `-- plot_figure_data(...)
+```
+
+`analysis/data_products.py` is the reusable selection and data-product layer.
+`AnalysedRun` keeps one run's result rows together with its label, source
+experiment, analysis directory, and recipe. `load_analysed_run()` reconstructs
+one from a quick-analysis directory. Multiple `AnalysedRun` objects can be
+passed to `excitation_scan_data()` or `rotation_scan_data()`; series are keyed
+by run and harmonic so points from separate experiments are never joined into
+one line.
+
+`FigureData` is presentation-independent and contains exactly the long-form
+records that will be plotted. `save_figure_data_csv()` writes those records,
+including unnormalised signal, plotted value, units, correction provenance,
+any normalisation factor, and the fixed-value absolute tolerance.
+`plotting/harmonic_plots.py:plot_figure_data()`
+renders the same object as a Cartesian or, for rotation data, polar figure.
+Rendering does not aggregate replicates, discard saturated rows, or change
+negative corrected signals.
+
+Excitation selection accepts four explicit fields already present in the
+canonical measurement/result model: `waveplate_angle_deg`, `power_mw`,
+`fluence_mj_cm2`, and `intensity_w_cm2`. Missing power, fluence, or intensity
+values cause an actionable error; there is no implicit calibration or fallback
+to waveplate angle. Repeated coordinates remain separate records. Same-named
+harmonics with different wavelength windows across selected runs are rejected
+by default.
+
+For `rotation_scan_data(..., fixed_field="power_mw")`, matching is against
+achieved `HarmonicResult.power_mw`, not the requested target. `value_tolerance`
+is an explicit non-negative absolute tolerance in mW. The requested value and
+tolerance are stored in `FigureData` and every figure CSV row. Quick-analysis
+manifest records additionally store the minimum and maximum achieved values
+actually matched, making the selected range auditable.
+
+When the quick CLI uses `--plot-all` with `power_mw`, complete
+`target_power_mw` coverage supplies nominal automatic rotation centres. The
+selector nevertheless matches each row's achieved `power_mw` using the
+configured tolerance. If target coverage is incomplete, unique achieved-power
+values supply the automatic centres. `analysis_recipe.json` records the centre
+source separately from the selection field.
+
+`tools/analyse_experiment.py` remains the single-run quick-analysis entry point.
+Its `--input-coordinate`, `--input-value`, `--input-tolerance`, and `--signal`
+flags control figure selection without changing the master calculation table.
+It writes:
+
+* `harmonic_signals.csv`, containing every derived measurement/harmonic row.
+* `analysis_recipe.json`, containing correction provenance and a figure
+  manifest.
+* `analysis_recipe.sha256`, containing the SHA-256 of the final recipe.
+* `analysis_summary.md`, containing the durable human-readable report.
+* Same-stem PNG, PDF, and CSV files for every requested figure.
+
+Each manifest entry records the PNG, PDF, and figure-data CSV paths together
+with the coordinate, signal, fixed selection, absolute tolerance, actual
+matched minimum/maximum, correction annotation, figure-data SHA-256, series
+IDs, and row count. Analysis and plotting remain hardware-independent.
+
+Background and transmission correction modes are explicit provenance states:
+`used`, `explicitly_not_used`, or `not_specified`. `--no-background` and
+`--no-transmission-correction` distinguish a deliberate no-correction analysis
+from an omitted choice. If a background is available or an installed filter is
+recorded while the corresponding choice is unspecified, analysis proceeds
+without that correction and records an actionable warning. Metadata never
+turns corrections on implicitly.
+
+The analysis recipe format is version 2. It records the ordered correction
+pipeline:
+
+1. Raw detector data.
+2. Optional saved-background subtraction.
+3. Optional scalar or wavelength-dependent filter-transmission correction.
+4. Harmonic-window integration with `numpy.trapezoid`.
+
+It also records quality counts, warnings, Python/NumPy/Matplotlib versions, the
+master harmonic-table checksum, source background/calibration checksums where
+applicable, and the figure manifest. Each figure-data CSV has its own checksum
+in that manifest. `analysis/analysis_reporting.py` builds those warnings,
+correction annotations, console summary, and `analysis_summary.md`.
+
+`plot_figure_data()` accepts a correction annotation. The CLI supplies one by
+default so quick-look figures state the displayed signal and correction
+choices. `--no-annotate-corrections` disables only this visual footer; it does
+not alter numerical processing or provenance outputs.
+
+`integrated_signal` is the final window integral after all explicitly selected
+corrections. `raw_integrated_signal` is the uncorrected integral, and
+`background_corrected_integral` is the intermediate value before optional
+transmission correction. Keeping all three in every result makes correction
+choices inspectable without modifying the raw experiment.
 
 ## Standalone tools
 
@@ -396,19 +549,14 @@ For example, `tools/live_spectrometer.py` should not connect to either rotation 
 
 ## Background correction architecture
 
-The live viewer may use a persistent background manager such as:
-
-```text
-tools/spectrum_background.py
-```
-
-with a fixed file:
+The live viewer implements persistent display-background handling directly in
+`tools/live_spectrometer.py`, using the fixed file:
 
 ```text
 tools/live_spectrometer_background.npz
 ```
 
-The background manager should:
+The live background handling should:
 
 * Load one saved background.
 * Capture and overwrite it.

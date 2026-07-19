@@ -1,6 +1,10 @@
 ﻿.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 data/*/**
 !data/*
 results/
+tools/live_spectrometer_background.npz
