@@ -1,0 +1,387 @@
+diff --git a/tools/test_target_power_scan_hardware.py b/tools/test_target_power_scan_hardware.py
+index e060e3b..bc812b7 100644
+--- a/tools/test_target_power_scan_hardware.py
++++ b/tools/test_target_power_scan_hardware.py
+@@ -351,198 +351,226 @@ def run_order_test(
+     failure: BaseException | None = None
+     starting_waveplate: float | None = None
+     starting_sample: float | None = None
+-    hardware = None
++
++    hardware_context = hardware_factory(
++        enable_power_meter=True,
++        power_meter_wavelength_option=arguments.wavelength_option,
++        power_meter_range_option=arguments.range_option,
++    )
+ 
+     try:
+-        with hardware_factory(
+-            enable_power_meter=True,
+-            power_meter_wavelength_option=arguments.wavelength_option,
+-            power_meter_range_option=arguments.range_option,
+-        ) as hardware:
+-            recorder.record("hardware_connected")
+-            hardware.spectrometer.set_integration_time(
+-                float(arguments.integration_time_ms)
+-            )
+-            acquisition = acquisition_factory(
+-                spectrometer=hardware.spectrometer,
+-                shutter=hardware.shutter,
+-                shutter_open_delay=0.0,
+-                shutter_close_delay=0.0,
+-                before_open=hardware.require_sample_beam_path_clear,
+-            )
+-
+-            starting_waveplate = float(hardware.waveplate.position)
+-            starting_sample = float(hardware.sample.position)
+-            recorder.record(
+-                "starting_positions",
+-                waveplate_angle_deg=starting_waveplate,
+-                sample_angle_deg=starting_sample,
+-            )
+-
+-            hardware.shutter.close()
+-            recorder.record("shutter_closed")
+-
+-            for block_index, block in enumerate(blocks, start=1):
++        with hardware_context as hardware:
++            try:
++                recorder.record("hardware_connected")
++                hardware.spectrometer.set_integration_time(
++                    float(arguments.integration_time_ms)
++                )
++                acquisition = acquisition_factory(
++                    spectrometer=hardware.spectrometer,
++                    shutter=hardware.shutter,
++                    shutter_open_delay=0.0,
++                    shutter_close_delay=0.0,
++                    before_open=hardware.require_sample_beam_path_clear,
++                )
++
++                starting_waveplate = float(hardware.waveplate.position)
++                starting_sample = float(hardware.sample.position)
+                 recorder.record(
+-                    "power_block_started",
+-                    block_index=block_index,
+-                    simulated_target_power_mw=block.target_power_mw,
+-                    planned_waveplate_angle_deg=block.waveplate_angle_deg,
++                    "starting_positions",
++                    waveplate_angle_deg=starting_waveplate,
++                    sample_angle_deg=starting_sample,
+                 )
+ 
+-                with hardware.power_probe.measurement_session() as session:
+-                    recorder.record(
+-                        "power_probe_inserted",
+-                        block_index=block_index,
+-                        stage_position_mm=float(hardware.power_meter_stage.position_mm),
+-                    )
+-                    session.prepare_for_motion()
+-                    recorder.record(
+-                        "waveplate_motion_guard_verified",
+-                        block_index=block_index,
+-                        shutter_closed=bool(hardware.shutter.is_closed),
+-                    )
+-                    hardware.waveplate.move_to(block.waveplate_angle_deg)
++                hardware.shutter.close()
++                recorder.record("shutter_closed")
++
++                for block_index, block in enumerate(blocks, start=1):
+                     recorder.record(
+-                        "waveplate_moved",
++                        "power_block_started",
+                         block_index=block_index,
+-                        waveplate_angle_deg=float(hardware.waveplate.position),
++                        simulated_target_power_mw=block.target_power_mw,
++                        planned_waveplate_angle_deg=block.waveplate_angle_deg,
+                     )
+ 
+-                    if arguments.exercise_optical_paths:
+-                        trace = session.acquire_trace(
+-                            duration_s=float(arguments.power_duration_s),
+-                            settle_time_s=float(arguments.power_settle_s),
+-                        )
+-                        trace_summary = save_trace(
+-                            run_directory=run_directory,
+-                            trace=trace,
+-                            trace_index=block_index,
++                    with hardware.power_probe.measurement_session() as session:
++                        recorder.record(
++                            "power_probe_inserted",
++                            block_index=block_index,
+                             stage_position_mm=float(
+                                 hardware.power_meter_stage.position_mm
+                             ),
+                         )
++                        session.prepare_for_motion()
+                         recorder.record(
+-                            "dark_power_trace_acquired",
++                            "waveplate_motion_guard_verified",
+                             block_index=block_index,
+-                            trace_id=trace.trace_id,
+-                            valid_samples=trace.statistics.valid_sample_count,
+-                            mean_power_mw=(
+-                                trace.statistics.arithmetic_mean_power_mw
+-                            ),
+-                            summary_file=f"trace_{block_index:03d}_summary.json",
+-                            summary=trace_summary,
++                            shutter_closed=bool(hardware.shutter.is_closed),
+                         )
+-                    else:
++                        hardware.waveplate.move_to(block.waveplate_angle_deg)
+                         recorder.record(
+-                            "dark_power_trace_skipped",
++                            "waveplate_moved",
+                             block_index=block_index,
+-                            shutter_closed=bool(hardware.shutter.is_closed),
++                            waveplate_angle_deg=float(hardware.waveplate.position),
+                         )
+ 
+-                hardware.require_sample_beam_path_clear()
+-                recorder.record(
+-                    "power_probe_retracted",
+-                    block_index=block_index,
+-                    stage_position_mm=float(hardware.power_meter_stage.position_mm),
+-                )
+-
+-                for sample_index, sample_angle in enumerate(
+-                    arguments.sample_angles,
+-                    start=1,
+-                ):
+-                    hardware.sample.move_to(float(sample_angle))
++                        if arguments.exercise_optical_paths:
++                            trace = session.acquire_trace(
++                                duration_s=float(arguments.power_duration_s),
++                                settle_time_s=float(arguments.power_settle_s),
++                            )
++                            trace_summary = save_trace(
++                                run_directory=run_directory,
++                                trace=trace,
++                                trace_index=block_index,
++                                stage_position_mm=float(
++                                    hardware.power_meter_stage.position_mm
++                                ),
++                            )
++                            recorder.record(
++                                "dark_power_trace_acquired",
++                                block_index=block_index,
++                                trace_id=trace.trace_id,
++                                valid_samples=trace.statistics.valid_sample_count,
++                                mean_power_mw=(
++                                    trace.statistics.arithmetic_mean_power_mw
++                                ),
++                                summary_file=(
++                                    f"trace_{block_index:03d}_summary.json"
++                                ),
++                                summary=trace_summary,
++                            )
++                        else:
++                            recorder.record(
++                                "dark_power_trace_skipped",
++                                block_index=block_index,
++                                shutter_closed=bool(hardware.shutter.is_closed),
++                            )
++
++                    hardware.require_sample_beam_path_clear()
+                     recorder.record(
+-                        "sample_moved",
++                        "power_probe_retracted",
+                         block_index=block_index,
+-                        sample_index=sample_index,
+-                        sample_angle_deg=float(hardware.sample.position),
++                        stage_position_mm=float(
++                            hardware.power_meter_stage.position_mm
++                        ),
+                     )
+ 
+-                    if arguments.exercise_optical_paths:
+-                        spectrum = acquisition.acquire(
+-                            averages=int(arguments.averages)
+-                        )
+-                        spectrum_path = save_spectrum(
+-                            run_directory=run_directory,
+-                            spectrum=spectrum,
+-                            block_index=block_index,
+-                            sample_index=sample_index,
+-                            block=block,
+-                            sample_angle_deg=float(sample_angle),
+-                        )
+-                        recorder.record(
+-                            "dark_spectrum_acquired",
+-                            block_index=block_index,
+-                            sample_index=sample_index,
+-                            spectrum_file=str(
+-                                spectrum_path.relative_to(run_directory)
+-                            ),
+-                        )
+-                    else:
++                    for sample_index, sample_angle in enumerate(
++                        arguments.sample_angles,
++                        start=1,
++                    ):
++                        hardware.sample.move_to(float(sample_angle))
+                         recorder.record(
+-                            "dark_spectrum_skipped",
++                            "sample_moved",
+                             block_index=block_index,
+                             sample_index=sample_index,
+-                            shutter_closed=bool(hardware.shutter.is_closed),
++                            sample_angle_deg=float(hardware.sample.position),
+                         )
+ 
+-                recorder.record(
+-                    "power_block_finished",
+-                    block_index=block_index,
+-                    simulated_target_power_mw=block.target_power_mw,
+-                )
++                        if arguments.exercise_optical_paths:
++                            spectrum = acquisition.acquire(
++                                averages=int(arguments.averages)
++                            )
++                            spectrum_path = save_spectrum(
++                                run_directory=run_directory,
++                                spectrum=spectrum,
++                                block_index=block_index,
++                                sample_index=sample_index,
++                                block=block,
++                                sample_angle_deg=float(sample_angle),
++                            )
++                            recorder.record(
++                                "dark_spectrum_acquired",
++                                block_index=block_index,
++                                sample_index=sample_index,
++                                spectrum_file=str(
++                                    spectrum_path.relative_to(run_directory)
++                                ),
++                            )
++                        else:
++                            recorder.record(
++                                "dark_spectrum_skipped",
++                                block_index=block_index,
++                                sample_index=sample_index,
++                                shutter_closed=bool(hardware.shutter.is_closed),
++                            )
+ 
+-    except BaseException as error:
+-        failure = error
+-        recorder.record("test_failed", error=repr(error))
+-        raise
++                    recorder.record(
++                        "power_block_finished",
++                        block_index=block_index,
++                        simulated_target_power_mw=block.target_power_mw,
++                    )
+ 
+-    finally:
+-        if hardware is not None:
+-            try:
+-                hardware.shutter.close()
+-                recorder.record("final_shutter_close_requested")
+-            except Exception as error:
+-                recorder.record("final_shutter_close_failed", error=repr(error))
++            except BaseException as error:
++                failure = error
++                recorder.record("test_failed", error=repr(error))
++                raise
++
++            finally:
++                cleanup_errors: list[BaseException] = []
+ 
+-            try:
+-                if hardware.power_probe is not None:
+-                    hardware.power_probe.safe_retract()
+-                    recorder.record("final_probe_retraction_verified")
+-            except Exception as error:
+-                recorder.record("final_probe_retraction_failed", error=repr(error))
+-
+-            if (
+-                not arguments.leave_rotation_stages
+-                and starting_waveplate is not None
+-                and starting_sample is not None
+-            ):
+                 try:
+                     hardware.shutter.close()
+-                    if hardware.power_probe is not None:
+-                        hardware.power_probe.require_out()
+-                    hardware.waveplate.move_to(starting_waveplate)
+-                    recorder.record(
+-                        "waveplate_returned",
+-                        waveplate_angle_deg=float(hardware.waveplate.position),
+-                    )
+-                    hardware.sample.move_to(starting_sample)
++                    recorder.record("final_shutter_close_verified")
++                except BaseException as error:
++                    cleanup_errors.append(error)
+                     recorder.record(
+-                        "sample_returned",
+-                        sample_angle_deg=float(hardware.sample.position),
++                        "final_shutter_close_failed",
++                        error=repr(error),
+                     )
+-                except Exception as error:
++
++                try:
++                    if hardware.power_probe is not None:
++                        hardware.power_probe.safe_retract()
++                        recorder.record("final_probe_retraction_verified")
++                except BaseException as error:
++                    cleanup_errors.append(error)
+                     recorder.record(
+-                        "rotation_stage_return_failed",
++                        "final_probe_retraction_failed",
+                         error=repr(error),
+                     )
+ 
++                if (
++                    not arguments.leave_rotation_stages
++                    and starting_waveplate is not None
++                    and starting_sample is not None
++                ):
++                    try:
++                        hardware.shutter.close()
++                        hardware.require_sample_beam_path_clear()
++                        hardware.waveplate.move_to(starting_waveplate)
++                        recorder.record(
++                            "waveplate_returned",
++                            waveplate_angle_deg=float(
++                                hardware.waveplate.position
++                            ),
++                        )
++                        hardware.sample.move_to(starting_sample)
++                        recorder.record(
++                            "sample_returned",
++                            sample_angle_deg=float(hardware.sample.position),
++                        )
++                    except BaseException as error:
++                        cleanup_errors.append(error)
++                        recorder.record(
++                            "rotation_stage_return_failed",
++                            error=repr(error),
++                        )
++
++                if failure is None and cleanup_errors:
++                    raise RuntimeError(
++                        "Laser-off hardware-order cleanup failed: "
++                        + "; ".join(str(error) for error in cleanup_errors)
++                    ) from cleanup_errors[0]
++
++    finally:
+         summary = {
+             "created": datetime.now().isoformat(),
+             "laser_off_asserted": bool(arguments.laser_off),
+             "exercise_optical_paths": bool(arguments.exercise_optical_paths),
+-            "sample_angles_deg": [float(value) for value in arguments.sample_angles],
++            "sample_angles_deg": [
++                float(value) for value in arguments.sample_angles
++            ],
+             "blocks": [
+                 {
+                     "simulated_target_power_mw": block.target_power_mw,
+@@ -562,7 +590,6 @@ def run_order_test(
+     print(f"Saved chronological hardware-order log: {run_directory}")
+     return run_directory
+ 
+-
+ def main() -> None:
+     arguments = parse_arguments()
+     print_action_summary(arguments)
