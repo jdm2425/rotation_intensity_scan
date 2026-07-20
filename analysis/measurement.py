@@ -17,6 +17,11 @@ import numpy as np
 
 from hardware.devices.spectrometer.spectrum import Spectrum
 
+try:
+    from hardware.devices.power_meter.models import PowerTrace
+except ImportError:  # Models are optional for legacy/no-meter installations.
+    PowerTrace = Any
+
 
 @dataclass(slots=True)
 class Measurement:
@@ -61,6 +66,34 @@ class Measurement:
     power_measurement_duration_s: float | None = field(
         default=None,
         kw_only=True,
+    )
+
+    # Population standard deviation of valid power samples. ``power_rms_mw``
+    # remains the absolute RMS sqrt(mean(power**2)); these are intentionally
+    # separate statistics.
+    power_std_mw: float | None = field(default=None, kw_only=True)
+
+    # Stable reference shared by all spectra associated with one raw power
+    # trace. No value is manufactured when acquisition fails.
+    power_measurement_id: str | None = field(default=None, kw_only=True)
+
+    power_trace_id: str | None = field(default=None, kw_only=True)
+
+    power_measurement_status: str | None = field(default=None, kw_only=True)
+
+    power_measurement_error: str | None = field(default=None, kw_only=True)
+
+    power_valid_sample_count: int | None = field(default=None, kw_only=True)
+
+    power_total_sample_count: int | None = field(default=None, kw_only=True)
+
+    # A transient/shared in-memory reference. DataWriter stores each unique
+    # trace once and DataLoader restores shared references after loading.
+    power_trace: PowerTrace | None = field(
+        default=None,
+        kw_only=True,
+        repr=False,
+        compare=False,
     )
 
     fluence_mj_cm2: float | None = None
@@ -214,6 +247,27 @@ class Measurement:
 
             "power_measurement_duration_s":
                 self.power_measurement_duration_s,
+
+            "power_std_mw":
+                self.power_std_mw,
+
+            "power_measurement_id":
+                self.power_measurement_id,
+
+            "power_trace_id":
+                self.power_trace_id,
+
+            "power_measurement_status":
+                self.power_measurement_status,
+
+            "power_measurement_error":
+                self.power_measurement_error,
+
+            "power_valid_sample_count":
+                self.power_valid_sample_count,
+
+            "power_total_sample_count":
+                self.power_total_sample_count,
 
             "peak_counts":
                 self.peak_counts,

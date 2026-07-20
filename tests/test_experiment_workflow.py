@@ -54,6 +54,10 @@ class FakeShutter:
     def is_open(self) -> bool:
         return self.state == 0
 
+    @property
+    def is_closed(self) -> bool:
+        return self.state == 1
+
     def open(self) -> None:
         self.state = 0
         self.events.append(("shutter", "open"))
@@ -109,6 +113,8 @@ class FakeHardwareManager:
 
     def __init__(self):
         self.events: list[tuple] = []
+        self.context_exited = False
+        self.exit_exception_type = None
         self.waveplate = FakeStage("Waveplate", self.events)
         self.sample = FakeStage("Sample Stage", self.events)
         self.shutter = FakeShutter(self.events)
@@ -120,6 +126,8 @@ class FakeHardwareManager:
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        self.context_exited = True
+        self.exit_exception_type = exc_type
         self.shutter.close()
         return False
 
@@ -130,6 +138,20 @@ class FakeHardwareManager:
             "shutter": self.shutter.info(),
             "spectrometer": self.spectrometer.info(),
         }
+
+
+class FailingBackgroundHardwareManager(FakeHardwareManager):
+    """Fake a spectrometer failure during pre-scan setup."""
+
+    def __init__(self):
+        super().__init__()
+
+        def fail_background(*, averages: int = 1) -> Spectrum:
+            shutter_state = "open" if self.shutter.is_open else "closed"
+            self.events.append(("acquire", shutter_state, averages))
+            raise RuntimeError("simulated background failure")
+
+        self.spectrometer.acquire = fail_background
 
 
 class DummyPlotManager:
@@ -221,10 +243,54 @@ def main() -> None:
         )
         assert first_acquisition < first_move
         assert hardware.shutter.state == 1
+        assert hardware.context_exited is True
+        assert hardware.exit_exception_type is None
+
+    # The persistence callback is installed before pre-scan acquisition. A
+    # setup failure must clear that callback, stop both rotation stages, and
+    # still exit the hardware context with the shutter closed.
+    with tempfile.TemporaryDirectory(prefix="failed_setup_") as temporary:
+        config = ExperimentConfig()
+        config.saving.output_directory = Path(temporary)
+        config.saving.experiment_name = "FailedSetup"
+        config.background.settle_time_s = 0.0
+        config.shutter.open_delay_s = 0.0
+        config.shutter.close_delay_s = 0.0
+        experiment = RotationIntensityExperiment()
+
+        with (
+            patch(
+                "experiments.experiment_controller.HardwareManager",
+                FailingBackgroundHardwareManager,
+            ),
+            patch(
+                "experiments.experiment_controller.PlotManager",
+                DummyPlotManager,
+            ),
+        ):
+            try:
+                ExperimentController(
+                    config=config,
+                    experiment=experiment,
+                ).run(
+                    waveplate_angles=[0.0],
+                    sample_angles=[0.0],
+                )
+            except RuntimeError as error:
+                assert "simulated background failure" in str(error)
+            else:
+                raise AssertionError("Expected simulated background failure.")
+
+        hardware = FailingBackgroundHardwareManager.last_instance
+        assert experiment.power_attempt_callback is None
+        assert hardware.context_exited is True
+        assert hardware.exit_exception_type is RuntimeError
+        assert hardware.shutter.is_closed
+        assert ("stop", "Waveplate") in hardware.events
+        assert ("stop", "Sample Stage") in hardware.events
 
     print("EXPERIMENT WORKFLOW TEST PASSED")
 
 
 if __name__ == "__main__":
     main()
-

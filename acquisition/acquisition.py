@@ -36,8 +36,15 @@ class Acquisition:
     shutter
         Beam shutter.
 
-    shutter_delay
+    shutter_open_delay
         Delay after opening the shutter before beginning acquisition.
+
+    shutter_close_delay
+        Optional hold time after acquisition and before closing the shutter.
+
+    before_open
+        Optional safety guard called immediately before every illuminated
+        shutter opening.
     """
 
     def __init__(
@@ -47,6 +54,7 @@ class Acquisition:
         shutter,
         shutter_open_delay: float = 0.10,
         shutter_close_delay: float = 0.00,
+        before_open=None,
     ):
 
         self.spectrometer = spectrometer
@@ -67,6 +75,7 @@ class Acquisition:
         self.shutter_close_delay = float(
             shutter_close_delay
         )
+        self.before_open = before_open
     # ------------------------------------------------------------------
 
     def acquire(
@@ -81,11 +90,14 @@ class Acquisition:
         even if an exception occurs.
         """
 
-        logger.debug("Opening shutter.")
-
-        self.shutter.open()
-
         try:
+
+            logger.debug("Opening shutter.")
+
+            if self.before_open is not None:
+                self.before_open()
+
+            self.shutter.open()
 
             #
             # Allow the shutter to finish moving.

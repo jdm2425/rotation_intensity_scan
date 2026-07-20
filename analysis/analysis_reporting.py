@@ -56,10 +56,13 @@ def installed_filter_names(experimental_metadata: dict) -> list[str]:
 
 def build_quality_summary(
     results: Iterable[HarmonicResult],
+    *,
+    power_attempts: Iterable[object] = (),
 ) -> dict[str, int]:
     """Summarise quality flags and power-statistics coverage."""
 
     rows = tuple(results)
+    attempts = tuple(power_attempts)
     measurement_numbers = {row.measurement_number for row in rows}
     saturated_measurements = {
         row.measurement_number for row in rows if row.saturated
@@ -67,6 +70,74 @@ def build_quality_summary(
     target_power_rows = [
         row for row in rows if getattr(row, "target_power_mw", None) is not None
     ]
+    failed_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if getattr(row, "power_measurement_status", None) == "failed"
+    }
+    invalid_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if getattr(row, "power_measurement_status", None) == "invalid"
+    }
+    partial_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if getattr(row, "power_measurement_status", None)
+        == "measured_with_invalid_samples"
+    }
+    over_limit_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if getattr(row, "power_measurement_status", None) == "over_limit"
+    }
+    unsafe_status_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if getattr(row, "power_measurement_status", None)
+        == "unsafe_meter_status"
+    }
+    nonpositive_power_measurements = {
+        getattr(row, "power_measurement_id", None) or row.measurement_number
+        for row in rows
+        if row.power_mw is not None and row.power_mw <= 0
+    }
+
+    linked_power_attempt_ids = {
+        str(getattr(row, "power_measurement_id"))
+        for row in rows
+        if getattr(row, "power_measurement_id", None) is not None
+    }
+    indexed_attempt_ids: set[str] = set()
+    attempt_ids_by_status: dict[str, set[str]] = {}
+    for index, attempt in enumerate(attempts, start=1):
+        if isinstance(attempt, dict):
+            attempt_id = attempt.get("attempt_id")
+            status = attempt.get("status")
+        else:
+            attempt_id = getattr(attempt, "attempt_id", None)
+            status = getattr(attempt, "status", None)
+        stable_id = (
+            str(attempt_id).strip()
+            if attempt_id is not None and str(attempt_id).strip()
+            else f"unidentified_attempt_{index}"
+        )
+        indexed_attempt_ids.add(stable_id)
+        if status is not None:
+            attempt_ids_by_status.setdefault(str(status), set()).add(stable_id)
+
+    failed_power_measurements.update(attempt_ids_by_status.get("failed", set()))
+    invalid_power_measurements.update(attempt_ids_by_status.get("invalid", set()))
+    partial_power_measurements.update(
+        attempt_ids_by_status.get("measured_with_invalid_samples", set())
+    )
+    over_limit_power_measurements.update(
+        attempt_ids_by_status.get("over_limit", set())
+    )
+    unsafe_status_power_measurements.update(
+        attempt_ids_by_status.get("unsafe_meter_status", set())
+    )
+    attempts_without_spectra = indexed_attempt_ids - linked_power_attempt_ids
 
     return {
         "measurement_count": len(measurement_numbers),
@@ -81,6 +152,9 @@ def build_quality_summary(
         "power_rms_row_count": sum(
             getattr(row, "power_rms_mw", None) is not None for row in rows
         ),
+        "power_std_row_count": sum(
+            getattr(row, "power_std_mw", None) is not None for row in rows
+        ),
         "power_duration_row_count": sum(
             getattr(row, "power_measurement_duration_s", None) is not None
             for row in rows
@@ -92,10 +166,28 @@ def build_quality_summary(
             getattr(row, "power_rms_mw", None) is not None
             for row in target_power_rows
         ),
+        "target_power_with_std_count": sum(
+            getattr(row, "power_std_mw", None) is not None
+            for row in target_power_rows
+        ),
         "target_power_with_duration_count": sum(
             getattr(row, "power_measurement_duration_s", None) is not None
             for row in target_power_rows
         ),
+        "failed_power_measurement_count": len(failed_power_measurements),
+        "invalid_power_measurement_count": len(invalid_power_measurements),
+        "partial_power_measurement_count": len(partial_power_measurements),
+        "over_limit_power_measurement_count": len(
+            over_limit_power_measurements
+        ),
+        "unsafe_status_power_measurement_count": len(
+            unsafe_status_power_measurements
+        ),
+        "nonpositive_power_measurement_count": len(
+            nonpositive_power_measurements
+        ),
+        "power_attempt_count": len(indexed_attempt_ids),
+        "power_attempt_without_spectrum_count": len(attempts_without_spectra),
     }
 
 
@@ -106,11 +198,12 @@ def build_analysis_warnings(
     available_backgrounds: Iterable[str],
     transmission_mode: str,
     experimental_metadata: dict,
+    power_attempts: Iterable[object] = (),
 ) -> list[dict[str, str]]:
     """Build warnings for omitted choices and notable data-quality flags."""
 
     rows = tuple(results)
-    quality = build_quality_summary(rows)
+    quality = build_quality_summary(rows, power_attempts=power_attempts)
     warnings: list[AnalysisWarning] = []
     available_backgrounds = list(available_backgrounds)
     filters = installed_filter_names(experimental_metadata)
@@ -187,6 +280,94 @@ def build_analysis_warnings(
             )
         )
 
+    if quality["failed_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="failed_power_measurements",
+                message=(
+                    f"{quality['failed_power_measurement_count']} incident-"
+                    "power measurement(s) failed. Their achieved power is "
+                    "left missing; no value was predicted or substituted."
+                ),
+            )
+        )
+
+    if quality["invalid_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="invalid_power_measurements",
+                message=(
+                    f"{quality['invalid_power_measurement_count']} incident-"
+                    "power trace(s) contained no valid positive reading. "
+                    "Zero, negative, missing, and status-flagged raw samples "
+                    "are preserved, but no achieved power was inferred."
+                ),
+            )
+        )
+
+    if quality["partial_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="partially_invalid_power_measurements",
+                message=(
+                    f"{quality['partial_power_measurement_count']} incident-"
+                    "power trace(s) included invalid raw samples. They were "
+                    "preserved but excluded from the reported mean, "
+                    "standard deviation, and RMS."
+                ),
+            )
+        )
+
+    if quality["over_limit_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="incident_power_over_limit",
+                message=(
+                    f"{quality['over_limit_power_measurement_count']} incident-"
+                    "power attempt(s) exceeded the configured safety limit."
+                ),
+            )
+        )
+
+    if quality["unsafe_status_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="unsafe_power_meter_status",
+                message=(
+                    f"{quality['unsafe_status_power_measurement_count']} "
+                    "incident-power attempt(s) contained an unsafe meter "
+                    "status/non-finite flag."
+                ),
+            )
+        )
+
+    if quality["power_attempt_without_spectrum_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="power_attempts_without_spectra",
+                message=(
+                    f"{quality['power_attempt_without_spectrum_count']} saved "
+                    "incident-power attempt(s) have no associated spectrum. "
+                    "This records an acquisition abort or a later spectrum "
+                    "failure; inspect power_attempts.json for the exact status "
+                    "and error."
+                ),
+            )
+        )
+
+    if quality["nonpositive_power_measurement_count"]:
+        warnings.append(
+            AnalysisWarning(
+                code="nonpositive_achieved_power",
+                message=(
+                    f"{quality['nonpositive_power_measurement_count']} "
+                    "measurement(s) contain a legacy non-positive achieved "
+                    "power value. Treat these as invalid; the analysis does "
+                    "not replace them."
+                ),
+            )
+        )
+
     target_count = quality["target_power_row_count"]
     if target_count:
         if target_count < quality["harmonic_row_count"]:
@@ -205,6 +386,8 @@ def build_analysis_warnings(
             incomplete.append("achieved mean power")
         if quality["target_power_with_rms_count"] < target_count:
             incomplete.append("power RMS")
+        if quality["target_power_with_std_count"] < target_count:
+            incomplete.append("power population standard deviation")
         if quality["target_power_with_duration_count"] < target_count:
             incomplete.append("power measurement duration")
         if incomplete:
@@ -449,8 +632,10 @@ def render_analysis_summary(
             "- Replicates: preserved as individual rows; not averaged",
             (
                 "- Power fields: `target_power_mw` is the requested setpoint; "
-                "`power_mw` is the achieved mean; `power_rms_mw` is the RMS "
-                "reported over `power_measurement_duration_s`"
+                "`power_mw` is the arithmetic mean of valid positive raw "
+                "samples; `power_std_mw` is their population standard "
+                "deviation; `power_rms_mw` is sqrt(mean(power^2)); no "
+                "missing or invalid power is predicted"
             ),
             "",
             "## Quality summary",
@@ -470,11 +655,30 @@ def render_analysis_summary(
                 f"{quality.get('negative_final_signal_row_count', 0)}"
             ),
             (
-                "- Rows with target / achieved / RMS / duration power data: "
+                "- Rows with target / achieved / STD / RMS / duration power "
+                "data: "
                 f"{quality.get('target_power_row_count', 0)} / "
                 f"{quality.get('achieved_power_row_count', 0)} / "
+                f"{quality.get('power_std_row_count', 0)} / "
                 f"{quality.get('power_rms_row_count', 0)} / "
                 f"{quality.get('power_duration_row_count', 0)}"
+            ),
+            (
+                "- Failed / invalid / partially-invalid incident-power "
+                "measurements: "
+                f"{quality.get('failed_power_measurement_count', 0)} / "
+                f"{quality.get('invalid_power_measurement_count', 0)} / "
+                f"{quality.get('partial_power_measurement_count', 0)}"
+            ),
+            (
+                "- Over-limit / unsafe-status incident-power attempts: "
+                f"{quality.get('over_limit_power_measurement_count', 0)} / "
+                f"{quality.get('unsafe_status_power_measurement_count', 0)}"
+            ),
+            (
+                "- Saved power attempts / attempts without spectra: "
+                f"{quality.get('power_attempt_count', 0)} / "
+                f"{quality.get('power_attempt_without_spectrum_count', 0)}"
             ),
             "",
             "## Warnings",

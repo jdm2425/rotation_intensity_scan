@@ -1,20 +1,42 @@
-from pylablib.devices import Thorlabs
+"""Operator-approved low-level Kinesis shutter diagnostic.
 
-mff = Thorlabs.MFF("37008491")
+This intentionally bypasses :class:`BeamShutter` to diagnose the vendor API.
+Normal code and normal shutter tests must use the project driver instead.
+"""
 
-print(mff.get_status())
+from __future__ import annotations
 
-print("Next command:")
+from hardware.config import SHUTTER
 
-mff.move_to_state(0)
 
-import time
-time.sleep(0.2)
+def main() -> None:
+    from pylablib.devices import Thorlabs
 
-print(mff.get_status())
+    device = Thorlabs.MFF(SHUTTER.serial)
+    try:
+        print("Initial status:", device.get_status())
+        device.move_to_state(1)  # Project mapping: 1 = beam closed.
+        device.wait_for_status(
+            ["moving_fw", "moving_bk"],
+            enabled=False,
+            timeout=5.0,
+            period=0.05,
+        )
+        print("Closed status:", device.get_status())
+    finally:
+        try:
+            device.move_to_state(1)
+            device.wait_for_status(
+                ["moving_fw", "moving_bk"],
+                enabled=False,
+                timeout=5.0,
+                period=0.05,
+            )
+        finally:
+            device.close()
 
-print("Next command:")
+    print("LOW-LEVEL MFF TEST PASSED (final command was close)")
 
-time.sleep(1)
 
-print(mff.get_status())
+if __name__ == "__main__":
+    main()

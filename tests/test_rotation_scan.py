@@ -1,27 +1,65 @@
-from experiments.rotation_scan import RotationScan
+"""Hardware-free check of an intensity-major rotation scan sequence."""
 
-scan = RotationScan(
+from __future__ import annotations
 
-    angles=[0, 5, 10, 15],
+from experiments.scan_runner import ScanRunner
 
-    test_mode=True,
 
-)
+class FakeMonitor:
+    def __init__(self) -> None:
+        self.started: list[tuple[float, float]] = []
 
-results = scan.execute()
+    def measurement_started(
+        self,
+        *,
+        sample_angle: float,
+        waveplate_angle: float,
+    ) -> None:
+        self.started.append((waveplate_angle, sample_angle))
 
-print()
 
-print("=" * 60)
+class FakeExperiment:
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
 
-print("Collected", len(results), "spectra")
+    def scan_started(self) -> None:
+        self.events.append(("scan_started",))
 
-for point in results:
+    def prepare_intensity(self, *, waveplate_angle: float) -> None:
+        self.events.append(("prepare_intensity", waveplate_angle))
 
-    print(
-        f"{point['angle_deg']:5.1f}°",
-        len(point["spectrum"].wavelengths),
-        "pixels",
+    def measure(self, *, waveplate_angle: float, sample_angle: float) -> tuple:
+        result = (waveplate_angle, sample_angle)
+        self.events.append(("measure", *result))
+        return result
+
+
+def main() -> None:
+    experiment = FakeExperiment()
+    monitor = FakeMonitor()
+    results = list(
+        ScanRunner(experiment=experiment, monitor=monitor).run(
+            waveplate_angles=[0.0, 5.0],
+            sample_angles=[0.0, 10.0, 20.0],
+        )
     )
 
-print("=" * 60)
+    expected = [
+        (0.0, 0.0),
+        (0.0, 10.0),
+        (0.0, 20.0),
+        (5.0, 0.0),
+        (5.0, 10.0),
+        (5.0, 20.0),
+    ]
+    assert results == expected
+    assert monitor.started == expected
+    assert [event for event in experiment.events if event[0] == "prepare_intensity"] == [
+        ("prepare_intensity", 0.0),
+        ("prepare_intensity", 5.0),
+    ]
+    print("ROTATION SCAN ORDER TEST PASSED")
+
+
+if __name__ == "__main__":
+    main()

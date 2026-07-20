@@ -5,7 +5,10 @@
 
 A Python control and acquisition system for rotation- and intensity-dependent optical spectroscopy.
 
-The project coordinates two Thorlabs rotation stages, a Thorlabs beam shutter, and an Ocean Insight Ocean SR spectrometer. It acquires and saves spectra while varying sample angle and beam intensity.
+The project coordinates two Thorlabs rotation stages, a Thorlabs beam shutter,
+a retractable PI/Ophir incident-power probe, and an Ocean Insight Ocean SR
+spectrometer. It acquires and saves spectra while varying sample angle and
+waveplate-controlled beam intensity.
 
 ## Safety warning
 
@@ -24,19 +27,34 @@ The shutter mapping currently verified for this setup is:
 - State `0` = open.
 - State `1` = closed.
 
+The fixed beam order is:
+
+```text
+laser -> waveplate -> polariser -> shutter -> power meter -> sample
+```
+
+The shutter is therefore always upstream of the power meter. The implemented
+interlock closes and verifies the shutter before moving the probe, and refuses
+sample illumination unless the probe's live position matches its configured
+out position.
+
 ## Experiment concept
 
-The intended experiment is:
+The implemented experiment is intensity-major:
 
-1. Move the sample rotation stage to a selected angle.
-2. At that sample angle, move the waveplate through one or more intensity settings.
-3. Control the shutter around acquisition.
-4. Acquire an Ocean SR spectrum.
-5. Save the spectrum and the corresponding experimental state.
-6. Repeat across the scan grid.
-7. Later isolate a selected harmonic region and integrate its intensity.
-8. Apply optional background and transmission corrections.
-9. Relate waveplate angle to beam power, fluence, or intensity.
+1. Move the waveplate to one intensity setting.
+2. By default, insert the power probe and acquire one incident-power trace.
+3. Retract and verify the probe, then rotate the sample through every requested
+   sample angle and acquire an Ocean SR spectrum at each angle.
+4. Save each spectrum immediately, linked to the shared power attempt and raw
+   trace for that intensity block.
+5. Repeat for the next waveplate setting.
+6. Later isolate one or more harmonic regions and apply explicitly selected
+   background and transmission corrections.
+
+The alternative `per_measurement` cadence takes a fresh power trace before
+each spectrum. Power metering may also be disabled. No power value is inferred
+from waveplate angle.
 
 ## Current architecture
 
@@ -61,6 +79,8 @@ A `Spectrum` stores:
 * Acquisition timestamp where supported.
 
 The persistence layer saves numeric arrays only and reloads them with NumPy pickle disabled.
+`ExperimentDataset` additionally owns unique raw `PowerTrace` objects and
+`PowerMeasurementAttempt` records referenced by its measurements.
 
 ## Repository layout
 
@@ -104,6 +124,11 @@ rotation_intensity_scan/
 Generated experimental data belong in `results/`.
 
 The `data/` directory is a Python package and should contain source code only.
+The retractable-probe implementation is split between
+`hardware/devices/linear/pi_stage.py`,
+`hardware/devices/power_meter/ophir_juno.py`, and the experiment-specific
+interlock in `hardware/power_probe.py`. Power-attempt records live in
+`data/power_measurement.py`.
 
 ## Environment
 
@@ -124,6 +149,14 @@ Important libraries include:
 * pylablib.
 * seabreeze using the `pyseabreeze` backend.
 * Thorlabs Kinesis components where required by existing device code.
+* PIPython for the PI C-891 controller.
+* pywin32 for Ophir's `OphirLMMeasurement` COM API.
+
+The pinned hardware-facing Python packages are listed in
+`requirements-hardware.txt`. They do not replace the vendor runtimes: install
+Thorlabs Kinesis, Ocean Insight SeaBreeze, the 64-bit PI Software Suite/GCS DLL,
+and Ophir StarLab with its registered COM server. Close StarLab and
+PIMikroMove before Python tries to own their USB devices.
 
 ## Hardware-free regression test
 
@@ -144,11 +177,20 @@ It verifies:
 Additional hardware-free workflow and analysis regressions are:
 
 ```powershell
+python -m tests.test_base
+python -m tests.test_rotation_scan
 python -m tests.test_experiment_workflow
 python -m tests.test_harmonic_analysis
 python -m tests.test_data_products
 python -m tests.test_analysis_reporting
 python -m tests.test_analysis_cli
+python -m tests.test_ophir_power_meter
+python -m tests.test_pi_linear_stage
+python -m tests.test_power_probe
+python -m tests.test_power_trace_round_trip
+python -m tests.test_power_experiment_workflow
+python -m tests.test_power_safety_policy
+python -m tests.test_acquisition_guard
 ```
 
 These use fake devices or deterministic synthetic data and temporary
@@ -174,6 +216,8 @@ Planned or implemented controls include:
 * `R`: reset plot limits.
 * `B`: capture and replace the persistent background.
 * `G`: toggle background subtraction.
+* `X`: enter custom x-axis limits inside the plot window.
+* `Y`: enter custom y-axis limits and disable y autoscaling.
 
 Saved standalone spectra belong under:
 
@@ -197,17 +241,52 @@ The full experiment entry point is:
 python run_rotation_intensity.py
 ```
 
+This is the single maintained workflow. `run_rotation_intensity_scan.py` is a
+compatibility wrapper which delegates to the same `main()` function.
+
 Do not run it as an ordinary software test. It may connect to and move real hardware.
 
 Before running:
 
 1. Inspect `hardware/config.py`.
 2. Confirm all serial numbers.
-3. Confirm stage motion ranges.
-4. Confirm the shutter starts closed.
-5. Confirm the spectrometer is available.
-6. Confirm the output directory is `results/`.
-7. Keep an operator present.
+3. Confirm the PI stage is not owned by PIMikroMove and StarLab is closed.
+4. Confirm all stage motion ranges.
+5. Confirm the shutter starts closed.
+6. Confirm the spectrometer is available.
+7. Confirm the output directory is `results/`.
+8. Keep an operator present.
+
+The configured PI stage is marked installed, but its `in_position_mm` and
+`out_position_mm` are intentionally `None`. `HardwareManager` refuses to make
+any hardware connection until both positions are physically established and
+entered. Do not guess them. If the entire retractable probe is deliberately
+removed from the optical setup, set `POWER_METER_STAGE.installed=False`; power
+meter acquisition cannot be enabled in that mode.
+
+The exact C-891.120200 identity, axis-1 V-408.132020 assignment, already
+referenced state, live limits, guarded servo enable, and one +0.100 mm reversible
+move have been verified with the shutter closed. Startup treats the configured
+1 mm/s as a maximum velocity: faster live settings are reduced and verified,
+while already slower settings are retained. Physical in/out coordinates are
+the remaining commissioning requirement.
+
+After commissioning the positions, enable the current defaults in a run script
+before constructing `ExperimentController`:
+
+```python
+config.power_meter.enabled = True
+# Defaults: per_intensity, 10 s trace, 3 s sensor settling, physical 2000 nm,
+# Ophir option >800, fixed 30.0mW range, and a 20 mW safety ceiling.
+
+# Optional deliberate changes for a different run:
+config.power_meter.cadence = "per_measurement"  # or "per_intensity"/"disabled"
+config.power_meter.measurement_duration_s = 20.0
+config.power_meter.range_option = "30.0mW"       # exact meter-returned label
+```
+
+`run_rotation_intensity.py` currently leaves power metering disabled and does
+not ask for a target power. It still records run notes and filter metadata.
 
 ## Saved experiment format
 
@@ -233,7 +312,11 @@ results/
 
 Each `.npz` file contains numerical spectrum arrays and scalar acquisition metadata.
 
-The current saved-data format is version 4. `metadata.json` records the
+Format 5 experiments with power attempts additionally contain
+`power_attempts.json`, `power_measurements.json`, and pickle-free raw trace
+archives such as `power_measurements/power_000001.npz`.
+
+The current saved-data format is version 5. `metadata.json` records the
 format version, `measurements.csv` stores each measurement's JSON metadata,
 and named raw background spectra are indexed by `backgrounds.json`.
 This metadata can record analysis bounds, filtering choices, background use,
@@ -241,24 +324,42 @@ and other correction provenance without changing the core data model. Older
 CSV files without per-measurement metadata continue to load with an empty
 metadata dictionary.
 
-Version 4 adds optional power-meter context to each measurement:
+Version 5 adds durable raw power acquisition and provenance:
 
 * `target_power_mw`: requested power setpoint.
-* `power_mw`: achieved mean power and the canonical power coordinate.
-* `power_rms_mw`: RMS statistic reported by the power meter over the sampling
-  interval. It is not a standard deviation unless the eventual verified meter
-  integration defines it that way.
-* `power_measurement_duration_s`: duration of that power-meter sampling
-  interval.
+* `power_mw`: arithmetic mean of valid positive, status-OK samples and the
+  canonical achieved-power coordinate.
+* `power_std_mw`: population standard deviation of those valid samples.
+* `power_rms_mw`: absolute RMS, `sqrt(mean(power**2))`, of those samples.
+* `power_measurement_duration_s`: actual elapsed trace duration.
+* Attempt/trace IDs, status, error, and valid/total sample counts.
+
+`power_attempts.json` is written before spectrum acquisition, so a completed or
+failed power attempt survives a later spectrometer failure.
+`power_measurements.json` indexes each unique raw trace stored once under
+`power_measurements/`; every measurement in a default intensity block points
+to the same trace. Raw values, timestamps, status values, parsing validity, and
+invalid reasons are retained in pickle-free arrays.
 
 Older measurement tables without these additional columns still load, with the
-new values set to `None`. The current experiment does not yet connect to a
-power meter or populate these fields; there is also no implemented
-waveplate-to-power calibration. Do not infer or invent them.
+new values set to `None`. No waveplate-to-power calibration, power targeting,
+fluence conversion, or intensity conversion is implemented.
 
-Before a normal scan, the controller acquires a named shutter-closed background
-and saves it with the experiment. Signal spectra remain raw; background and
-filter-transmission corrections are selected explicitly during offline analysis.
+Zero, negative, missing, non-finite, or status-flagged readings are never
+replaced or predicted. They remain in the raw trace and are excluded from
+statistics. If a trace contains no valid positive sample, achieved power and
+all statistics remain `None`; the default run policy aborts before acquiring a
+spectrum. A deliberate `continue_without_power_on_meter_error=True` permits a
+failed or all-invalid read to be recorded with missing power, but never creates
+a value. Unsafe meter-status or non-finite-power flags and any raw positive value above the
+configured 20 mW ceiling always abort the spectrum acquisition.
+
+Before a normal data-saving scan, the controller acquires and saves the default
+`pre_scan_dark` background with the shutter closed, five spectrometer averages,
+and 0.05 s settling, before any scan-point motion. Unsaved test mode does not
+take this background because there is no experiment dataset in which to retain
+it. Signal spectra remain raw; background and filter-transmission corrections
+are selected explicitly during offline analysis.
 
 ## Offline harmonic analysis
 
@@ -313,14 +414,20 @@ CSV data file and records its SHA-256, fixed selection, absolute tolerance,
 actual matched minimum/maximum, correction annotation, series IDs, and row
 count.
 
-The version-2 analysis recipe records the four-step correction pipeline (raw
+The version-3 analysis recipe records the four-step correction pipeline (raw
 detector data, optional saved-background subtraction, optional filter
 transmission correction, then harmonic-window trapezoidal integration), quality
 counts, warnings, Python/NumPy/Matplotlib versions, and the SHA-256 of
 `harmonic_signals.csv`. Background and copied transmission-curve records carry
 their own source checksums. `analysis_recipe.sha256` protects the final recipe,
 and `analysis_summary.md` gives a durable human-readable account of the same
-choices, warnings, power-field coverage, and figure manifest.
+choices, warnings, power-field coverage, exact STD/RMS definitions, and figure
+manifest. Power-quality warnings are grouped by acquisition-attempt ID so one
+shared trace is not counted once per sample angle. The quick analysis also
+reads `ExperimentDataset.power_attempts`: aborting attempts with no spectrum
+are counted, their failure/invalid/over-limit/unsafe status contributes to the
+quality warnings, and `power_attempts_without_spectra` directs the operator to
+the saved attempt record.
 
 Quick-look figures include a correction footer by default. It identifies the
 displayed signal plus the background and transmission choices. Use

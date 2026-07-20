@@ -1,19 +1,29 @@
-from pylablib.devices import Thorlabs
+"""Operator-approved reversible motion test for the configured sample stage."""
 
-stage = Thorlabs.KinesisMotor("55447814")
+from __future__ import annotations
 
-print("Device info:")
-print(stage.get_device_info())
+import logging
 
-print()
-
-print("Full info:")
-print(stage.get_full_info())
+from hardware.config import SAMPLE_STAGE
+from hardware.devices.rotation import RotationStage
 
 
-print("Stage settings: ")
-print(stage.get_settings())
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-print("Stage status: ")
-print(stage.get_status())
 
+def main() -> None:
+    stage = RotationStage(serial=SAMPLE_STAGE.serial, name=SAMPLE_STAGE.name)
+
+    with stage:
+        print(stage.info())
+        start = stage.position
+        try:
+            stage.move_by(2.0)
+            print(f"Moved to {stage.position:.4f} deg")
+        finally:
+            stage.move_to(start)
+            print(f"Returned to {stage.position:.4f} deg")
+
+
+if __name__ == "__main__":
+    main()

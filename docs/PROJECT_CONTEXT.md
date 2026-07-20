@@ -21,11 +21,13 @@ The longer-term analysis objective is to isolate a selected harmonic feature in 
 
 The optical arrangement includes:
 
-1. A rotatable waveplate.
-2. A polariser after the waveplate.
-3. A sample mounted on a rotation stage.
+1. The laser.
+2. A rotatable waveplate.
+3. A polariser after the waveplate.
 4. A controllable beam shutter.
-5. An Ocean Insight Ocean SR spectrometer.
+5. An Ophir power sensor on a retractable PI linear stage.
+6. The sample mounted on a rotation stage.
+7. An Ocean Insight Ocean SR spectrometer collecting the emitted spectrum.
 
 Rotating the waveplate before the polariser changes the transmitted power. Rotating the sample changes the sample orientation relative to the incident field.
 
@@ -36,25 +38,27 @@ The beam shutter is used to:
 - Acquire background or dark spectra.
 - Ensure a defined safe state after failures.
 
+The shutter is always upstream of the power sensor. Every insertion-stage move
+therefore requires a positively verified closed shutter. The sample beam may
+open only after the sensor has returned to its configured, live-verified out
+position.
+
 ## Intended scan
 
 The intended high-level sequence is:
 
 ```text
-For each sample angle:
-    Move sample stage.
-    Wait for motion to complete.
+For each waveplate or intensity setting:
+    Move waveplate stage and wait for motion to complete.
+    By default, acquire one shutter-interlocked incident-power trace.
+    Close shutter, retract power meter, and verify the out position.
 
-    For each waveplate or intensity setting:
-        Move waveplate stage.
-        Wait for motion to complete.
-
-        Set shutter state required for acquisition.
-        Wait for optical settling.
-        Acquire spectrum.
-        Close shutter safely.
+    For each sample angle:
+        Move sample stage and wait for motion to complete.
+        Verify the power meter is out.
+        Open shutter, acquire spectrum, and close shutter safely.
         Calculate basic statistics.
-        Save measurement immediately.
+        Save measurement immediately with the shared power-trace reference.
         Update monitor and plot.
 ````
 
@@ -71,8 +75,10 @@ A measurement includes:
 * Sample angle.
 * Optional requested power setpoint (`target_power_mw`).
 * Optional achieved mean power (`power_mw`).
-* Optional meter-reported power RMS (`power_rms_mw`) and its sampling duration
-  (`power_measurement_duration_s`).
+* Optional population standard deviation (`power_std_mw`) and absolute RMS
+  (`power_rms_mw`) of valid power samples.
+* Actual power-sampling duration, attempt/trace IDs, status, error, and
+  valid/total sample counts.
 * Optional fluence.
 * Optional intensity.
 * Detector spectrum.
@@ -92,6 +98,8 @@ The current project scope includes:
 * Device connection and cleanup.
 * Blocking stage motion.
 * Shutter control.
+* Shutter-interlocked PI probe insertion and retraction.
+* Ophir power streaming with raw samples and explicit validity.
 * Spectrum acquisition.
 * Live spectrum display.
 * Experiment monitoring.
@@ -158,8 +166,10 @@ It should be possible to:
 
 ### Experiment background
 
-A full experiment acquires a shutter-closed background before scan-point motion
-when background acquisition is enabled in `ExperimentConfig`.
+A normal data-saving experiment acquires a shutter-closed background before
+scan-point motion when background acquisition is enabled in `ExperimentConfig`.
+The defaults are name `pre_scan_dark`, five averages, and 0.05 s settling.
+Unsaved test mode skips it because no dataset exists in which to preserve it.
 
 Those backgrounds should be saved as experiment data rather than relying only on the live-view background file.
 
@@ -194,13 +204,14 @@ The final model may depend on:
 
 Until that model is implemented and verified, power, fluence, and intensity fields should remain optional.
 
-The version-4 data model already reserves distinct power fields:
+The version-5 data model and acquisition path use distinct power fields:
 
 * `target_power_mw` is the requested setpoint.
-* `power_mw` is the achieved mean and canonical analysis coordinate.
-* `power_rms_mw` is the RMS statistic reported by the power meter over
-  `power_measurement_duration_s`. It is not a standard deviation unless the
-  eventual verified meter/API explicitly defines it that way.
+* `power_mw` is the arithmetic mean of finite, positive, status-OK raw samples
+  and the canonical analysis coordinate.
+* `power_std_mw` is their population standard deviation (denominator `N`).
+* `power_rms_mw` is their absolute RMS, `sqrt(mean(power**2))`.
+* `power_measurement_duration_s` is the actual elapsed trace duration.
 
 Offline fixed-power selection matches achieved `power_mw` using an explicit
 absolute tolerance and records both that tolerance and the actual matched
@@ -210,9 +221,23 @@ nominal automatic centres, but selection still matches achieved power. The
 analysis recipe records whether target or achieved values supplied the
 centres.
 
-No power meter is currently configured, connected by `HardwareManager`, or
-sampled by the experiment. No waveplate-to-power calibration has been
-implemented. The fields are schema-ready, not populated acquisition data.
+The Ophir meter driver, PI driver, retractable-probe coordinator, experiment
+cadence, persistence, and analysis propagation are implemented. The default is
+one power trace after each waveplate setting and before its sample-angle block;
+`per_measurement` and `disabled` cadences are also available. The standard
+settings are a 10 s trace after 3 s settling, physical fundamental wavelength
+2000 nm, sensor option `>800`, fixed range `30.0mW`, and a 20 mW maximum raw
+positive reading.
+
+Zero, negative, missing, non-finite, or status-flagged raw readings are retained
+but excluded from statistics. They are never predicted, substituted, or
+derived from waveplate angle. An all-invalid trace therefore has no achieved
+power. No waveplate-to-power calibration or closed-loop target-power control is
+implemented, so target power, fluence, and intensity normally remain unset.
+
+Power acquisition is still disabled by default because the physical PI-stage
+in/out positions have not yet been established. The current hardware manager
+also refuses to connect while the installed probe lacks those safe positions.
 
 Do not invent missing physical quantities.
 
@@ -231,10 +256,10 @@ The project should prioritise:
 9. Traceability of configuration and hardware metadata.
 10. Maintainable code over clever abstractions.
 
-The next power-related development step is final power-meter hardware
-integration, but only after the hardware-free persistence and analysis tests
-pass. The real device, interface, units, sampling duration, and RMS semantics
-must be verified before a driver or calibration is added.
+The PI identity/state check and smallest reversible motion are now verified.
+The next power-related step is physical in/out-position calibration, followed
+by one complete shutter-interlocked intensity-block validation. This must not introduce an
+automatic reference/home procedure or a waveplate-power prediction.
 
 ## Out of scope unless explicitly added
 
@@ -258,6 +283,8 @@ A scan is successful when:
 * Stage angles and acquisition settings are saved.
 * Metadata and hardware information are saved.
 * The shutter finishes closed.
+* The retractable power meter finishes at its verified out position when it is
+  physically installed.
 * Hardware is disconnected or returned to a defined state.
 * The output can be reloaded without enabling pickle.
 * The loaded data are suitable for offline analysis.

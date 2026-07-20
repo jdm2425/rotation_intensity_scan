@@ -41,6 +41,7 @@ from analysis.data_products import (
     save_figure_data_csv,
 )
 from analysis.harmonic_analysis import (
+    ANALYSIS_FORMAT_VERSION,
     HarmonicResult,
     HarmonicWindow,
     TransmissionCurve,
@@ -321,17 +322,21 @@ def main() -> None:
         curve_hash=curve_hash,
         minimum_fraction=arguments.minimum_transmission_fraction,
     )
-    quality_summary = build_quality_summary(results)
+    quality_summary = build_quality_summary(
+        results,
+        power_attempts=dataset.power_attempts,
+    )
     warnings = build_analysis_warnings(
         results=results,
         background_mode=background_mode,
         available_backgrounds=available_backgrounds,
         transmission_mode=transmission_mode,
         experimental_metadata=experimental_metadata,
+        power_attempts=dataset.power_attempts,
     )
 
     recipe = {
-        "analysis_format_version": 2,
+        "analysis_format_version": ANALYSIS_FORMAT_VERSION,
         "analysis_id": output_directory.name,
         "created": datetime.now().isoformat(),
         "source_experiment": str(dataset.root),

@@ -1,0 +1,10 @@
+# Python packages used by the physical-device drivers in this repository.
+# Vendor runtimes are also required:
+# - Thorlabs Kinesis for the rotation stages and MFF shutter
+# - Ocean Insight SeaBreeze native runtime
+# - PI Software Suite / 64-bit PI_GCS2_DLL for the C-891
+# - Ophir StarLab with registered OphirLMMeasurement COM server for Juno
+pylablib==1.4.5
+seabreeze==2.11.0
+PIPython==2.11.0.6
+pywin32==312

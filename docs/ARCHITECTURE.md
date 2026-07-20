@@ -55,6 +55,10 @@ ExperimentDataset
                  └── Spectrum
 ```
 
+The complete hardware branch additionally includes the installed PI
+power-meter insertion stage, the optionally enabled Ophir meter, and their
+experiment-specific retractable-probe interlock.
+
 ## Hardware layer
 
 The `hardware/` package owns device-specific behaviour.
@@ -98,7 +102,30 @@ It should provide:
 * Coordinated connect and disconnect.
 * Hardware status information.
 * Safe cleanup after partial connection failures.
-* Access to the waveplate, sample stage, shutter, and spectrometer.
+* Access to the waveplate, sample stage, shutter, spectrometer, installed PI
+  insertion stage, and optionally enabled Ophir meter.
+
+The reusable drivers live in `hardware/devices/linear/pi_stage.py` and
+`hardware/devices/power_meter/ophir_juno.py`.
+`PIStageConfig` keeps controller identity, axis, application limits, tolerance,
+and timeout outside experiment logic; `PILinearStage.from_project_config()` is
+only a structural adapter, so the driver can be reused with another project's
+configuration. The Ophir driver's `PowerSample`, `PowerStatistics`, and
+`PowerTrace` models are vendor-independent, while its COM runtime and clocks can
+be injected for hardware-free use.
+`hardware/power_probe.py:RetractablePowerProbe` is the experiment-specific
+optical interlock around them. Its fixed sequence is close and verify shutter,
+move in and verify, open and verify, settle and sample, close and verify, then
+move out and verify. It never commands insertion-stage motion when upstream
+shutter closure cannot be verified.
+
+Because the configured stage is physically marked `installed=True`,
+`HardwareManager` manages and retracts it even when meter sampling is disabled.
+Construction fails before any connection while its in/out positions are unset.
+After PI connection it applies the configured 1 mm/s maximum startup velocity
+(lowering and verifying a faster live value, retaining an already slower one),
+then performs reference-gated motor/servo preparation and a verified safe
+retraction. It never performs reference/home motion.
 
 It should not own scientific analysis.
 
@@ -113,6 +140,8 @@ Its responsibilities may include:
 * Waiting for optical settling.
 * Acquiring a `Spectrum`.
 * Closing the shutter in a `finally` block.
+* Running a live power-probe-out guard immediately before every sample-beam
+  opening.
 * Applying close delays where necessary.
 * Propagating meaningful errors.
 
@@ -170,8 +199,15 @@ Measurement(
     sample_angle_deg=...,
     power_mw=...,                       # achieved mean power
     target_power_mw=...,                # requested setpoint
-    power_rms_mw=...,                   # meter-reported RMS
+    power_std_mw=...,                   # population STD of valid samples
+    power_rms_mw=...,                   # absolute sqrt(mean(power**2))
     power_measurement_duration_s=...,
+    power_measurement_id=...,            # attempt ID
+    power_trace_id=...,                  # raw trace ID
+    power_measurement_status=...,
+    power_measurement_error=...,
+    power_valid_sample_count=...,
+    power_total_sample_count=...,
     fluence_mj_cm2=...,
     intensity_w_cm2=...,
     spectrum=...,
@@ -197,14 +233,17 @@ These properties should forward to the embedded `Spectrum`; they should not crea
 `power_mw` is intentionally the canonical achieved mean power and remains the
 field used by power-coordinate analysis. `achieved_power_mw` is a read-only
 alias. `target_power_mw` is the requested setpoint and must not be substituted
-for achieved power. `power_rms_mw` stores the RMS statistic reported by the
-meter over `power_measurement_duration_s`; it is not defined as standard
-deviation unless a future verified hardware integration explicitly establishes
-that convention.
+for achieved power. The driver computes `power_mw`, `power_std_mw`, and
+`power_rms_mw` from finite, positive, status-OK raw samples only. STD uses the
+population denominator `N`; RMS is `sqrt(mean(power**2))` and is not an
+uncertainty. Raw invalid values are retained and are never replaced.
 
-These optional fields make the model ready for a power meter, but the current
-hardware and experiment layers do not construct, connect, sample, or calibrate
-one. `RotationIntensityExperiment` currently leaves all power fields unset.
+`power_measurement_id` identifies an acquisition attempt and
+`power_trace_id` identifies its raw trace. Under the default cadence, all
+sample-angle spectra at one waveplate setting share both references and the
+same in-memory `PowerTrace`. Failed attempts can have an attempt ID and no
+trace. Target power, fluence, and intensity remain unset unless supplied by a
+future verified control/calibration path.
 
 ### Historical incompatibility
 
@@ -231,6 +270,10 @@ When old code is encountered, migrate it to construct `Spectrum` first.
 
 The experiment layer defines the scan sequence.
 
+`run_rotation_intensity.py` is the single maintained full-experiment entry
+point. `run_rotation_intensity_scan.py` is only a compatibility wrapper which
+delegates to it; it does not define a second workflow.
+
 Relevant components may include:
 
 * `experiments/rotation_intensity_scan.py`
@@ -242,12 +285,23 @@ Relevant components may include:
 The experiment should:
 
 * Generate or accept the scan points.
-* Move stages to each requested position.
-* Wait for blocking motion to complete.
-* Request a spectrum through the acquisition layer.
+* Iterate waveplate settings outside the sample-angle loop.
+* Move the waveplate once and, by default, acquire one incident-power trace
+  for the complete sample-rotation block.
+* Support explicit `per_measurement` or `disabled` power cadences.
+* Move stages to each requested position and wait for blocking motion.
+* Require the power probe to be out before requesting an illuminated spectrum.
 * Construct a `Measurement`.
 * Compute basic measurement statistics.
 * Return or yield completed measurements.
+
+A power attempt is published to the writer immediately after acquisition and
+before the first associated spectrum. Normal status values are `measured`,
+`measured_with_invalid_samples`, `invalid`, `failed`, `over_limit`, and
+`unsafe_meter_status`. Failed and all-invalid reads abort by default; an
+explicit continuation option can preserve missing power and continue only for
+those recoverable cases. Over-limit or unsafe-status traces always abort before
+sample acquisition.
 
 It should not know the internal `.npz` file format.
 
@@ -271,6 +325,8 @@ The controller coordinates:
 * Safe shutdown.
 
 It should save each completed measurement as soon as practical.
+It also saves each power attempt immediately so a later spectrum failure does
+not erase the power record.
 
 ## Monitoring and plotting
 
@@ -333,16 +389,33 @@ results/
         └── ...
 ```
 
-The current format version is `4`, recorded as `format_version` in
+Format-5 experiments with incident-power attempts additionally contain:
+
+```text
+power_attempts.json
+power_measurements.json
+power_measurements/
+    power_000001.npz
+```
+
+The current format version is `5`, recorded as `format_version` in
 `metadata.json`. The CSV index includes a `measurement_metadata` field holding
 a JSON object for per-measurement analysis and correction provenance. Loaders
 treat the absent field in older datasets as an empty dictionary.
 
-Version 4 adds optional `target_power_mw`, `power_rms_mw`, and
-`power_measurement_duration_s` columns while retaining `power_mw` as achieved
-mean power. The loader treats any of these columns as absent/`None` for older
-datasets. This is a persistence schema capability, not evidence that a power
-meter was connected during acquisition.
+Version 5 adds `power_std_mw`, attempt/trace IDs, status/error, and valid/total
+sample counts while retaining the existing optional target, achieved, RMS, and
+duration columns. `power_attempts.json` records each attempt independently of a
+spectrum. `power_measurements.json` indexes each unique `PowerTrace`, whose raw
+values, timestamps, statuses, parsed numeric fields, validity flags, invalid
+reasons, and batch structure are stored as non-object arrays. A default
+intensity block stores one trace once and references it from every associated
+measurement.
+
+The loader accepts older datasets with no new columns or power indexes and
+restores their values as `None`/empty collections. For format 5 it validates
+attempt-to-trace and measurement-to-attempt referential integrity and restores
+the shared in-memory trace reference.
 
 Named raw background spectra are stored separately under `backgrounds/` and
 indexed by `backgrounds.json`. `ExperimentDataset.backgrounds` exposes them as
@@ -362,6 +435,9 @@ interpreted as an empty background collection.
 * Validate array dimensions and matching shapes.
 * Avoid pickle and Python object arrays.
 * Persist `Measurement.metadata` as JSON-compatible data.
+* Persist a power attempt before any corresponding spectrum.
+* Validate each measurement's summary fields against its raw trace statistics.
+* Save each unique raw power trace only once and reject ID collisions.
 
 A spectrum archive should use fields such as:
 
@@ -406,6 +482,9 @@ If an old archive contains object arrays, report that it was produced by an inco
 * General metadata.
 * A list of `Measurement` objects.
 * A list of named `BackgroundSpectrum` objects.
+* A list of unique raw `PowerTrace` objects.
+* A list of `PowerMeasurementAttempt` records, including failed attempts with
+  no trace.
 
 It should support iteration, indexing, length, and useful convenience summaries.
 
@@ -506,7 +585,7 @@ recorded while the corresponding choice is unspecified, analysis proceeds
 without that correction and records an actionable warning. Metadata never
 turns corrections on implicitly.
 
-The analysis recipe format is version 2. It records the ordered correction
+The analysis recipe format is version 3. It records the ordered correction
 pipeline:
 
 1. Raw detector data.
@@ -519,6 +598,15 @@ master harmonic-table checksum, source background/calibration checksums where
 applicable, and the figure manifest. Each figure-data CSV has its own checksum
 in that manifest. `analysis/analysis_reporting.py` builds those warnings,
 correction annotations, console summary, and `analysis_summary.md`.
+
+Analysis version 3 propagates the attempt/trace IDs, exact population STD and
+absolute-RMS fields, status/error, and sample counts into every harmonic row.
+Power-quality warnings are grouped by attempt ID, avoiding duplicate warning
+counts when one default-cadence trace is shared across multiple sample angles.
+Quick analysis also supplies `ExperimentDataset.power_attempts` to reporting,
+so abort-only attempts without harmonic rows are counted, their statuses are
+included, and a dedicated warning points to `power_attempts.json`. Missing or
+invalid achieved power remains missing; analysis never estimates it.
 
 `plot_figure_data()` accepts a correction annotation. The CLI supplies one by
 default so quick-look figures state the displayed signal and correction

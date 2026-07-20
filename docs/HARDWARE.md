@@ -19,33 +19,145 @@ Any new hardware discovery should be verified with the real device and then docu
 | Sample rotation | Thorlabs PRM1-Z8 | `27268870` | pylablib / Kinesis |
 | Beam shutter | Thorlabs MFF002 controller/device | `37008491` | Thorlabs/Kinesis-compatible driver |
 | Spectrometer | Ocean Insight Ocean SR | `SR600415` | seabreeze with `pyseabreeze` |
+| Power-meter insertion | PI V-408.132020 on C-891.120200, axis 1 | `118054611` | PIPython / 64-bit PI GCS2 DLL |
+| Incident-power controller | Ophir Juno | `3144168` | StarLab `OphirLMMeasurement` COM via pywin32 |
+| Incident-power sensor | Ophir 3A-P-V1 thermopile | `3141552` | Juno channel 0 |
 
 The exact class names and configuration object names in `hardware/config.py` remain authoritative.
 
-### Power meter status: not integrated
+### Optical order and retractable power probe
 
-There is currently no configured power meter. The repository contains no
-verified meter model, serial number, driver/library choice, configuration
-object, `HardwareManager` member, or experiment sampling call. The optional
-power fields in the version-4 data format do not imply that power was measured.
+The fixed order for this experiment is:
 
-When a real meter is added, preserve these meanings:
+```text
+laser -> waveplate -> polariser -> shutter -> power meter -> sample
+```
 
-* `target_power_mw`: requested setpoint.
-* `power_mw`: achieved mean power measured for the spectrum.
-* `power_rms_mw`: the RMS statistic reported by the meter over
-  `power_measurement_duration_s`.
+The shutter is always before the meter. The probe sequence implemented by
+`hardware/power_probe.py:RetractablePowerProbe` is:
 
-Do not describe `power_rms_mw` as standard deviation unless the authoritative
-meter documentation/API and verified acquisition implementation explicitly
-define it that way. Record the meter model, serial, interface, units, sampling
-method, and statistic definitions before using the values for publication.
+```text
+close and verify shutter
+-> move meter in and verify position
+-> open and verify shutter
+-> settle and stream power
+-> close and verify shutter
+-> move meter out and verify position
+```
 
-Power-meter hardware integration must wait until the persistence and analysis
-regressions pass. A first device test still requires explicit operator approval
-and should connect only to the meter, query identity, take the smallest useful
-read-only sample, and disconnect cleanly. Do not move stages or open the shutter
-merely to test meter communication.
+The code never moves the insertion stage after an unverified shutter close.
+Every sample-spectrum shutter opening has a live out-position guard. A meter
+read failure is considered recoverable only after the shutter-closed out state
+has been verified.
+
+### Ophir meter: live-verified identity and settings
+
+An approved live connection verified:
+
+* Controller: Juno, serial `3144168`, ROM `JN1.53`.
+* Sensor: thermopile 3A-P-V1, serial `3141552`, channel 0.
+* Measurement mode: `Power`.
+* Returned wavelength options: `<800`, `>800`.
+* Returned range options: `AUTO`, `3.00W`, `300mW`, `30.0mW`, `3.00mW`,
+  `300uW`.
+
+The experiment records the physical fundamental wavelength separately as
+2000 nm while selecting the sensor's coarse returned option `>800`. The default
+fixed range is `30.0mW`, which covers the configured 20 mW sample-safety
+ceiling. Reverify the returned option names if the sensor is changed; the
+driver selects by returned name and verifies readback rather than hardcoding a
+fragile list index. A different fixed range can be selected explicitly in the
+experiment config, but no range is inferred from a requested power setpoint.
+
+The stated operating context is a 1 kHz source, approximately 5 mm beam at the
+sensor, and anticipated meter readings within roughly 0--50 mW. The current
+sample/focusing geometry may damage near 20 mW, so the experiment software uses
+20 mW as the stricter interlock unless deliberately reconfigured after a safety
+review. Repetition rate and beam size are metadata/context only; the current
+software does not derive pulse energy, fluence, or peak intensity from them.
+
+One approved 10 s shutter-closed trace at `>800` and `30.0mW` returned 138/138
+valid samples: mean `0.0594928 mW`, population STD `0.00219435 mW`, and absolute
+RMS `0.0595332 mW`. This is a recorded dark/offset observation, not an automatic
+zero correction. The acquisition and analysis paths do not subtract it or
+silently force it to zero.
+
+Raw meter data originate in watts. A reading is valid for statistics only when
+its value and timestamp are finite, its power is strictly positive, and its
+raw status maps to `ok`. Zero, negative, missing, non-finite, and status-flagged
+samples are retained with invalid reasons and excluded; no value is predicted
+or substituted. The implemented statistics are:
+
+* `power_mw`: arithmetic mean of valid samples.
+* `power_std_mw`: population standard deviation, denominator `N`.
+* `power_rms_mw`: absolute RMS, `sqrt(mean(power**2))`.
+
+If no valid sample remains, all three values are `None`. RMS is not the
+uncertainty; use the separate population STD as the trace spread.
+
+Power acquisition is disabled by default. When enabled, the standard cadence
+is `per_intensity`: set the waveplate, take one 10 s trace after 3 s sensor
+settling, retract, then reuse that trace for every sample angle in the block.
+`per_measurement` takes a fresh trace before each spectrum and `disabled` takes
+none. A failed or all-invalid trace aborts by default; continuation with missing
+power requires the explicit `continue_without_power_on_meter_error=True` opt-in.
+Any non-finite power value or status-flagged sample makes the trace unsafe, and
+any finite positive raw sample above 20 mW trips the interlock. Those cases always
+abort before an illuminated spectrum, even if other samples or the mean are
+below the limit.
+
+### PI insertion stage: live connection and small motion verified
+
+Configured hardware:
+
+* Controller: C-891.120200, serial `118054611`.
+* Live identity: C-891.120200, serial `118054611`, firmware `02.012`.
+* Live stage assignment: V-408.132020.
+* Axis: `1`.
+* Application envelope: -12 to +12 mm, additionally intersected with live
+  `TMN?`/`TMX?` controller limits for every move.
+* Final-position tolerance: 0.01 mm; motion timeout: 30 s.
+
+After fully terminating a hidden PIMikroMove process, PIPython connected to the
+exact enumerated controller and verified axis 1. Live readback reported:
+
+* `FRF? = true` (already referenced; no reference/home command was issued).
+* Motor enabled and servo initially disabled.
+* Controller travel limits -12.5 to +12.5 mm; the narrower application envelope
+  remains -12 to +12 mm.
+* Initial `VEL? = 200 mm/s`.
+
+With the shutter verified closed, closed-loop preparation enabled the servo;
+the controller target readback then matched the current position without any
+reference motion. A single +0.100 mm absolute move and return to the observed starting position
+succeeded, with the final return within the configured 0.01 mm tolerance. The
+shutter began and ended closed.
+
+The configured `velocity_mm_s=1.0` is a maximum startup velocity. The driver
+reduces a faster live value to 1 mm/s and verifies readback before closed-loop
+preparation; if the controller is already slower, it retains that safer value.
+It never speeds the axis up automatically.
+
+The supplied `C-891-UserManual-MS251E.pdf` is not an exact model manual: its
+stated scope is C-891.130300, although C-891.120200 appears in examples/updater
+material. It is useful for general GCS guidance only; every command and state
+assumption for this controller must be checked against live readback and the
+correct controller documentation.
+
+The driver deliberately does not reference/home, run a startup helper, perform
+phase finding, select a stage database record, redefine position, or write
+persistent parameters. Connection validates `*IDN?`, active axis, and `CST?`,
+then captures read-only state. Closed-loop enable is allowed only when `FRF?` is
+already true. The only velocity write is the guarded, readback-verified startup
+reduction described above. Motion is a bounded absolute `MOV`, waits for
+`ONT?`, verifies `POS?`, and attempts a smooth `HLT` after motion failure.
+Disconnect closes the GCS connection without disabling the motor or servo;
+that preserves the user-approved controller state.
+
+The required physical `in_position_mm` and `out_position_mm` are intentionally
+unset. Because the stage is marked installed, `HardwareManager` refuses all
+connections until both are measured and entered. Do not guess these values or
+use automatic reference motion to create them.
 
 ## Waveplate stage
 
@@ -221,6 +333,29 @@ When debugging connection problems, distinguish between:
 * Integration-time or feature support.
 * Spectrometer already open in another process.
 
+### PI Software Suite and PIPython
+
+The reusable PI driver imports PIPython only when a real connection is
+requested. The host needs the 64-bit PI GCS2 DLL installed by PI Software
+Suite. The tested Python dependency is `PIPython==2.11.0.6`.
+
+PIMikroMove and Python should not own the controller simultaneously. A PI error
+`-9` during `ConnectUSB` while PIMikroMove is still running should be treated as
+an ownership/connection failure, not as permission to retry motion or alter
+controller parameters.
+
+### Ophir StarLab COM
+
+The Juno driver uses the registered
+`OphirLMMeasurement.CoLMMeasurement` COM server supplied with StarLab through
+`pywin32==312`. Connection, configuration, streaming, data retrieval, and
+cleanup must remain on the same thread because COM is apartment-threaded.
+Close StarLab before Python opens the Juno.
+
+The pinned Python hardware dependencies are recorded in
+`requirements-hardware.txt`; vendor runtimes remain machine installations and
+must not be copied into the repository.
+
 ## Configuration
 
 Hardware serials and model settings should be defined centrally in:
@@ -241,21 +376,23 @@ The hardware manager should own:
 * Sample stage.
 * Shutter.
 * Spectrometer.
-
-It does not currently own a power meter. Add one only after its real
-configuration and lifecycle have been verified; keep partial-connection cleanup
-and the safe closed-shutter state intact.
+* The PI insertion stage whenever it is physically marked installed.
+* The Ophir power meter when experiment power sampling is enabled.
+* The `RetractablePowerProbe` coordinator.
 
 Connection should be coordinated so that partial failures are cleaned up.
 
-Suggested safe strategy:
+Implemented safe strategy:
 
-1. Construct devices.
-2. Connect one at a time.
-3. Record which devices connected successfully.
-4. Ensure the shutter is closed once available.
-5. If any later connection fails, disconnect already-connected devices.
-6. Report the original failure.
+1. Validate configured in/out positions before connecting anything.
+2. Connect the shutter first and close it.
+3. Connect other devices one at a time and track partial ownership.
+4. Connect the PI stage, require an already referenced axis, enable motor/servo
+   if required, and retract/verify the probe before any acquisition.
+5. Connect Ophir last when enabled.
+6. On failure, close the shutter, safely retract if closure is verifiable, or
+   halt without motion if it is not, then disconnect in reverse order.
+7. Preserve the original exception while reporting any safe-state failure.
 
 ## Hardware test classification
 
@@ -273,11 +410,21 @@ Suggested safe strategy:
 * Single-spectrum acquisition test.
 * Spectrometer metadata test.
 
-### Future power-meter hardware
+### Power-meter hardware
 
 * Meter identity/configuration test.
-* One read-only sample and units/statistics verification.
-* Sampling-duration and meter-reported RMS verification.
+* One read-only or shutter-closed stream and units/statistics verification.
+* Sampling-duration, population-STD, and absolute-RMS verification.
+
+### PI insertion-stage hardware
+
+* USB connection and read-only state queries.
+* Closed-loop enable on an already referenced axis.
+* Any insertion, retraction, or small reversible move.
+
+Never combine a first PI connection attempt with reference motion. Before any
+motion, state the exact start, target, maximum displacement, effective limits,
+and return position, and verify that the shutter begins and ends closed.
 
 These require explicit approval even if no stage motion or shutter operation is
 intended. They must not be included in automatic hardware-free test runs.
@@ -299,6 +446,7 @@ intended. They must not be included in automatic hardware-free test runs.
 * Complete experiment.
 * Background acquisition through the shutter.
 * Coordinated scan.
+* Coordinated power insertion, measurement, retraction, and sample acquisition.
 
 Codex must not run any hardware category without explicit approval.
 

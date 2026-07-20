@@ -12,7 +12,6 @@ Progress reporting is handled by ExperimentMonitor.
 from __future__ import annotations
 
 import logging
-from itertools import product
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +46,27 @@ class ScanRunner:
         RotationIntensityResult
         """
 
-        for sample_angle, waveplate_angle in product(
-            sample_angles,
-            waveplate_angles,
-        ):
+        if hasattr(self.experiment, "scan_started"):
+            self.experiment.scan_started()
+
+        # Intensity-major ordering is intentional. The intensity waveplate is
+        # set once, its incident power is measured once by default, and then
+        # every requested sample angle is acquired using that same power
+        # trace. This avoids inserting the power meter for every rotation.
+        for waveplate_angle in waveplate_angles:
+
+            if hasattr(self.experiment, "prepare_intensity"):
+                self.experiment.prepare_intensity(
+                    waveplate_angle=waveplate_angle,
+                )
+
+            for sample_angle in sample_angles:
 
             #
             # Notify monitor.
             #
 
-            self.monitor.measurement_started(
+                self.monitor.measurement_started(
 
                 sample_angle=sample_angle,
 
@@ -68,7 +78,7 @@ class ScanRunner:
             # Execute measurement.
             #
 
-            result = self.experiment.measure(
+                result = self.experiment.measure(
 
                 waveplate_angle=waveplate_angle,
 
@@ -76,7 +86,7 @@ class ScanRunner:
 
             )
 
-            yield result
+                yield result
 
     # ------------------------------------------------------------------
 
@@ -89,6 +99,14 @@ class ScanRunner:
         """
         Execute a single measurement.
         """
+
+        if hasattr(self.experiment, "scan_started"):
+            self.experiment.scan_started()
+
+        if hasattr(self.experiment, "prepare_intensity"):
+            self.experiment.prepare_intensity(
+                waveplate_angle=waveplate_angle,
+            )
 
         self.monitor.measurement_started(
 

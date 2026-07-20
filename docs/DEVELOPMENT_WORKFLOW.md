@@ -142,17 +142,29 @@ Other safe tests should use:
 Current hardware-free workflow regressions are:
 
 ```powershell
+python -m tests.test_base
 python -m tests.test_round_trip
+python -m tests.test_rotation_scan
 python -m tests.test_experiment_workflow
 python -m tests.test_harmonic_analysis
 python -m tests.test_data_products
 python -m tests.test_analysis_reporting
 python -m tests.test_analysis_cli
+python -m tests.test_ophir_power_meter
+python -m tests.test_pi_linear_stage
+python -m tests.test_power_probe
+python -m tests.test_power_trace_round_trip
+python -m tests.test_power_experiment_workflow
+python -m tests.test_power_safety_policy
+python -m tests.test_acquisition_guard
 ```
 
 The experiment-workflow test uses fake devices; it does not connect hardware.
 The harmonic-analysis, data-product, reporting, and analysis-CLI tests use
-deterministic synthetic results and temporary directories.
+deterministic synthetic results and temporary directories. The Ophir, PI,
+power-probe, power-policy, and acquisition-guard tests inject fake devices;
+their method names such as `ConnectUSB`, `MOV`, and `ScanUSB` are fake calls and
+do not access vendor runtimes or laboratory hardware.
 
 ### Offline analysis workflow
 
@@ -204,7 +216,7 @@ matched range.
 Every quick-analysis directory contains:
 
 * `harmonic_signals.csv`: complete derived result table.
-* `analysis_recipe.json`: machine-readable version-2 recipe.
+* `analysis_recipe.json`: machine-readable version-3 recipe.
 * `analysis_recipe.sha256`: SHA-256 of the final recipe.
 * `analysis_summary.md`: durable human-readable analysis report.
 * Same-stem PNG, PDF, and CSV files for each requested figure.
@@ -243,14 +255,20 @@ rejected by default.
 Power-field meaning is fixed across persistence and analysis:
 
 * `target_power_mw` is the requested setpoint.
-* `power_mw` is the achieved mean and the field used for power-coordinate
-  selection.
-* `power_rms_mw` is the RMS statistic reported by the meter over
-  `power_measurement_duration_s`; do not call it standard deviation unless a
-  verified future meter API explicitly defines that statistic.
+* `power_mw` is the arithmetic mean of finite, positive, status-OK raw samples
+  and the field used for power-coordinate selection.
+* `power_std_mw` is their population standard deviation (denominator `N`).
+* `power_rms_mw` is their absolute RMS, `sqrt(mean(power**2))`; it is not the
+  uncertainty.
+* `power_measurement_duration_s` is actual elapsed streaming duration.
 
-The current acquisition path does not populate these fields because no power
-meter or waveplate-power calibration is integrated.
+Raw zero, negative, missing, non-finite, or status-flagged values are preserved
+and excluded from statistics. Missing or invalid power is never inferred from
+waveplate angle. Analysis format 3 propagates power IDs/status/counts and groups
+quality warnings by attempt ID when one trace is shared across sample angles.
+Reporting also consumes `ExperimentDataset.power_attempts`, counts aborting
+attempts with no spectra, includes their statuses, and emits a dedicated warning
+which points to `power_attempts.json`.
 
 ### Level 2: spectrometer-only
 
@@ -273,6 +291,8 @@ Examples:
 * Open/close shutter test.
 * Waveplate move.
 * Sample stage move.
+* PI insertion-stage connection, state query, or move.
+* Ophir connection or power stream.
 * Home command.
 * Position scan.
 
@@ -285,15 +305,36 @@ Before running, report:
 * Expected final state.
 * Shutter behaviour.
 
+Current operator-only scripts include:
+
+```powershell
+python -m tests.test_rotation_stage   # waveplate +2 deg and exact return
+python -m tests.test_sample_stage     # sample +2 deg and exact return
+python -m tests.test_shutter          # opens once, verifies final close
+python -m tests.test_mff_api          # low-level Kinesis close diagnostic
+python -m tests.test_ocean_sr         # connects and acquires one spectrum
+python -m tests.test_hardware_manager # coordinated stack, motion, beam open
+```
+
+Inspect each file immediately before use. In particular,
+`tests.test_hardware_manager` now includes the installed PI probe and currently
+refuses to start while its in/out positions are unset. It must not be treated
+as a generic regression test.
+
 ### Level 4: full experiment
 
 Requires explicit approval and operator supervision.
 
+Use `python run_rotation_intensity.py`. The similarly named
+`run_rotation_intensity_scan.py` exists only as a compatibility wrapper and
+delegates to the same maintained entry point.
+
 A full experiment may:
 
 * Connect all hardware.
-* Move both stages.
+* Move both rotation stages and the PI insertion stage.
 * Open the shutter.
+* Stream incident power.
 * Acquire many spectra.
 * Save experimental data.
 
@@ -317,25 +358,34 @@ For an approved hardware test:
 
 Do not repeatedly retry motion automatically after an unexplained failure.
 
-### Gate before power-meter integration
+### Gate for remaining power-probe commissioning
 
-The data model is ready for power samples, but adding a meter is a hardware
-change. Before implementing or testing it:
+The driver, interlock, experiment cadence, persistence, and analysis propagation
+are implemented. The exact PI identity/state, reference status, live limits,
+closed-loop enable, guarded 1 mm/s startup velocity, and a +0.100 mm reversible
+move have been verified with the shutter closed. The remaining commissioning
+still requires explicit operator approval and this order:
 
-1. Run `tests.test_round_trip`, `tests.test_harmonic_analysis`,
-   `tests.test_data_products`, `tests.test_analysis_reporting`, and
-   `tests.test_analysis_cli`; all must pass.
-2. Identify the real meter model, serial, supported Python interface, units,
-   sampling behaviour, and definition of its RMS output.
-3. Keep `power_mw` as achieved mean and `target_power_mw` as the setpoint.
-4. Do not reinterpret meter-reported RMS as standard deviation without an
-   authoritative device/API definition.
-5. Add driver and experiment integration through the normal hardware ownership
-   layers; do not construct a meter inside analysis or persistence code.
-6. Request explicit operator approval before connecting to or reading the real
-   device, and begin with the smallest read-only identity/sample test.
-7. Re-run persistence and analysis regressions before attempting a coordinated
-   experiment.
+1. Run the complete hardware-free suite, including the fake Ophir/PI/probe and
+   format-5 round-trip tests.
+2. Confirm the laser is off, the shutter will begin and end closed, StarLab is
+   closed, and PIMikroMove has fully exited.
+3. Physically establish distinct probe in/out positions and enter them in
+   `hardware/config.py`; do not infer them from the nominal travel range.
+4. Verify shutter-closed insertion/retraction and the live sample-beam out guard.
+5. Run one short coordinated intensity block and reload its power attempt, raw
+   trace, spectra, and background before expanding the scan.
+
+For any future PI controller revalidation, begin with read-only identity/axis/
+stage, `FRF?`, `EAX?`, `SVO?`, `POS?`, `MOV?`, `ONT?`, `TMN?`, `TMX?`, and
+`VEL?` queries. Do not home/reference, phase-find, load a stage database,
+redefine position, or write persistent parameters. The maintained 1 mm/s
+startup setting is a maximum: it lowers and verifies faster values, retains an
+already slower live value, and never speeds the axis up automatically.
+
+The supplied MS251E manual explicitly targets C-891.130300, not the configured
+C-891.120200. Treat it as general GCS guidance only and rely on the correct
+manual plus live readback for model-specific behaviour.
 
 ## Data-model change protocol
 
@@ -373,10 +423,22 @@ Any persistence change must consider:
 * Array dtypes.
 * Pickle safety.
 
-The current experiment format is version 4. Its additive optional power columns
-are `target_power_mw`, `power_mw`, `power_rms_mw`, and
-`power_measurement_duration_s`; older tables without the new context columns
-must continue to load with `None` values.
+The current experiment format is version 5. Its power columns include target,
+achieved arithmetic mean, population STD, absolute RMS, elapsed duration,
+attempt/trace IDs, status/error, and valid/total counts. Raw traces are stored
+once under `power_measurements/`, indexed by `power_measurements.json`, while
+attempts (including failures without traces) are indexed by
+`power_attempts.json`. Older tables and experiments without these columns or
+indexes must continue to load with `None` values and empty collections.
+
+A persistence change must preserve these additional rules:
+
+* Save an attempt before any associated spectrum.
+* Preserve raw values, timestamps, status values, invalid reasons, and batch
+  structure.
+* Store strings as non-object NumPy arrays; never enable pickle.
+* Reject ID collisions and broken attempt/trace/measurement references.
+* Reconstruct one shared `PowerTrace` for all measurements which reference it.
 
 Required safety rule:
 
@@ -480,7 +542,8 @@ Before changing imports, inspect the actual package structure.
 
 Do not upgrade hardware libraries casually.
 
-A change to pylablib, seabreeze, NumPy, Python, or Kinesis components may affect:
+A change to pylablib, seabreeze, PIPython, pywin32, NumPy, Python, Kinesis,
+PI Software Suite, or StarLab components may affect:
 
 * Device discovery.
 * Units.
@@ -497,6 +560,12 @@ Before upgrading:
 4. Test hardware-free code first.
 5. Test one device at a time with approval.
 6. Keep a rollback path.
+
+Pinned hardware-facing Python versions are in `requirements-hardware.txt`.
+They still require the matching vendor installations: Kinesis, SeaBreeze, the
+64-bit PI GCS2 DLL, and the registered Ophir StarLab COM server. Close StarLab
+and PIMikroMove before Python hardware tests so ownership failures are not
+mistaken for driver or configuration faults.
 
 ## Codex workflow
 

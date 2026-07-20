@@ -116,6 +116,7 @@ def create_saved_experiment(output_root: Path) -> Path:
                     intensity_w_cm2=(1.0 + waveplate_angle / 7.5) * 1e8,
                     target_power_mw=1.05 + waveplate_angle / 7.5,
                     power_rms_mw=0.02 + measurement_number * 0.001,
+                    power_std_mw=0.01 + measurement_number * 0.001,
                     power_measurement_duration_s=0.25,
                     spectrum=spectrum,
                     metadata={
@@ -357,7 +358,7 @@ def main() -> None:
         with recipe_path.open("r", encoding="utf-8") as file:
             recipe = json.load(file)
 
-        assert recipe["analysis_format_version"] == 2
+        assert recipe["analysis_format_version"] == 3
         assert Path(recipe["source_experiment"]) == experiment_directory.resolve()
         assert recipe["background"]["mode"] == "used"
         assert recipe["background"]["applied"] is True

@@ -14,6 +14,9 @@ from data.experiment_dataset import ExperimentDataset
 from hardware.devices.spectrometer.spectrum import Spectrum
 
 
+ANALYSIS_FORMAT_VERSION = 3
+
+
 @dataclass(frozen=True, slots=True)
 class HarmonicWindow:
     """Named wavelength interval over which one harmonic is integrated."""
@@ -154,10 +157,17 @@ class HarmonicResult:
     averages: int = 1
     spectrometer_serial: str = ""
     transmission_fraction: float | None = None
-    analysis_format_version: int = 1
+    analysis_format_version: int = ANALYSIS_FORMAT_VERSION
     target_power_mw: float | None = None
     power_rms_mw: float | None = None
     power_measurement_duration_s: float | None = None
+    power_std_mw: float | None = None
+    power_measurement_id: str | None = None
+    power_trace_id: str | None = None
+    power_measurement_status: str | None = None
+    power_measurement_error: str | None = None
+    power_valid_sample_count: int | None = None
+    power_total_sample_count: int | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -296,6 +306,21 @@ def analyse_dataset(
                     power_measurement_duration_s=(
                         measurement.power_measurement_duration_s
                     ),
+                    power_std_mw=measurement.power_std_mw,
+                    power_measurement_id=measurement.power_measurement_id,
+                    power_trace_id=measurement.power_trace_id,
+                    power_measurement_status=(
+                        measurement.power_measurement_status
+                    ),
+                    power_measurement_error=(
+                        measurement.power_measurement_error
+                    ),
+                    power_valid_sample_count=(
+                        measurement.power_valid_sample_count
+                    ),
+                    power_total_sample_count=(
+                        measurement.power_total_sample_count
+                    ),
                     fluence_mj_cm2=measurement.fluence_mj_cm2,
                     intensity_w_cm2=measurement.intensity_w_cm2,
                     integration_time_ms=spectrum.integration_time_ms,
@@ -427,6 +452,27 @@ def load_results_csv(path: str | Path) -> list[HarmonicResult]:
                         power_measurement_duration_s=_csv_optional_float(
                             row.get("power_measurement_duration_s")
                         ),
+                        power_std_mw=_csv_optional_float(
+                            row.get("power_std_mw")
+                        ),
+                        power_measurement_id=_csv_optional_text(
+                            row.get("power_measurement_id")
+                        ),
+                        power_trace_id=_csv_optional_text(
+                            row.get("power_trace_id")
+                        ),
+                        power_measurement_status=_csv_optional_text(
+                            row.get("power_measurement_status")
+                        ),
+                        power_measurement_error=_csv_optional_text(
+                            row.get("power_measurement_error")
+                        ),
+                        power_valid_sample_count=_csv_optional_int(
+                            row.get("power_valid_sample_count")
+                        ),
+                        power_total_sample_count=_csv_optional_int(
+                            row.get("power_total_sample_count")
+                        ),
                         fluence_mj_cm2=_csv_optional_float(
                             row.get("fluence_mj_cm2")
                         ),
@@ -547,6 +593,12 @@ def _csv_optional_float(value: str | None) -> float | None:
     if not np.isfinite(result):
         raise ValueError("optional numeric value is not finite")
     return result
+
+
+def _csv_optional_int(value: str | None) -> int | None:
+    if value is None or not str(value).strip():
+        return None
+    return int(value)
 
 
 def _csv_int(

@@ -16,6 +16,8 @@ from typing import Any, Iterable
 
 from analysis.measurement import Measurement
 from data.background_spectrum import BackgroundSpectrum
+from data.power_measurement import PowerMeasurementAttempt
+from hardware.devices.power_meter.models import PowerTrace
 
 
 @dataclass(slots=True)
@@ -64,6 +66,14 @@ class ExperimentDataset:
     )
 
     backgrounds: list[BackgroundSpectrum] = field(
+        default_factory=list
+    )
+
+    power_traces: list[PowerTrace] = field(
+        default_factory=list
+    )
+
+    power_attempts: list[PowerMeasurementAttempt] = field(
         default_factory=list
     )
 
@@ -119,6 +129,36 @@ class ExperimentDataset:
                 f"Multiple backgrounds are named {name!r}."
             )
 
+        return matches[0]
+
+    def get_power_trace(self, trace_id: str) -> PowerTrace:
+        """Return one uniquely identified raw incident-power trace."""
+
+        matches = [
+            trace
+            for trace in self.power_traces
+            if trace.trace_id == trace_id
+        ]
+        if not matches:
+            raise KeyError(f"No power trace has ID {trace_id!r}.")
+        if len(matches) > 1:
+            raise ValueError(f"Multiple power traces have ID {trace_id!r}.")
+        return matches[0]
+
+    def get_power_attempt(self, attempt_id: str) -> PowerMeasurementAttempt:
+        """Return one uniquely identified incident-power attempt."""
+
+        matches = [
+            attempt
+            for attempt in self.power_attempts
+            if attempt.attempt_id == attempt_id
+        ]
+        if not matches:
+            raise KeyError(f"No power attempt has ID {attempt_id!r}.")
+        if len(matches) > 1:
+            raise ValueError(
+                f"Multiple power attempts have ID {attempt_id!r}."
+            )
         return matches[0]
 
     # ------------------------------------------------------------------
@@ -178,6 +218,12 @@ class ExperimentDataset:
         ]
 
     @property
+    def power_std_values(self):
+        """Population standard deviations in mW, when recorded."""
+
+        return [m.power_std_mw for m in self.measurements]
+
+    @property
     def fluences(self):
 
         return [
@@ -222,6 +268,10 @@ class ExperimentDataset:
             "measurements": len(self),
 
             "backgrounds": len(self.backgrounds),
+
+            "power_traces": len(self.power_traces),
+
+            "power_attempts": len(self.power_attempts),
 
             "directory": str(self.root),
 

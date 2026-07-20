@@ -13,6 +13,7 @@ saving one ExperimentConfig alongside the acquired data.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,104 @@ class BackgroundConfig:
             raise ValueError("Background averages must be at least one.")
         if self.settle_time_s < 0:
             raise ValueError("Background settle time must not be negative.")
+
+
+# =============================================================================
+# Incident-power acquisition
+# =============================================================================
+
+@dataclass(slots=True)
+class PowerMeasurementConfig:
+    """Incident-power sampling performed by the retractable meter probe.
+
+    ``enabled`` remains false until the laboratory-specific in/out stage
+    positions have been measured and entered in :mod:`hardware.config`.
+    Whenever it is enabled, the normal cadence is one measurement after each
+    waveplate setting and before the corresponding sample-rotation block.
+    """
+
+    enabled: bool = False
+
+    cadence: str = "per_intensity"
+
+    wavelength_nm: float = 2000.0
+
+    # Exact option label verified live on sensor 3141552. ``wavelength_nm``
+    # remains the experiment's physical fundamental wavelength and is saved
+    # independently. Re-verify this returned label if the sensor is swapped.
+    wavelength_option: str | None = ">800"
+
+    measurement_duration_s: float = 10.0
+
+    pre_measurement_settle_s: float = 3.0
+
+    measurement_mode: str = "Power"
+
+    # Ophir option label, deliberately not a fragile numeric option index.
+    # 30.0mW covers the configured 20mW sample-safety ceiling; select 300mW
+    # explicitly for a separately reviewed higher-range diagnostic.
+    range_option: str | None = "30.0mW"
+
+    # Proceeding after a failed/invalid incident-power read would expose the
+    # sample at unknown power. It therefore requires an explicit opt-in.
+    continue_without_power_on_meter_error: bool = False
+
+    maximum_allowed_power_mw: float | None = 20.0
+
+    def __post_init__(self) -> None:
+        allowed_cadences = {
+            "per_intensity",
+            "per_measurement",
+            "disabled",
+        }
+        if self.cadence not in allowed_cadences:
+            raise ValueError(
+                "Power-measurement cadence must be one of "
+                f"{sorted(allowed_cadences)}."
+            )
+        if not math.isfinite(float(self.wavelength_nm)) or self.wavelength_nm <= 0:
+            raise ValueError("Power-meter wavelength must be positive.")
+        if self.wavelength_option is not None and not self.wavelength_option.strip():
+            raise ValueError("Power-meter wavelength option must not be empty.")
+        if (
+            not math.isfinite(float(self.measurement_duration_s))
+            or self.measurement_duration_s <= 0
+        ):
+            raise ValueError(
+                "Power-measurement duration must be greater than zero."
+            )
+        if (
+            not math.isfinite(float(self.pre_measurement_settle_s))
+            or self.pre_measurement_settle_s < 0
+        ):
+            raise ValueError(
+                "Power-meter pre-measurement settle time must not be negative."
+            )
+        if self.measurement_mode != "Power":
+            raise ValueError(
+                "The Ophir integration currently supports measurement_mode "
+                "'Power' only."
+            )
+        if self.range_option is not None and not self.range_option.strip():
+            raise ValueError("Power-meter range option must not be empty.")
+        if self.maximum_allowed_power_mw is not None and (
+            not math.isfinite(float(self.maximum_allowed_power_mw))
+            or self.maximum_allowed_power_mw <= 0
+        ):
+            raise ValueError("Maximum allowed power must be positive.")
+
+    def validate_for_run(self) -> None:
+        """Validate settings that become mandatory only when enabled."""
+
+        self.__post_init__()
+        if self.enabled and self.cadence != "disabled":
+            if self.wavelength_option is None:
+                raise ValueError(
+                    "Power metering is enabled but wavelength_option is not "
+                    "set. Select an exact option returned by the attached "
+                    "Ophir sensor so wavelength_nm cannot be mistaken for an "
+                    "unverified calibration setting."
+                )
 
 
 # =============================================================================
@@ -195,6 +294,10 @@ class ExperimentConfig:
 
     background: BackgroundConfig = field(
         default_factory=BackgroundConfig
+    )
+
+    power_meter: PowerMeasurementConfig = field(
+        default_factory=PowerMeasurementConfig
     )
 
     metadata: ExperimentMetadataConfig = field(

@@ -137,6 +137,45 @@ class ExperimentMonitor:
             f"{len(spectrum.intensities)}"
         )
 
+        power_status = getattr(result, "power_measurement_status", None)
+        if power_status is not None:
+            power_mw = getattr(result, "power_mw", None)
+            power_std_mw = getattr(result, "power_std_mw", None)
+            if power_mw is None:
+                print(
+                    "Incident power  : unavailable "
+                    f"(status={power_status})"
+                )
+            elif power_std_mw is None:
+                print(
+                    f"Incident power  : {power_mw:.6g} mW "
+                    f"(status={power_status})"
+                )
+            else:
+                print(
+                    f"Incident power  : {power_mw:.6g} +/- "
+                    f"{power_std_mw:.3g} mW (population STD; "
+                    f"status={power_status})"
+                )
+            duration = getattr(
+                result,
+                "power_measurement_duration_s",
+                None,
+            )
+            valid = getattr(result, "power_valid_sample_count", None)
+            total = getattr(result, "power_total_sample_count", None)
+            if duration is not None or total is not None:
+                duration_text = (
+                    f"{duration:.3f} s" if duration is not None else "unknown"
+                )
+                print(
+                    f"Power sampling  : {duration_text}, "
+                    f"valid samples={valid}/{total}"
+                )
+            power_error = getattr(result, "power_measurement_error", None)
+            if power_error:
+                print(f"Power warning   : {power_error}")
+
         print("Status          : OK")
 
     # ------------------------------------------------------------------
@@ -199,6 +238,8 @@ class ExperimentMonitor:
     def failed(
         self,
         exc: Exception,
+        *,
+        shutdown_status: dict | None = None,
     ):
 
         elapsed = time.time() - self.start_time
@@ -230,13 +271,27 @@ class ExperimentMonitor:
 
         print()
 
-        print(
-            "Beam safely blocked."
-        )
+        shutdown_status = shutdown_status or {}
+        if shutdown_status.get("shutter_closed"):
+            print("Beam shutter closure verified.")
+        else:
+            print(
+                "WARNING: Beam shutter closure was NOT verified; inspect "
+                "hardware before enabling the laser."
+            )
 
-        print(
-            "Motors stopped."
-        )
+        probe_out = shutdown_status.get("power_probe_out")
+        if probe_out is True:
+            print("Power-meter out position verified.")
+        elif probe_out is False:
+            print(
+                "WARNING: Power-meter out position was NOT verified; inspect "
+                "the beam path."
+            )
+
+        stopped = shutdown_status.get("rotation_stages_stopped", [])
+        if stopped:
+            print("Stopped rotation stages: " + ", ".join(stopped))
 
         print("=" * 70)
 

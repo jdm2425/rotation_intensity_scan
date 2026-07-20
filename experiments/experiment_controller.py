@@ -53,12 +53,31 @@ class ExperimentController:
         sample_angles,
     ):
 
+        self.config.power_meter.validate_for_run()
+
         total_measurements = (
             len(waveplate_angles)
             * len(sample_angles)
         )
 
-        with HardwareManager() as hardware:
+        power_enabled = bool(
+            self.config.power_meter.enabled
+            and self.config.power_meter.cadence != "disabled"
+        )
+        if power_enabled:
+            hardware_context = HardwareManager(
+                enable_power_meter=True,
+                power_meter_wavelength_option=(
+                    self.config.power_meter.wavelength_option
+                ),
+                power_meter_range_option=(
+                    self.config.power_meter.range_option
+                ),
+            )
+        else:
+            hardware_context = HardwareManager()
+
+        with hardware_context as hardware:
 
             hardware.spectrometer.set_integration_time(
                 self.config.spectrometer.integration_time_ms
@@ -69,11 +88,17 @@ class ExperimentController:
                 shutter=hardware.shutter,
                 shutter_open_delay=self.config.shutter.open_delay_s,
                 shutter_close_delay=self.config.shutter.close_delay_s,
+                before_open=getattr(
+                    hardware,
+                    "require_sample_beam_path_clear",
+                    None,
+                ),
             )
 
             self.experiment.hardware = hardware
             self.experiment.acquisition = acquisition
             self.experiment.averages = self.config.spectrometer.averages
+            self.experiment.power_meter_config = self.config.power_meter
 
             monitor = ExperimentMonitor()
 
@@ -101,41 +126,46 @@ class ExperimentController:
                     not self.config.test.enabled
                     or self.config.test.save_data
                 )
-
-                if self.config.background.enabled and should_save:
-                    logger.info(
-                        "Acquiring pre-scan background %r with shutter closed.",
-                        self.config.background.name,
-                    )
-
-                    background = acquisition.acquire_dark(
-                        averages=self.config.background.averages,
-                        settle_time_s=(
-                            self.config.background.settle_time_s
-                        ),
-                    )
-
-                    writer.save_background(
-                        background,
-                        name=self.config.background.name,
-                        metadata={
-                            "kind": "shutter_closed_dark",
-                            "purpose": "pre_scan_background_correction",
-                            "shutter_state": "closed",
-                            "notes": self.config.background.notes,
-                        },
-                    )
-
-                plotter = PlotManager(
-                    enabled=True,
+                self.experiment.power_attempt_callback = (
+                    writer.save_power_attempt if should_save else None
                 )
 
-                runner = ScanRunner(
-                    experiment=self.experiment,
-                    monitor=monitor,
-                )
-
+                plotter = None
                 try:
+
+                    if self.config.background.enabled and should_save:
+                        logger.info(
+                            "Acquiring pre-scan background %r with shutter "
+                            "closed.",
+                            self.config.background.name,
+                        )
+
+                        background = acquisition.acquire_dark(
+                            averages=self.config.background.averages,
+                            settle_time_s=(
+                                self.config.background.settle_time_s
+                            ),
+                        )
+
+                        writer.save_background(
+                            background,
+                            name=self.config.background.name,
+                            metadata={
+                                "kind": "shutter_closed_dark",
+                                "purpose": "pre_scan_background_correction",
+                                "shutter_state": "closed",
+                                "notes": self.config.background.notes,
+                            },
+                        )
+
+                    plotter = PlotManager(
+                        enabled=True,
+                    )
+
+                    runner = ScanRunner(
+                        experiment=self.experiment,
+                        monitor=monitor,
+                    )
 
                     for measurement in runner.run(
                         waveplate_angles=waveplate_angles,
@@ -178,14 +208,15 @@ class ExperimentController:
                         "Experiment interrupted."
                     )
 
-                    self._safe_shutdown(
+                    shutdown_status = self._safe_shutdown(
                         hardware
                     )
 
                     monitor.failed(
                         KeyboardInterrupt(
                             "Experiment interrupted by user."
-                        )
+                        ),
+                        shutdown_status=shutdown_status,
                     )
 
                     raise
@@ -196,17 +227,25 @@ class ExperimentController:
                         "Experiment failed."
                     )
 
-                    self._safe_shutdown(
+                    shutdown_status = self._safe_shutdown(
                         hardware
                     )
 
-                    monitor.failed(exc)
+                    monitor.failed(
+                        exc,
+                        shutdown_status=shutdown_status,
+                    )
 
                     raise
 
                 finally:
 
-                    plotter.close()
+                    # Clear the callback before closing any resource. This
+                    # prevents a failed setup or plot close from leaving a
+                    # bound method to a DataWriter that is about to close.
+                    self.experiment.power_attempt_callback = None
+                    if plotter is not None:
+                        plotter.close()
 
                 monitor.finish()
 
@@ -215,7 +254,7 @@ class ExperimentController:
     def _safe_shutdown(
         self,
         hardware,
-    ):
+    ) -> dict:
         """
         Put the laboratory into a safe state.
         """
@@ -223,6 +262,12 @@ class ExperimentController:
         logger.warning(
             "Performing emergency shutdown..."
         )
+
+        status = {
+            "shutter_closed": False,
+            "power_probe_out": None,
+            "rotation_stages_stopped": [],
+        }
 
         #
         # Close shutter first.
@@ -235,12 +280,39 @@ class ExperimentController:
             logger.info(
                 "Beam shutter closed."
             )
+            status["shutter_closed"] = bool(hardware.shutter.is_closed)
 
         except Exception:
 
             logger.exception(
                 "Failed to close beam shutter."
             )
+
+        # With the shutter upstream, insertion-stage motion is allowed only
+        # after the closed state has been positively verified by PowerProbe.
+        power_probe = getattr(hardware, "power_probe", None)
+        if power_probe is not None:
+            try:
+                power_probe.safe_retract()
+                logger.info("Power meter returned to its verified out position.")
+                status["power_probe_out"] = True
+            except Exception:
+                status["power_probe_out"] = False
+                logger.exception(
+                    "Failed to return the power meter to its safe out position."
+                )
+                insertion_stage = getattr(
+                    hardware,
+                    "power_meter_stage",
+                    None,
+                )
+                if insertion_stage is not None:
+                    try:
+                        insertion_stage.halt()
+                    except Exception:
+                        logger.exception(
+                            "Failed to halt the power-meter insertion stage."
+                        )
 
         #
         # Stop stages.
@@ -254,6 +326,7 @@ class ExperimentController:
             try:
 
                 stage.stop()
+                status["rotation_stages_stopped"].append(stage.name)
 
             except Exception:
 
@@ -265,3 +338,5 @@ class ExperimentController:
         logger.warning(
             "Emergency shutdown complete."
         )
+
+        return status

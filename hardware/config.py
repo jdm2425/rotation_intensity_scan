@@ -40,6 +40,38 @@ class ShutterConfig:
     serial: str
     name: str = "Beam Shutter"
 
+
+@dataclass(frozen=True)
+class LinearStageConfig:
+    """Configuration for a PI linear insertion stage.
+
+    The application limits are an additional software safety envelope. They
+    do not replace the controller limits queried at connection time.
+    """
+
+    serial: str
+    controller_model: str
+    stage_model: str
+    installed: bool = True
+    axis: str = "1"
+    name: str = "Linear Stage"
+    application_min_mm: float = -12.0
+    application_max_mm: float = 12.0
+    in_position_mm: float | None = None
+    out_position_mm: float | None = None
+    velocity_mm_s: float | None = 1.0
+    position_tolerance_mm: float = 0.01
+    motion_timeout_s: float = 30.0
+
+
+@dataclass(frozen=True)
+class PowerMeterHardwareConfig:
+    """Identity of the Ophir USB power-meter controller and sensor head."""
+
+    controller_serial: str
+    sensor_serial: str
+    name: str = "Incident Power Meter"
+
 # =============================================================================
 # Shutter timing
 # =============================================================================
@@ -106,6 +138,30 @@ SHUTTER_TIMING = ShutterTimingConfig()
 SPECTROMETER = SpectrometerConfig(
     serial="SR600415",
     integration_time_ms=10.0,
+)
+
+#
+# Retractable incident-power probe. The in/out positions are intentionally
+# unset until they have been physically established in this optical setup.
+# Power-meter operation is rejected while either value remains unset.
+#
+POWER_METER_STAGE = LinearStageConfig(
+    serial="118054611",
+    controller_model="C-891.120200",
+    stage_model="V-408.132020",
+    installed=True,
+    axis="1",
+    name="Power Meter Translation Stage",
+    application_min_mm=-12.0,
+    application_max_mm=12.0,
+    in_position_mm=1.0,
+    out_position_mm=-1.0,
+    velocity_mm_s=1.0,
+)
+
+POWER_METER = PowerMeterHardwareConfig(
+    controller_serial="3144168",
+    sensor_serial="3141552",
 )
 
 # =============================================================================

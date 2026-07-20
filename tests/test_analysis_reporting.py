@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -320,10 +321,87 @@ def test_automatic_power_centres_use_complete_targets() -> None:
     assert source == "power_mw"
 
 
+def test_power_attempt_warnings_are_grouped_by_attempt() -> None:
+    partial_h5 = replace(
+        make_result(1, sample_angle_deg=0.0),
+        power_measurement_id="attempt-partial",
+        power_measurement_status="measured_with_invalid_samples",
+    )
+    partial_h7 = replace(partial_h5, harmonic="H7")
+    failed_first_angle = replace(
+        make_result(2, sample_angle_deg=0.0, power_mw=None),
+        power_measurement_id="attempt-failed",
+        power_measurement_status="failed",
+        power_measurement_error="meter unavailable",
+    )
+    failed_second_angle = replace(
+        failed_first_angle,
+        measurement_number=3,
+        sample_angle_deg=90.0,
+    )
+    rows = (
+        partial_h5,
+        partial_h7,
+        failed_first_angle,
+        failed_second_angle,
+    )
+    quality = build_quality_summary(rows)
+    assert quality["partial_power_measurement_count"] == 1
+    assert quality["failed_power_measurement_count"] == 1
+
+    warnings = build_analysis_warnings(
+        results=rows,
+        background_mode=BACKGROUND_EXPLICITLY_NOT_USED,
+        available_backgrounds=[],
+        transmission_mode=TRANSMISSION_EXPLICITLY_NOT_USED,
+        experimental_metadata={},
+    )
+    codes = {warning["code"] for warning in warnings}
+    assert "partially_invalid_power_measurements" in codes
+    assert "failed_power_measurements" in codes
+
+
+def test_attempts_without_spectra_are_included_in_reporting() -> None:
+    linked = replace(
+        make_result(1, sample_angle_deg=0.0),
+        power_measurement_id="attempt-linked",
+        power_measurement_status="measured",
+    )
+    attempts = (
+        {"attempt_id": "attempt-linked", "status": "measured"},
+        {"attempt_id": "attempt-over-limit", "status": "over_limit"},
+        {"attempt_id": "attempt-unsafe", "status": "unsafe_meter_status"},
+        {"attempt_id": "attempt-failed", "status": "failed"},
+    )
+
+    quality = build_quality_summary((linked,), power_attempts=attempts)
+    assert quality["power_attempt_count"] == 4
+    assert quality["power_attempt_without_spectrum_count"] == 3
+    assert quality["over_limit_power_measurement_count"] == 1
+    assert quality["unsafe_status_power_measurement_count"] == 1
+    assert quality["failed_power_measurement_count"] == 1
+
+    warnings = build_analysis_warnings(
+        results=(linked,),
+        background_mode=BACKGROUND_EXPLICITLY_NOT_USED,
+        available_backgrounds=[],
+        transmission_mode=TRANSMISSION_EXPLICITLY_NOT_USED,
+        experimental_metadata={},
+        power_attempts=attempts,
+    )
+    codes = {warning["code"] for warning in warnings}
+    assert "incident_power_over_limit" in codes
+    assert "unsafe_power_meter_status" in codes
+    assert "failed_power_measurements" in codes
+    assert "power_attempts_without_spectra" in codes
+
+
 def main() -> None:
     test_warning_modes_and_reporting_text()
     test_raw_annotation_and_fixed_tolerance_plot()
     test_automatic_power_centres_use_complete_targets()
+    test_power_attempt_warnings_are_grouped_by_attempt()
+    test_attempts_without_spectra_are_included_in_reporting()
     print("ANALYSIS REPORTING TEST PASSED")
 
 

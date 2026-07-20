@@ -46,7 +46,7 @@ class DataWriter:
         Human-readable name used in the experiment directory.
     """
 
-    FORMAT_VERSION = 4
+    FORMAT_VERSION = 5
 
     CSV_FIELDS = [
         "measurement",
@@ -57,6 +57,13 @@ class DataWriter:
         "target_power_mw",
         "power_rms_mw",
         "power_measurement_duration_s",
+        "power_std_mw",
+        "power_measurement_id",
+        "power_trace_id",
+        "power_measurement_status",
+        "power_measurement_error",
+        "power_valid_sample_count",
+        "power_total_sample_count",
         "fluence_mj_cm2",
         "intensity_w_cm2",
         "integration_time_ms",
@@ -98,9 +105,18 @@ class DataWriter:
             self.root / "backgrounds"
         )
 
+        self.power_measurements_directory = (
+            self.root / "power_measurements"
+        )
+
         self._measurement_number = 0
         self._background_number = 0
         self._background_records: list[dict[str, Any]] = []
+        self._power_trace_records: list[dict[str, Any]] = []
+        self._power_trace_paths: dict[str, Path] = {}
+        self._power_trace_objects: dict[str, Any] = {}
+        self._power_attempt_records: list[dict[str, Any]] = []
+        self._power_attempt_objects: dict[str, Any] = {}
 
         self._csv_file = None
         self._csv_writer = None
@@ -169,6 +185,18 @@ class DataWriter:
         """
 
         return self._measurement_number
+
+    @property
+    def power_trace_count(self) -> int:
+        """Number of unique raw incident-power traces written so far."""
+
+        return len(self._power_trace_records)
+
+    @property
+    def power_attempt_count(self) -> int:
+        """Number of incident-power acquisition attempts persisted."""
+
+        return len(self._power_attempt_records)
 
     # ------------------------------------------------------------------
     # Metadata
@@ -289,6 +317,66 @@ class DataWriter:
             measurement.metadata
         )
 
+        power_trace = getattr(measurement, "power_trace", None)
+        power_status = getattr(measurement, "power_measurement_status", None)
+        attempt_id = getattr(measurement, "power_measurement_id", None)
+        measurement_trace_id = getattr(measurement, "power_trace_id", None)
+        if power_status and not attempt_id:
+            raise ValueError(
+                "A power measurement status requires a stable "
+                "power_measurement_id."
+            )
+        if attempt_id:
+            attempt = self._power_attempt_objects.get(str(attempt_id))
+            if attempt is None:
+                raise ValueError(
+                    "Power measurement attempt must be persisted before its "
+                    "associated spectrum."
+                )
+            if attempt.trace_id != measurement_trace_id:
+                raise ValueError(
+                    "Measurement power_trace_id disagrees with its persisted "
+                    "power attempt."
+                )
+            if not np.isclose(
+                float(attempt.waveplate_angle_deg),
+                float(measurement.waveplate_angle_deg),
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "Measurement waveplate angle disagrees with its power "
+                    "attempt."
+                )
+            if attempt.status != power_status:
+                raise ValueError(
+                    "Measurement power status disagrees with its persisted "
+                    "power attempt."
+                )
+            if attempt.error != getattr(
+                measurement,
+                "power_measurement_error",
+                None,
+            ):
+                raise ValueError(
+                    "Measurement power error disagrees with its persisted "
+                    "power attempt."
+                )
+        if measurement_trace_id and power_trace is None:
+            raise ValueError(
+                "power_trace_id is set but no raw power trace is attached."
+            )
+        if power_trace is not None:
+            trace_id = str(power_trace.trace_id)
+            if measurement_trace_id != trace_id:
+                raise ValueError(
+                    "Measurement power_trace_id does not match its "
+                    f"attached power trace ({measurement_trace_id!r} != "
+                    f"{trace_id!r})."
+                )
+            self._validate_power_summary(measurement, power_trace)
+            self.save_power_trace(power_trace)
+
         self._measurement_number += 1
 
         filename = (
@@ -364,6 +452,49 @@ class DataWriter:
                         measurement.power_measurement_duration_s
                     ),
 
+                "power_std_mw":
+                    self._optional_value(
+                        getattr(measurement, "power_std_mw", None)
+                    ),
+
+                "power_measurement_id":
+                    getattr(measurement, "power_measurement_id", None) or "",
+
+                "power_trace_id":
+                    getattr(measurement, "power_trace_id", None) or "",
+
+                "power_measurement_status":
+                    getattr(
+                        measurement,
+                        "power_measurement_status",
+                        None,
+                    ) or "",
+
+                "power_measurement_error":
+                    getattr(
+                        measurement,
+                        "power_measurement_error",
+                        None,
+                    ) or "",
+
+                "power_valid_sample_count":
+                    self._optional_value(
+                        getattr(
+                            measurement,
+                            "power_valid_sample_count",
+                            None,
+                        )
+                    ),
+
+                "power_total_sample_count":
+                    self._optional_value(
+                        getattr(
+                            measurement,
+                            "power_total_sample_count",
+                            None,
+                        )
+                    ),
+
                 "fluence_mj_cm2":
                     self._optional_value(
                         measurement.fluence_mj_cm2
@@ -415,6 +546,207 @@ class DataWriter:
         self._csv_file.flush()
 
         return filepath
+
+    def save_power_trace(self, trace) -> Path:
+        """Save one unique raw power trace and atomically update its index.
+
+        Raw COM values are encoded as JSON strings inside a non-object NumPy
+        array. This preserves missing values and primitive types without
+        enabling pickle when the experiment is reloaded.
+        """
+
+        self._require_open()
+
+        trace_id = str(trace.trace_id).strip()
+        if not trace_id:
+            raise ValueError("Power trace ID must not be empty.")
+        existing_path = self._power_trace_paths.get(trace_id)
+        if existing_path is not None:
+            if self._power_trace_objects[trace_id] != trace:
+                raise ValueError(
+                    f"Power trace ID collision for {trace_id!r}."
+                )
+            return existing_path
+
+        samples = tuple(trace.samples)
+        batch_sizes = np.asarray(trace.batch_sizes, dtype=int)
+        if batch_sizes.ndim != 1 or np.any(batch_sizes < 0):
+            raise ValueError(
+                "Power-trace batch sizes must be a one-dimensional, "
+                "non-negative integer sequence."
+            )
+        if int(np.sum(batch_sizes)) != len(samples):
+            raise ValueError(
+                "Power-trace batch sizes do not account for every sample."
+            )
+
+        self.power_measurements_directory.mkdir(
+            parents=False,
+            exist_ok=True,
+        )
+        filename = f"power_{len(self._power_trace_records) + 1:06d}.npz"
+        filepath = self.power_measurements_directory / filename
+
+        np.savez_compressed(
+            filepath,
+            batch_sizes=batch_sizes,
+            batch_index=np.asarray(
+                [sample.batch_index for sample in samples],
+                dtype=int,
+            ),
+            index_in_batch=np.asarray(
+                [sample.index_in_batch for sample in samples],
+                dtype=int,
+            ),
+            raw_value_json=np.asarray(
+                [self._raw_json(sample.raw_value) for sample in samples],
+                dtype=str,
+            ),
+            raw_timestamp_json=np.asarray(
+                [self._raw_json(sample.raw_timestamp) for sample in samples],
+                dtype=str,
+            ),
+            raw_status_json=np.asarray(
+                [self._raw_json(sample.raw_status) for sample in samples],
+                dtype=str,
+            ),
+            power_w=np.asarray(
+                [
+                    np.nan if sample.power_w is None else sample.power_w
+                    for sample in samples
+                ],
+                dtype=float,
+            ),
+            timestamp_s=np.asarray(
+                [
+                    np.nan
+                    if sample.timestamp_s is None
+                    else sample.timestamp_s
+                    for sample in samples
+                ],
+                dtype=float,
+            ),
+            valid_for_statistics=np.asarray(
+                [sample.valid_for_statistics for sample in samples],
+                dtype=bool,
+            ),
+            invalid_reasons_json=np.asarray(
+                [
+                    json.dumps(
+                        list(sample.invalid_reasons),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    for sample in samples
+                ],
+                dtype=str,
+            ),
+        )
+
+        record = {
+            "trace_id": trace_id,
+            "trace_file": (
+                Path("power_measurements") / filename
+            ).as_posix(),
+            "requested_duration_s": float(trace.requested_duration_s),
+            "elapsed_duration_s": float(trace.elapsed_duration_s),
+            "started_at_unix_s": float(trace.started_at_unix_s),
+            "source_unit": str(trace.source_unit),
+            "device_serial": trace.device_serial,
+            "sensor_serial": trace.sensor_serial,
+            "measurement_mode": trace.measurement_mode,
+            "wavelength_option": trace.wavelength_option,
+            "range_option": trace.range_option,
+            "total_sample_count": len(samples),
+            "valid_sample_count": trace.statistics.valid_sample_count,
+        }
+        self._power_trace_records.append(record)
+        self._power_trace_paths[trace_id] = filepath
+        self._power_trace_objects[trace_id] = trace
+        try:
+            self._write_json(
+                "power_measurements.json",
+                {"power_measurements": self._power_trace_records},
+            )
+        except Exception:
+            self._power_trace_records.pop()
+            self._power_trace_paths.pop(trace_id, None)
+            self._power_trace_objects.pop(trace_id, None)
+            raise
+
+        return filepath
+
+    def save_power_attempt(self, attempt, trace=None) -> None:
+        """Persist one success/failure attempt before spectrum acquisition."""
+
+        self._require_open()
+        attempt_id = str(attempt.attempt_id).strip()
+        existing = self._power_attempt_objects.get(attempt_id)
+        if existing is not None:
+            if existing != attempt:
+                raise ValueError(
+                    f"Power measurement attempt ID collision: {attempt_id!r}."
+                )
+            return
+
+        if trace is None:
+            if attempt.trace_id is not None:
+                raise ValueError(
+                    "Power attempt references a trace but no trace was supplied."
+                )
+        else:
+            if attempt.trace_id != trace.trace_id:
+                raise ValueError(
+                    "Power attempt trace_id does not match the supplied trace."
+                )
+            self.save_power_trace(trace)
+
+        record = self._to_json_compatible(attempt)
+        self._power_attempt_records.append(record)
+        self._power_attempt_objects[attempt_id] = attempt
+        try:
+            self._write_json(
+                "power_attempts.json",
+                {"power_attempts": self._power_attempt_records},
+            )
+        except Exception:
+            self._power_attempt_records.pop()
+            self._power_attempt_objects.pop(attempt_id, None)
+            raise
+
+    @staticmethod
+    def _validate_power_summary(measurement, trace) -> None:
+        """Prevent derived CSV values drifting from the preserved raw trace."""
+
+        statistics = trace.statistics
+        expected = {
+            "power_mw": statistics.arithmetic_mean_power_mw,
+            "power_std_mw": statistics.population_standard_deviation_mw,
+            "power_rms_mw": statistics.absolute_root_mean_square_power_mw,
+            "power_measurement_duration_s": trace.elapsed_duration_s,
+            "power_valid_sample_count": statistics.valid_sample_count,
+            "power_total_sample_count": statistics.total_sample_count,
+        }
+        for name, expected_value in expected.items():
+            actual_value = getattr(measurement, name, None)
+            if expected_value is None or actual_value is None:
+                matches = expected_value is None and actual_value is None
+            elif isinstance(expected_value, int):
+                matches = int(actual_value) == expected_value
+            else:
+                matches = bool(
+                    np.isclose(
+                        float(actual_value),
+                        float(expected_value),
+                        rtol=1e-12,
+                        atol=1e-12,
+                    )
+                )
+            if not matches:
+                raise ValueError(
+                    f"Measurement {name}={actual_value!r} does not match "
+                    f"raw power trace statistic {expected_value!r}."
+                )
 
     def save_background(
         self,
@@ -639,4 +971,15 @@ class DataWriter:
             cls._to_json_compatible(metadata),
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    @classmethod
+    def _raw_json(cls, value) -> str:
+        """Encode one raw vendor value without requiring a NumPy object array."""
+
+        return json.dumps(
+            cls._to_json_compatible(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
         )

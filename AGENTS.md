@@ -27,10 +27,15 @@ It coordinates:
 - A waveplate rotation stage that controls beam power.
 - A sample rotation stage.
 - A beam shutter.
+- A PI linear stage carrying a retractable incident-power sensor.
+- An Ophir Juno power meter and 3A-P-V1 sensor.
 - An Ocean Insight Ocean SR spectrometer.
 - Spectrum acquisition, live monitoring, persistence, and later harmonic analysis.
 
-The intended experiment rotates the sample and, at each sample angle, varies the waveplate angle or intensity setting, acquires spectra, isolates a harmonic region, and integrates its intensity.
+The maintained scan is intensity-major: it sets one waveplate angle, measures
+incident power once by default, then acquires spectra across every requested
+sample angle before advancing the waveplate. Offline analysis isolates and
+integrates one or more harmonic regions.
 
 ## Hardware safety
 
@@ -43,7 +48,8 @@ Do not perform any of the following unless the user explicitly approves a hardwa
 - Move a stage.
 - Open or toggle the shutter.
 - Connect to the spectrometer.
-- Connect to or read from a future power meter.
+- Connect to or read from the power meter.
+- Connect to or move the PI power-meter insertion stage.
 - Run a complete experiment.
 - Run any test marked as hardware-dependent.
 - Change hardware serial numbers or state mappings.
@@ -59,6 +65,11 @@ The known shutter mapping is:
 - State `1` = closed.
 
 Do not reverse or reinterpret this mapping without a real hardware verification requested by the user.
+
+The fixed optical order is shutter, then retractable power meter, then sample.
+The shutter must be closed and positively verified before every insertion-stage
+move. Sample-spectrum acquisition must be refused unless the power meter is at
+its configured and live-verified out position.
 
 Before any approved hardware test:
 
@@ -78,11 +89,21 @@ The following work is normally safe without hardware:
 - Import checks that do not instantiate devices.
 - Tests using synthetic `Spectrum` objects.
 - Tests using mocks or fakes.
+- `python -m tests.test_base`
 - `python -m tests.test_round_trip`
+- `python -m tests.test_rotation_scan`
+- `python -m tests.test_experiment_workflow`
 - `python -m tests.test_harmonic_analysis`
 - `python -m tests.test_data_products`
 - `python -m tests.test_analysis_reporting`
 - `python -m tests.test_analysis_cli`
+- `python -m tests.test_ophir_power_meter`
+- `python -m tests.test_pi_linear_stage`
+- `python -m tests.test_power_probe`
+- `python -m tests.test_power_trace_round_trip`
+- `python -m tests.test_power_experiment_workflow`
+- `python -m tests.test_power_safety_policy`
+- `python -m tests.test_acquisition_guard`
 - Persistence tests that write only to temporary directories.
 - Pure analysis, plotting, and configuration validation tests.
 
@@ -117,8 +138,15 @@ Measurement(
     sample_angle_deg=...,
     power_mw=...,                       # achieved mean power
     target_power_mw=...,                # requested setpoint
-    power_rms_mw=...,                   # meter-reported RMS
+    power_std_mw=...,                   # population STD of valid samples
+    power_rms_mw=...,                   # sqrt(mean(power**2))
     power_measurement_duration_s=...,
+    power_measurement_id=...,            # acquisition-attempt ID
+    power_trace_id=...,                  # raw-trace ID
+    power_measurement_status=...,
+    power_measurement_error=...,
+    power_valid_sample_count=...,
+    power_total_sample_count=...,
     fluence_mj_cm2=...,
     intensity_w_cm2=...,
     spectrum=Spectrum(...),
@@ -129,15 +157,26 @@ Convenience properties on `Measurement`, such as `integration_time_ms`, may forw
 
 `Measurement.power_mw` remains the canonical achieved mean power for backward
 compatibility. `achieved_power_mw` is a read-only alias. Do not use
-`target_power_mw` as though it were achieved power. Treat `power_rms_mw` as the
-RMS statistic reported by the eventual power meter over
-`power_measurement_duration_s`; it is not a standard deviation unless the
-verified meter API and acquisition implementation explicitly define it that
-way.
+`target_power_mw` as though it were achieved power. The implemented statistics
+use only finite, positive, status-OK raw samples: `power_mw` is their arithmetic
+mean, `power_std_mw` is their population standard deviation (denominator `N`),
+and `power_rms_mw` is their absolute RMS, `sqrt(mean(power**2))`. The RMS is not
+an uncertainty estimate. Zero, negative, missing, non-finite, or status-flagged
+samples remain in the raw trace and are never predicted, interpolated, clipped,
+or replaced. If no valid samples exist, all three statistics remain `None`.
 
-The data model and format are power-meter-ready, but no power-meter driver,
-serial, calibration, or experiment integration currently exists. Leave these
-fields `None` rather than deriving or inventing values.
+The Ophir/PI acquisition path is implemented. It does not implement a
+waveplate-to-power calibration or closed-loop power targeting, so
+`target_power_mw`, fluence, and intensity remain optional and must never be
+invented. Power acquisition is disabled by default until the PI probe's exact
+in/out positions are physically established in `hardware/config.py`.
+
+When enabled, defaults are one trace per waveplate/intensity block, 10 s
+sampling after 3 s sensor settling, physical fundamental wavelength 2000 nm,
+returned sensor option `>800`, fixed range `30.0mW`, and a 20 mW raw-sample
+ceiling. Unsafe meter-status or non-finite-power flags and any positive raw value above
+the ceiling abort before a spectrum, regardless of the mean or continuation
+setting.
 
 ## Persistence requirements
 
@@ -152,9 +191,12 @@ The persistence layer must:
 * Preserve completed measurements if a later acquisition fails.
 * Flush the measurement index after each successful save.
 
-The current experiment persistence format is version `4`. The three optional
-power-meter context fields are columns in `measurements.csv`; loaders must
-continue to accept older tables in which those columns are absent.
+The current experiment persistence format is version `5`. In addition to
+`measurements.csv`, it stores power attempts in `power_attempts.json`, unique
+trace metadata in `power_measurements.json`, and pickle-free raw traces under
+`power_measurements/`. A successful or failed power attempt is flushed before
+the corresponding spectrum acquisition. Loaders must continue to accept older
+tables and experiments in which these power fields and indexes are absent.
 
 The hardware-free round-trip test is a core regression test:
 
@@ -203,15 +245,14 @@ The likely next priorities are:
    especially `tests.test_round_trip`, `tests.test_harmonic_analysis`,
    `tests.test_data_products`, `tests.test_analysis_reporting`, and
    `tests.test_analysis_cli`.
-2. Only after those tests pass, design the final power-meter hardware
-   integration: verify the actual meter, interface, units, sampling semantics,
-   and serial before adding a driver or populating power fields. Any device
-   connection still requires explicit user approval.
-3. Hardware-validate the saved pre-scan experiment background workflow.
+2. Physically establish and record distinct power-meter in/out positions, then
+   perform the smallest shutter-interlocked insertion/retraction test. Do not
+   guess these positions.
+3. Hardware-validate one complete power-measured intensity block and the saved
+   pre-scan experiment background workflow.
 4. Refine harmonic analysis with optional local baselines, replicate
    uncertainty, and publication-specific plot formatting.
 5. Add detector/optical response corrections where calibration exists.
-6. Add safe utility scripts for hardware status and controlled stage movement.
 
 ## Git expectations
 
