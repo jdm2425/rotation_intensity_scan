@@ -141,9 +141,10 @@ SPECTROMETER = SpectrometerConfig(
 )
 
 #
-# Retractable incident-power probe. The in/out positions are intentionally
-# unset until they have been physically established in this optical setup.
-# Power-meter operation is rejected while either value remains unset.
+# Retractable incident-power probe. The repository currently contains
+# candidate in/out positions of +1.0/-1.0 mm. Treat them as usable only after
+# they have been physically verified on this exact setup. Set either value to
+# None to force HardwareManager to refuse probe operation until recommissioned.
 #
 POWER_METER_STAGE = LinearStageConfig(
     serial="118054611",
@@ -154,9 +155,9 @@ POWER_METER_STAGE = LinearStageConfig(
     name="Power Meter Translation Stage",
     application_min_mm=-12.0,
     application_max_mm=12.0,
-    in_position_mm=1.0,
-    out_position_mm=-1.0,
-    velocity_mm_s=1.0,
+    in_position_mm=12.0,
+    out_position_mm=-12.0,
+    velocity_mm_s=20.0,
 )
 
 POWER_METER = PowerMeterHardwareConfig(

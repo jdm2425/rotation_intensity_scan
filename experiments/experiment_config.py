@@ -160,6 +160,84 @@ class PowerMeasurementConfig:
                 )
 
 
+
+
+# =============================================================================
+# Closed-loop target-power control
+# =============================================================================
+
+@dataclass(slots=True)
+class TargetPowerConfig:
+    """Feedback settings for scanning requested powers instead of angles.
+
+    The waveplate bounds must describe one physically reviewed monotonic
+    branch.  They intentionally default to ``None`` so the software cannot
+    guess a safe branch of the periodic waveplate/polariser response.
+    """
+
+    waveplate_min_deg: float | None = None
+
+    waveplate_max_deg: float | None = None
+
+    monotonic_direction: str = "increasing"
+
+    tolerance_mw: float = 0.2
+
+    maximum_iterations: int = 8
+
+    minimum_angle_step_deg: float = 0.02
+
+    def validate_for_run(
+        self,
+        *,
+        target_powers_mw,
+        power_meter: PowerMeasurementConfig,
+    ) -> None:
+        if not power_meter.enabled or power_meter.cadence != "per_intensity":
+            raise ValueError(
+                "Target-power scans require power_meter.enabled=True and "
+                "power_meter.cadence='per_intensity'."
+            )
+        if self.waveplate_min_deg is None or self.waveplate_max_deg is None:
+            raise ValueError(
+                "Target-power scans require physically verified "
+                "waveplate_min_deg and waveplate_max_deg values."
+            )
+        lower = float(self.waveplate_min_deg)
+        upper = float(self.waveplate_max_deg)
+        if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+            raise ValueError(
+                "Target-power waveplate bounds must be finite and max > min."
+            )
+        direction = str(self.monotonic_direction).strip().lower()
+        if direction not in {"increasing", "decreasing"}:
+            raise ValueError(
+                "Target-power monotonic_direction must be 'increasing' or "
+                "'decreasing'."
+            )
+        if not math.isfinite(float(self.tolerance_mw)) or self.tolerance_mw <= 0:
+            raise ValueError("Target-power tolerance_mw must be positive.")
+        if int(self.maximum_iterations) < 1:
+            raise ValueError("Target-power maximum_iterations must be at least one.")
+        if (
+            not math.isfinite(float(self.minimum_angle_step_deg))
+            or self.minimum_angle_step_deg <= 0
+        ):
+            raise ValueError(
+                "Target-power minimum_angle_step_deg must be positive."
+            )
+        targets = [float(value) for value in target_powers_mw]
+        if not targets:
+            raise ValueError("At least one target power is required.")
+        if any(not math.isfinite(value) or value <= 0 for value in targets):
+            raise ValueError("All target powers must be finite and positive.")
+        limit = power_meter.maximum_allowed_power_mw
+        if limit is not None and any(value > float(limit) for value in targets):
+            raise ValueError(
+                "A requested target power exceeds maximum_allowed_power_mw."
+            )
+
+
 # =============================================================================
 # Experimental metadata
 # =============================================================================
@@ -298,6 +376,10 @@ class ExperimentConfig:
 
     power_meter: PowerMeasurementConfig = field(
         default_factory=PowerMeasurementConfig
+    )
+
+    target_power: TargetPowerConfig = field(
+        default_factory=TargetPowerConfig
     )
 
     metadata: ExperimentMetadataConfig = field(

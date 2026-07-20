@@ -45,9 +45,9 @@ Update this file whenever a feature is verified, abandoned, or materially redesi
   - PI power-meter insertion stage whenever it is marked installed.
   - Ophir meter when incident-power acquisition is enabled.
   - Retractable power-probe coordinator.
-- The individual PI and Ophir devices are live-verified. The complete
-  retractable-probe path remains blocked only by unset physical in/out
-  positions.
+- The individual PI and Ophir devices are live-verified. Candidate probe
+  positions `in=+1.0 mm` and `out=-1.0 mm` are present in configuration, but
+  this handoff does not independently verify that they are physically correct.
 
 ### Ophir power meter
 
@@ -78,8 +78,9 @@ Update this file whenever a feature is verified, abandoned, or materially redesi
   shutter began and ended closed.
 - Startup now treats the configured 1 mm/s as a maximum: it lowers a faster
   live value and verifies readback, but retains an already slower value.
-- `in_position_mm` and `out_position_mm` remain intentionally unset and must be
-  established physically before `HardwareManager` will connect anything.
+- `hardware/config.py` currently contains `in_position_mm=+1.0` and
+  `out_position_mm=-1.0`. These must be confirmed physically with the standalone
+  PI/probe test before relying on automatic insertion or sample-beam clearance.
 
 ### Experiment execution
 
@@ -348,10 +349,11 @@ raw trace and are never predicted. Failed or all-invalid reads abort by default
 and otherwise continue only under an explicit missing-power opt-in. Over-limit
 and unsafe-status cases always abort before acquiring a sample spectrum.
 
-No waveplate-to-power calibration or closed-loop target control is implemented;
-`target_power_mw`, fluence, and intensity are not invented. Complete real
-integration is blocked only by unset physical in/out positions and their
-coordinated insertion/retraction validation.
+A bounded closed-loop target-power controller is implemented. It searches
+only inside an operator-supplied monotonic waveplate branch and stores requested
+and achieved power separately. It does not invent fluence or intensity.
+Complete real integration still requires physical verification of the probe
+in/out positions and a staged hardware validation of the feedback loop.
 
 ### Laboratory utilities
 
@@ -458,7 +460,8 @@ Do not treat `measurement.spectrum` as an array.
 * The supplied PI manual targets C-891.130300 rather than the exact configured
   C-891.120200 controller.
 * Unset or guessed probe in/out positions can block operation or obstruct the
-  sample beam; the current manager deliberately refuses to start while unset.
+  sample beam. The manager refuses to start when unset, but cannot determine
+  whether configured numerical positions are mechanically correct.
 * A valid-looking mean must not hide one unsafe raw status or over-limit sample;
   the implemented interlocks inspect the raw trace.
 
@@ -466,8 +469,9 @@ Do not treat `measurement.spectrum` as an array.
 
 1. Keep the complete hardware-free persistence, analysis, power-driver,
    interlock, and workflow suite green.
-2. Physically determine and enter distinct power-meter in/out positions; verify
-   retraction and the sample-beam guard before enabling incident-power sampling.
+2. Use `tools.test_power_probe_hardware` to verify the configured distinct
+   power-meter in/out positions, retraction, and sample-beam guard before a full
+   incident-power scan.
 3. Run one small power-measured intensity block, reload format-5 data, and audit
    the raw trace, attempt record, shared measurement links, background, and
    analysis-format-3 warnings.
@@ -499,3 +503,30 @@ hardware unless I explicitly approve it.
 ```
 
 ````
+
+## Target-power scan software addition (20 July 2026)
+
+A bounded closed-loop target-power scan path has been added in software:
+
+- `experiments/power_targeting.py`
+- `run_target_power_scan.py`
+- target-power support in the controller, runner, experiment, and monitor
+- `tests/test_target_power_experiment_workflow.py`
+- `docs/TARGET_POWER_SCAN.md`
+
+The controller searches only inside an explicit monotonic waveplate branch,
+records requested and achieved powers separately, and aborts on unbracketed
+targets, invalid power, over-limit readings, or failed convergence. For each
+requested power it now opens one persistent probe session: the PI stage inserts
+once, every feedback trace is shutter-gated while the probe remains in place,
+and the probe retracts once before any sample spectrum.
+
+`tools/test_power_probe_hardware.py` provides separate `inspect`, `move`, and
+`measure` workflows for the shutter, PI stage, and Ophir meter without
+connecting the rotation stages or spectrometer. The `measure` workflow can
+record multiple traces during one insertion and saves CSV/JSON output.
+
+Hardware-free tests pass. Complete physical target-power operation remains
+unverified. Resolve the disagreement between the configured `+1/-1 mm` probe
+positions and the earlier documentation stating that those positions were
+unset/unverified before a real scan.

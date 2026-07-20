@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from analysis.measurement import Measurement
 from data.power_measurement import PowerMeasurementAttempt
+from experiments.power_targeting import TargetPowerController
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,12 @@ class RotationIntensityExperiment:
         self.acquisition = None
         self.averages = 1
         self.power_meter_config = None
+        self.target_power_config = None
         self.power_attempt_callback = None
         self._current_waveplate_angle: float | None = None
+        self._current_target_power_mw: float | None = None
+        self._target_power_controller: TargetPowerController | None = None
+        self._active_power_session = None
         self._power_state: dict = {}
 
     # ------------------------------------------------------------------
@@ -48,6 +53,9 @@ class RotationIntensityExperiment:
         """Reset run-local power state without operating any hardware."""
 
         self._current_waveplate_angle = None
+        self._current_target_power_mw = None
+        self._target_power_controller = None
+        self._active_power_session = None
         self._power_state = {}
 
     def prepare_intensity(self, *, waveplate_angle: float) -> None:
@@ -56,6 +64,7 @@ class RotationIntensityExperiment:
         if self.hardware is None:
             raise RuntimeError("Hardware has not been attached.")
 
+        self._current_target_power_mw = None
         waveplate_angle = float(waveplate_angle)
         logger.info("Setting waveplate to %.3f deg.", waveplate_angle)
         self.hardware.waveplate.move_to(waveplate_angle)
@@ -77,6 +86,104 @@ class RotationIntensityExperiment:
                 f"Unsupported power-measurement cadence: {config.cadence!r}"
             )
 
+    def prepare_target_power(self, *, target_power_mw: float) -> float:
+        """Move the waveplate until measured power reaches one requested value.
+
+        The power probe is inserted once for the complete feedback block.
+        Each candidate measurement opens and re-closes the shutter, while the
+        shutter remains closed during every waveplate move.  The probe is
+        retracted once before any sample spectrum is acquired.  The final
+        successful trace is reused for all sample angles in the target block.
+        """
+
+        if self.hardware is None:
+            raise RuntimeError("Hardware has not been attached.")
+        meter_config = self.power_meter_config
+        target_config = self.target_power_config
+        if meter_config is None or target_config is None:
+            raise RuntimeError("Target-power configuration has not been attached.")
+        if not meter_config.enabled or meter_config.cadence != "per_intensity":
+            raise RuntimeError(
+                "Target-power feedback requires enabled per_intensity power "
+                "measurement."
+            )
+
+        target_power_mw = float(target_power_mw)
+        self._current_target_power_mw = target_power_mw
+        if self._target_power_controller is None:
+            self._target_power_controller = TargetPowerController(
+                measure_power_at_angle=self._measure_power_at_angle,
+                waveplate_min_deg=target_config.waveplate_min_deg,
+                waveplate_max_deg=target_config.waveplate_max_deg,
+                monotonic_direction=target_config.monotonic_direction,
+                tolerance_mw=target_config.tolerance_mw,
+                maximum_iterations=target_config.maximum_iterations,
+                minimum_angle_step_deg=target_config.minimum_angle_step_deg,
+            )
+
+        power_probe = getattr(self.hardware, "power_probe", None)
+        if power_probe is None:
+            raise RuntimeError(
+                "Target-power feedback requires a retractable power probe."
+            )
+
+        logger.info(
+            "Targeting incident power %.6g +/- %.6g mW with one persistent "
+            "probe insertion.",
+            target_power_mw,
+            target_config.tolerance_mw,
+        )
+        with power_probe.measurement_session() as session:
+            self._active_power_session = session
+            try:
+                result = self._target_power_controller.set_target(target_power_mw)
+            finally:
+                self._active_power_session = None
+
+        self._current_waveplate_angle = result.waveplate_angle_deg
+        self._power_state["target_power_mw"] = target_power_mw
+        self._power_state["targeting"] = {
+            "absolute_error_mw": result.absolute_error_mw,
+            "measurement_count": result.measurement_count,
+            "tolerance_mw": target_config.tolerance_mw,
+            "monotonic_direction": target_config.monotonic_direction,
+            "waveplate_min_deg": target_config.waveplate_min_deg,
+            "waveplate_max_deg": target_config.waveplate_max_deg,
+        }
+        logger.info(
+            "Target power %.6g mW reached at %.6g deg: achieved %.6g mW.",
+            target_power_mw,
+            result.waveplate_angle_deg,
+            result.achieved_power_mw,
+        )
+        return result.waveplate_angle_deg
+
+    def _measure_power_at_angle(self, waveplate_angle: float) -> float:
+        """Move to one candidate angle and return a verified achieved power."""
+
+        session = self._active_power_session
+        if session is None or not session.active:
+            raise RuntimeError(
+                "Target-power feedback attempted a measurement outside the "
+                "persistent power-probe session."
+            )
+
+        waveplate_angle = float(waveplate_angle)
+        logger.info(
+            "Power feedback candidate: waveplate %.6g deg.",
+            waveplate_angle,
+        )
+        session.prepare_for_motion()
+        self.hardware.waveplate.move_to(waveplate_angle)
+        self._current_waveplate_angle = waveplate_angle
+        self._take_power_measurement(power_session=session)
+        power_mw = self._power_state.get("power_mw")
+        if power_mw is None:
+            raise RuntimeError(
+                "Target-power feedback received no valid achieved power."
+            )
+        return float(power_mw)
+
     # ------------------------------------------------------------------
 
     def measure(
@@ -84,6 +191,7 @@ class RotationIntensityExperiment:
         *,
         waveplate_angle: float,
         sample_angle: float,
+        target_power_mw: float | None = None,
     ) -> Measurement:
         """
         Perform one complete measurement.
@@ -105,7 +213,15 @@ class RotationIntensityExperiment:
             sample_angle,
         )
 
-        if (
+        if target_power_mw is not None:
+            if (
+                self._current_target_power_mw is None
+                or self._current_target_power_mw != float(target_power_mw)
+            ):
+                waveplate_angle = self.prepare_target_power(
+                    target_power_mw=target_power_mw
+                )
+        elif (
             self._current_waveplate_angle is None
             or self._current_waveplate_angle != float(waveplate_angle)
         ):
@@ -148,6 +264,8 @@ class RotationIntensityExperiment:
                     "wavelength_nm",
                     None,
                 ),
+                "target_power_mw": target_power_mw,
+                "targeting": self._power_state.get("targeting"),
             }
 
         measurement = Measurement(
@@ -155,6 +273,7 @@ class RotationIntensityExperiment:
             waveplate_angle_deg=waveplate_angle,
             sample_angle_deg=sample_angle,
             power_mw=self._power_state.get("power_mw"),
+            target_power_mw=target_power_mw,
             power_rms_mw=self._power_state.get("power_rms_mw"),
             power_std_mw=self._power_state.get("power_std_mw"),
             power_measurement_duration_s=self._power_state.get(
@@ -183,8 +302,13 @@ class RotationIntensityExperiment:
 
         return measurement
 
-    def _take_power_measurement(self) -> None:
-        """Acquire a real trace or record an explicit missing-power state."""
+    def _take_power_measurement(self, *, power_session=None) -> None:
+        """Acquire a real trace or record an explicit missing-power state.
+
+        ``power_session`` is supplied only by target-power feedback so several
+        traces can share one verified probe insertion.  Ordinary angle scans
+        retain the one-shot insert/measure/retract sequence.
+        """
 
         from hardware.power_probe import PowerProbeMeasurementError
 
@@ -206,8 +330,9 @@ class RotationIntensityExperiment:
         )
         attempt_id = str(uuid4())
         attempted_at = time.time()
+        trace_source = power_probe if power_session is None else power_session
         try:
-            trace = power_probe.acquire_trace(
+            trace = trace_source.acquire_trace(
                 duration_s=config.measurement_duration_s,
                 settle_time_s=config.pre_measurement_settle_s,
             )
@@ -368,6 +493,7 @@ class RotationIntensityExperiment:
             metadata={
                 "configured_wavelength_option": config.wavelength_option,
                 "configured_range_option": config.range_option,
+                "target_power_mw": self._current_target_power_mw,
             },
         )
         callback(attempt, self._power_state.get("trace"))

@@ -181,7 +181,6 @@ class HardwareManager:
             if self.power_meter_stage is not None:
                 self.power_meter_stage.connect()
                 connected_devices.append(self.power_meter_stage)
-                self.power_meter_stage.apply_configured_velocity()
                 self.power_meter_stage.prepare_for_closed_loop()
 
                 # The stage is physically installed even when power sampling

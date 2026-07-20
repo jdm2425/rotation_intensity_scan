@@ -114,10 +114,13 @@ configuration. The Ophir driver's `PowerSample`, `PowerStatistics`, and
 `PowerTrace` models are vendor-independent, while its COM runtime and clocks can
 be injected for hardware-free use.
 `hardware/power_probe.py:RetractablePowerProbe` is the experiment-specific
-optical interlock around them. Its fixed sequence is close and verify shutter,
-move in and verify, open and verify, settle and sample, close and verify, then
-move out and verify. It never commands insertion-stage motion when upstream
-shutter closure cannot be verified.
+optical interlock around them. One-shot acquisition closes and verifies the
+shutter, inserts and verifies the probe, opens and samples, then closes and
+retracts. `PowerProbeMeasurementSession` additionally supports one insertion
+across several feedback traces: every trace is shutter-gated, waveplate motion
+requires a verified closed shutter and in position, and context exit performs
+one verified retraction. Insertion-stage motion is never commanded when
+upstream shutter closure cannot be verified.
 
 Because the configured stage is physically marked `installed=True`,
 `HardwareManager` manages and retracts it even when meter sampling is disabled.
@@ -302,6 +305,28 @@ before the first associated spectrum. Normal status values are `measured`,
 explicit continuation option can preserve missing power and continue only for
 those recoverable cases. Over-limit or unsafe-status traces always abort before
 sample acquisition.
+
+### Target-power feedback
+
+A target-power scan supplies requested powers instead of fixed waveplate
+angles. `TargetPowerController` searches only within one operator-reviewed
+monotonic waveplate interval.
+
+For each requested power, `RotationIntensityExperiment` opens one
+`PowerProbeMeasurementSession`. The session:
+
+* closes and verifies the shutter before insertion;
+* inserts and verifies the PI probe once;
+* keeps the probe inserted while all feedback traces are acquired;
+* begins and ends every trace with the shutter closed;
+* requires a closed shutter and verified in position before each waveplate move;
+* closes the shutter and retracts/verifies the probe once on context exit,
+  including exceptions.
+
+After the target is reached and the session exits, sample spectra are acquired
+only through the existing live probe-out guard. Requested power, achieved mean
+power, final waveplate angle, and every intermediate raw trace remain distinct
+persisted quantities.
 
 It should not know the internal `.npz` file format.
 

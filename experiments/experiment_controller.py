@@ -49,14 +49,30 @@ class ExperimentController:
     def run(
         self,
         *,
-        waveplate_angles,
         sample_angles,
+        waveplate_angles=None,
+        target_powers_mw=None,
     ):
 
+        angle_mode = waveplate_angles is not None
+        target_power_mode = target_powers_mw is not None
+        if angle_mode == target_power_mode:
+            raise ValueError(
+                "Supply exactly one of waveplate_angles or target_powers_mw."
+            )
+
         self.config.power_meter.validate_for_run()
+        if target_power_mode:
+            self.config.target_power.validate_for_run(
+                target_powers_mw=target_powers_mw,
+                power_meter=self.config.power_meter,
+            )
+            intensity_values = target_powers_mw
+        else:
+            intensity_values = waveplate_angles
 
         total_measurements = (
-            len(waveplate_angles)
+            len(intensity_values)
             * len(sample_angles)
         )
 
@@ -99,6 +115,7 @@ class ExperimentController:
             self.experiment.acquisition = acquisition
             self.experiment.averages = self.config.spectrometer.averages
             self.experiment.power_meter_config = self.config.power_meter
+            self.experiment.target_power_config = self.config.target_power
 
             monitor = ExperimentMonitor()
 
@@ -169,6 +186,7 @@ class ExperimentController:
 
                     for measurement in runner.run(
                         waveplate_angles=waveplate_angles,
+                        target_powers_mw=target_powers_mw,
                         sample_angles=sample_angles,
                     ):
 

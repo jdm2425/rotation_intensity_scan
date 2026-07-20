@@ -165,11 +165,13 @@ an uncertainty estimate. Zero, negative, missing, non-finite, or status-flagged
 samples remain in the raw trace and are never predicted, interpolated, clipped,
 or replaced. If no valid samples exist, all three statistics remain `None`.
 
-The Ophir/PI acquisition path is implemented. It does not implement a
-waveplate-to-power calibration or closed-loop power targeting, so
-`target_power_mw`, fluence, and intensity remain optional and must never be
-invented. Power acquisition is disabled by default until the PI probe's exact
-in/out positions are physically established in `hardware/config.py`.
+The Ophir/PI acquisition path and bounded closed-loop target-power scan are
+implemented. Targeting is allowed only inside an operator-supplied monotonic
+waveplate branch and must preserve requested power, achieved power, final angle,
+and every raw feedback trace separately. The probe is inserted once per target
+block and retracted before sample spectra. Fluence and intensity remain
+optional and must never be invented. Configured PI in/out positions must be
+physically verified before hardware use.
 
 When enabled, defaults are one trace per waveplate/intensity block, 10 s
 sampling after 3 s sensor settling, physical fundamental wavelength 2000 nm,
@@ -245,11 +247,10 @@ The likely next priorities are:
    especially `tests.test_round_trip`, `tests.test_harmonic_analysis`,
    `tests.test_data_products`, `tests.test_analysis_reporting`, and
    `tests.test_analysis_cli`.
-2. Physically establish and record distinct power-meter in/out positions, then
-   perform the smallest shutter-interlocked insertion/retraction test. Do not
-   guess these positions.
-3. Hardware-validate one complete power-measured intensity block and the saved
-   pre-scan experiment background workflow.
+2. Use `tools.test_power_probe_hardware` to verify the configured PI probe
+   in/out positions and one persistent-insertion measurement session.
+3. Hardware-validate one target power with one sample angle, then inspect the
+   saved target, achieved power, final waveplate angle, attempts, and traces.
 4. Refine harmonic analysis with optional local baselines, replicate
    uncertainty, and publication-specific plot formatting.
 5. Add detector/optical response corrections where calibration exists.
@@ -284,4 +285,3 @@ In particular:
 * Update `docs/DEVELOPMENT_WORKFLOW.md` after test or command changes.
 
 ````
-

@@ -232,8 +232,11 @@ positive reading.
 Zero, negative, missing, non-finite, or status-flagged raw readings are retained
 but excluded from statistics. They are never predicted, substituted, or
 derived from waveplate angle. An all-invalid trace therefore has no achieved
-power. No waveplate-to-power calibration or closed-loop target-power control is
-implemented, so target power, fluence, and intensity normally remain unset.
+power. A bounded closed-loop target-power controller is implemented for an
+operator-supplied monotonic waveplate branch. It measures the requested power
+with the retractable probe and stores requested and achieved values separately.
+No absolute fluence or intensity calibration is implemented, so those fields
+remain unset unless independently established.
 
 Power acquisition is still disabled by default because the physical PI-stage
 in/out positions have not yet been established. The current hardware manager

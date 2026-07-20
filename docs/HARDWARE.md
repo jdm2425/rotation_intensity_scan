@@ -154,10 +154,12 @@ reduction described above. Motion is a bounded absolute `MOV`, waits for
 Disconnect closes the GCS connection without disabling the motor or servo;
 that preserves the user-approved controller state.
 
-The required physical `in_position_mm` and `out_position_mm` are intentionally
-unset. Because the stage is marked installed, `HardwareManager` refuses all
-connections until both are measured and entered. Do not guess these values or
-use automatic reference motion to create them.
+The current configuration contains candidate positions
+`in_position_mm=+1.0` and `out_position_mm=-1.0`. They must be checked on the
+physical setup before automatic use. `HardwareManager` can reject missing or
+indistinguishable values, but it cannot detect a collision or determine whether
+the sensor is truly centred/clear. Do not use automatic reference motion to
+create these coordinates.
 
 ## Waveplate stage
 

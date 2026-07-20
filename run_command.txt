@@ -1,0 +1,11 @@
+python run_target_power_scan.py `
+    --sample-angles -30 -20 -10 0 10 20 30 `
+    --target-powers-mw 2 5 10 `
+    --waveplate-min-deg YOUR_SAFE_BRANCH_MIN `
+    --waveplate-max-deg YOUR_SAFE_BRANCH_MAX `
+    --direction increasing `
+    --tolerance-mw 0.2 `
+    --maximum-power-mw YOUR_REVIEWED_LIMIT `
+    --integration-time-ms 10 `
+    --averages 1 `
+    --experiment-name full_target_power_scan

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+import sys
+import types
 from unittest.mock import patch
+
+# Keep this workflow test hardware-free even when vendor libraries are absent.
+_hardware_manager_stub = types.ModuleType("hardware.hardware_manager")
+_hardware_manager_stub.HardwareManager = object
+sys.modules.setdefault("hardware.hardware_manager", _hardware_manager_stub)
 
 from data.data_loader import load_experiment
 from experiments.experiment_config import ExperimentConfig
@@ -19,12 +26,49 @@ from tests.test_experiment_workflow import (
 )
 
 
+class FakePowerProbeSession:
+    def __init__(self, probe):
+        self.probe = probe
+        self.active = False
+
+    def __enter__(self):
+        if self.active:
+            raise AssertionError("Fake power session entered twice.")
+        self.active = True
+        self.probe.session_count += 1
+        self.probe.insert_count += 1
+        self.probe.hardware.events.append(("power", "insert"))
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.probe.hardware.events.append(("power", "retract"))
+        self.probe.retract_count += 1
+        self.active = False
+        return False
+
+    def prepare_for_motion(self):
+        if not self.active:
+            raise AssertionError("Fake power session is inactive.")
+        self.probe.hardware.events.append(("power", "prepare_motion"))
+
+    def acquire_trace(self, *, duration_s, settle_time_s):
+        if not self.active:
+            raise AssertionError("Fake power session is inactive.")
+        return self.probe._acquire_trace(
+            duration_s=duration_s,
+            settle_time_s=settle_time_s,
+        )
+
+
 class FakePowerProbe:
     def __init__(self, hardware):
         self.hardware = hardware
         self.call_count = 0
+        self.session_count = 0
+        self.insert_count = 0
+        self.retract_count = 0
 
-    def acquire_trace(self, *, duration_s, settle_time_s):
+    def _acquire_trace(self, *, duration_s, settle_time_s):
         self.call_count += 1
         waveplate = self.hardware.waveplate.position
         self.hardware.events.append(
@@ -67,11 +111,33 @@ class FakePowerProbe:
             ),
         )
 
+    def acquire_trace(self, *, duration_s, settle_time_s):
+        # Existing waveplate-angle scans retain one-shot probe behaviour.
+        self.insert_count += 1
+        self.hardware.events.append(("power", "insert"))
+        try:
+            return self._acquire_trace(
+                duration_s=duration_s,
+                settle_time_s=settle_time_s,
+            )
+        finally:
+            self.retract_count += 1
+            self.hardware.events.append(("power", "retract"))
+
+    def measurement_session(self):
+        return FakePowerProbeSession(self)
+
     def safe_retract(self):
+        self.retract_count += 1
         self.hardware.events.append(("power", "retract"))
 
     def info(self):
-        return {"is_out": True}
+        return {
+            "is_out": True,
+            "session_count": self.session_count,
+            "insert_count": self.insert_count,
+            "retract_count": self.retract_count,
+        }
 
 
 class FakePowerHardwareManager:
@@ -216,6 +282,11 @@ def main() -> None:
             for event in hardware.events
             if event[0] in {"move", "power", "acquire"}
             and not (event[0] == "acquire" and event[1] == "closed")
+            and not (
+                event[0] == "power"
+                and len(event) > 1
+                and event[1] in {"insert", "retract", "prepare_motion"}
+            )
         ]
         assert significant_events[:5] == [
             ("move", "Waveplate", 0.0),

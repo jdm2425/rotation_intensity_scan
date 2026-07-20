@@ -63,6 +63,7 @@ class ExperimentMonitor:
         *,
         sample_angle: float,
         waveplate_angle: float,
+        target_power_mw: float | None = None,
     ):
 
         measurement = self.completed_measurements + 1
@@ -105,6 +106,11 @@ class ExperimentMonitor:
             f"Waveplate angle : {waveplate_angle:8.3f}°"
         )
 
+        if target_power_mw is not None:
+            print(
+                f"Target power    : {target_power_mw:8.3f} mW"
+            )
+
         print(
             f"Elapsed         : "
             f"{timedelta(seconds=int(elapsed))}"
@@ -136,6 +142,10 @@ class ExperimentMonitor:
             f"Pixels          : "
             f"{len(spectrum.intensities)}"
         )
+
+        target_power_mw = getattr(result, "target_power_mw", None)
+        if target_power_mw is not None:
+            print(f"Target power    : {target_power_mw:.6g} mW")
 
         power_status = getattr(result, "power_measurement_status", None)
         if power_status is not None:

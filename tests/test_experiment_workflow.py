@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+import sys
+import types
 from unittest.mock import patch
 
 import numpy as np
+
+# Keep this workflow test hardware-free even when vendor libraries are absent.
+_hardware_manager_stub = types.ModuleType("hardware.hardware_manager")
+_hardware_manager_stub.HardwareManager = object
+sys.modules.setdefault("hardware.hardware_manager", _hardware_manager_stub)
 
 from data.data_loader import load_experiment
 from experiments.experiment_config import (

@@ -77,10 +77,9 @@ class PIStageConfig:
     software safety envelope.  Every move also queries the controller's live
     ``TMN?`` and ``TMX?`` values and uses the intersection of both ranges.
 
-    ``configured_velocity_mm_s`` is an optional maximum startup velocity. The
-    driver lowers a faster live setting to this value, while retaining any
-    already-slower setting. Unattended startup therefore never makes the axis
-    faster.
+    ``configured_velocity_mm_s is the exact controller velocity applied and
+    verified whenever the stage connects. When it is None, the existing
+    controller velocity is preserved.
     """
 
     serial: str = DEFAULT_CONTROLLER_SERIAL
@@ -410,11 +409,29 @@ class PILinearStage(HardwareDevice):
         self._device = device
         self._snapshot = snapshot
         self._set_connected(True)
+
+        try:
+            applied_velocity = (
+                self.apply_configured_velocity()
+            )
+
+        except Exception:
+            try:
+                self.disconnect()
+            except Exception:
+                logger.exception(
+                    "Failed to disconnect PI controller after "
+                    "velocity configuration failed."
+                )
+
+            raise
+
         logger.info(
-            "%s connected: %s (axis %s).",
+            "%s connected: %s (axis %s), velocity %.6g mm/s.",
             self.name,
             identity,
             self.axis,
+            applied_velocity,
         )
 
     def disconnect(self) -> None:
@@ -512,63 +529,76 @@ class PILinearStage(HardwareDevice):
         )
 
     def apply_configured_velocity(self) -> float:
-        """Apply and verify the configured startup velocity conservatively.
+        """
+        Apply and verify the configured controller velocity.
 
-        A missing configured value leaves the controller unchanged and returns
-        its live velocity. A live setting already below the configured value is
-        retained. The method can therefore make startup motion slower, but
-        never faster.
+        When configured_velocity_mm_s is None, the controller's existing
+        velocity is left unchanged. Otherwise, the configured value is
+        written to the controller and verified by reading it back.
         """
 
         self.require_connection()
-        current = self._required_float_query("qVEL")
-        if current <= 0.0:
-            raise PIStageStateError(
-                f"PI axis {self.axis!r} reported a non-positive velocity "
-                f"({current} mm/s)."
-            )
 
         configured = self.config.configured_velocity_mm_s
+
         if configured is None:
+            current = self._required_float_query("qVEL")
+
+            if current <= 0.0:
+                raise PIStageStateError(
+                    f"PI axis {self.axis!r} reported a non-positive "
+                    f"velocity ({current} mm/s)."
+                )
+
             return current
 
         target = _finite_float(
             configured,
             field_name="configured_velocity_mm_s",
         )
+
         if target <= 0.0:
             raise PIStageStateError(
-                "Configured PI startup velocity must be positive."
+                "Configured PI velocity must be positive."
             )
 
-        tolerance = max(1e-9, abs(target) * 1e-6)
-        if target > current + tolerance:
-            logger.info(
-                "%s: retaining live velocity %.6g mm/s because it is below "
-                "the configured maximum %.6g mm/s.",
-                self.name,
-                current,
+        try:
+            self._command(
+                "VEL",
+                self.axis,
                 target,
             )
-            return current
 
-        if not math.isclose(current, target, rel_tol=1e-6, abs_tol=1e-9):
-            try:
-                self._command("VEL", self.axis, target)
-            except Exception as exc:
-                raise PIStageStateError(
-                    f"PI controller rejected startup velocity {target} mm/s "
-                    f"for axis {self.axis!r}."
-                ) from exc
-
-        observed = self._required_float_query("qVEL")
-        if not math.isclose(observed, target, rel_tol=1e-6, abs_tol=1e-9):
+        except Exception as exc:
             raise PIStageStateError(
-                f"PI axis {self.axis!r} did not retain the configured startup "
-                f"velocity: requested={target} mm/s, observed={observed} mm/s."
+                f"PI controller rejected configured velocity "
+                f"{target} mm/s for axis {self.axis!r}."
+            ) from exc
+
+        observed = self._required_float_query(
+            "qVEL"
+        )
+
+        if not math.isclose(
+            observed,
+            target,
+            rel_tol=1e-6,
+            abs_tol=1e-9,
+        ):
+            raise PIStageStateError(
+                f"PI axis {self.axis!r} did not retain the "
+                f"configured velocity: requested={target} mm/s, "
+                f"observed={observed} mm/s."
             )
 
         self.refresh_snapshot()
+
+        logger.info(
+            "%s velocity set to %.6g mm/s.",
+            self.name,
+            observed,
+        )
+
         return observed
 
     @property
