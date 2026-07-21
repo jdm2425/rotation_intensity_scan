@@ -59,8 +59,8 @@ class LinearStageConfig:
     application_max_mm: float = 12.0
     in_position_mm: float | None = None
     out_position_mm: float | None = None
-    velocity_mm_s: float | None = 1.0
-    position_tolerance_mm: float = 0.01
+    velocity_mm_s: float | None = 5.0
+    position_tolerance_mm: float = 0.1
     motion_timeout_s: float = 30.0
 
 

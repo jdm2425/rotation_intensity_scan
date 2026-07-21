@@ -5,10 +5,13 @@
 #   1 mW to 10 mW in 1 mW increments
 #
 # Sample rotation:
-#   0 degrees to 359 degrees in 1 degree increments
+#   0 degrees to 359 degrees in 5 degree increments
 # ============================================================
 
-$sampleAngles = 0..359
+# $sampleAngles = 0..359
+$sampleAngles = for ($angle = 0; $angle -le 359; $angle += 5) {
+    $angle
+}
 $targetPowers = 1..10
 
 # Replace these with your measured safe monotonic waveplate branch.
@@ -25,8 +28,8 @@ python run_target_power_scan.py `
     --waveplate-min-deg $waveplateMinimum `
     --waveplate-max-deg $waveplateMaximum `
     --direction increasing `
-    --tolerance-mw 0.2 `
+    --tolerance-mw 0.25 `
     --maximum-power-mw 30 `
-    --integration-time-ms 10 `
-    --averages 3 `
+    --integration-time-ms 100 `
+    --averages 10 `
     --experiment-name Rubrene-power-1-to-10mW-rotation-0-to-359deg
