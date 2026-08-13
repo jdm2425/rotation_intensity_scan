@@ -66,11 +66,13 @@ class HardwareManager:
         self.waveplate = RotationStage(
             serial=WAVEPLATE.serial,
             name=WAVEPLATE.name,
+            maximum_velocity_deg_s=WAVEPLATE.maximum_velocity_deg_s,
         )
 
         self.sample = RotationStage(
             serial=SAMPLE_STAGE.serial,
             name=SAMPLE_STAGE.name,
+            maximum_velocity_deg_s=SAMPLE_STAGE.maximum_velocity_deg_s,
         )
 
         self.shutter = BeamShutter(

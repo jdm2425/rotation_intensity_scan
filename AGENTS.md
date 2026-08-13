@@ -283,5 +283,7 @@ In particular:
 * Update `docs/HARDWARE.md` after a real hardware discovery.
 * Update `docs/ARCHITECTURE.md` after a structural change.
 * Update `docs/DEVELOPMENT_WORKFLOW.md` after test or command changes.
+* Update `docs/COMMAND_REFERENCE.md` whenever an operator-facing entry point,
+  command-line option, default, or safety behaviour changes.
 
 ````

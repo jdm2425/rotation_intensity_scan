@@ -35,7 +35,7 @@ from typing import Any
 
 
 DEFAULT_WAVELENGTH_OPTION = ">800"
-DEFAULT_RANGE_OPTION = "30.0mW"
+DEFAULT_RANGE_OPTION = "AUTO"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,8 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
     measure_parser.add_argument(
         "--settle-s",
         type=float,
-        default=1.0,
-        help="Wait after opening the shutter before each trace (default: 1).",
+        default=3.0,
+        help="Wait after opening the shutter before each trace (default: 3).",
+    )
+    measure_parser.add_argument(
+        "--initial-settle-s",
+        type=float,
+        default=5.0,
+        help=(
+            "Longer wait before the first trace after meter connection "
+            "(default: 5). Later traces use --settle-s."
+        ),
     )
     measure_parser.add_argument(
         "--poll-interval-s",
@@ -131,8 +140,20 @@ def build_parser() -> argparse.ArgumentParser:
     measure_parser.add_argument(
         "--maximum-power-mw",
         type=float,
-        default=20.0,
-        help="Abort after a trace whose raw positive maximum exceeds this value.",
+        default=None,
+        help=(
+            "Optional diagnostic warning threshold in mW. Measurements are "
+            "still saved and subsequent traces continue unless "
+            "--abort-above-maximum is also supplied."
+        ),
+    )
+    measure_parser.add_argument(
+        "--abort-above-maximum",
+        action="store_true",
+        help=(
+            "Abort after saving a trace above --maximum-power-mw. This is "
+            "off by default because this command is a diagnostic tool."
+        ),
     )
     measure_parser.add_argument(
         "--output-directory",
@@ -179,12 +200,11 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         for name in (
             "duration_s",
             "poll_interval_s",
-            "maximum_power_mw",
         ):
             value = float(getattr(arguments, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be positive.")
-        for name in ("settle_s", "between_trace_delay_s"):
+        for name in ("settle_s", "initial_settle_s", "between_trace_delay_s"):
             value = float(getattr(arguments, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(
@@ -192,6 +212,14 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
                 )
         if arguments.traces < 1:
             raise ValueError("--traces must be at least one.")
+        if arguments.maximum_power_mw is not None:
+            value = float(arguments.maximum_power_mw)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("--maximum-power-mw must be positive.")
+        if arguments.abort_above_maximum and arguments.maximum_power_mw is None:
+            raise ValueError(
+                "--abort-above-maximum requires --maximum-power-mw."
+            )
         for name in ("in_position_mm", "out_position_mm"):
             value = getattr(arguments, name)
             if value is not None and not math.isfinite(float(value)):
@@ -247,7 +275,17 @@ def print_action_summary(arguments: argparse.Namespace) -> None:
         print(f"Trace count         : {arguments.traces}")
         print(f"Trace duration      : {arguments.duration_s} s")
         print(f"Settle time         : {arguments.settle_s} s")
-        print(f"Maximum raw power   : {arguments.maximum_power_mw} mW")
+        print(f"Initial settle time : {arguments.initial_settle_s} s")
+        print(
+            "Diagnostic threshold: "
+            + (
+                "disabled"
+                if arguments.maximum_power_mw is None
+                else f"{arguments.maximum_power_mw} mW ("
+                + ("abort" if arguments.abort_above_maximum else "warn only")
+                + ")"
+            )
+        )
         print(f"Wavelength option   : {arguments.wavelength_option!r}")
         print(f"Range option        : {arguments.range_option!r}")
         print(
@@ -387,7 +425,11 @@ def run_measure(arguments: argparse.Namespace) -> None:
                 print(f"Acquiring trace {trace_index}/{arguments.traces}...")
                 trace = session.acquire_trace(
                     duration_s=arguments.duration_s,
-                    settle_time_s=arguments.settle_s,
+                    settle_time_s=(
+                        arguments.initial_settle_s
+                        if trace_index == 1
+                        else arguments.settle_s
+                    ),
                     poll_interval_s=arguments.poll_interval_s,
                 )
                 summary = save_trace(
@@ -399,11 +441,19 @@ def run_measure(arguments: argparse.Namespace) -> None:
                 summaries.append(summary)
                 print_trace_summary(summary)
                 maximum = summary["maximum_positive_raw_power_mw"]
-                if maximum is not None and maximum > arguments.maximum_power_mw:
-                    raise RuntimeError(
+                if (
+                    maximum is not None
+                    and arguments.maximum_power_mw is not None
+                    and maximum > arguments.maximum_power_mw
+                ):
+                    message = (
                         f"Raw measured power {maximum:.6g} mW exceeded the "
-                        f"configured {arguments.maximum_power_mw:.6g} mW limit."
+                        f"diagnostic threshold "
+                        f"{arguments.maximum_power_mw:.6g} mW."
                     )
+                    if arguments.abort_above_maximum:
+                        raise RuntimeError(message)
+                    print(f"WARNING: {message} Continuing diagnostic traces.")
                 if trace_index < arguments.traces and arguments.between_trace_delay_s:
                     time.sleep(arguments.between_trace_delay_s)
 
@@ -415,6 +465,10 @@ def run_measure(arguments: argparse.Namespace) -> None:
                 "in_position_mm": in_position,
                 "out_position_mm": out_position,
                 "trace_count": len(summaries),
+                "diagnostic_warning_threshold_mw": arguments.maximum_power_mw,
+                "abort_above_diagnostic_threshold": bool(
+                    arguments.abort_above_maximum
+                ),
                 "traces": summaries,
                 "ophir": meter.info(),
                 "pi_stage": stage.info(),

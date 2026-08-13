@@ -28,7 +28,14 @@ class FakeExperiment:
     def prepare_intensity(self, *, waveplate_angle: float) -> None:
         self.events.append(("prepare_intensity", waveplate_angle))
 
-    def measure(self, *, waveplate_angle: float, sample_angle: float) -> tuple:
+    def measure(
+        self,
+        *,
+        waveplate_angle: float,
+        sample_angle: float,
+        replicate_index: int = 1,
+        replicate_count: int = 1,
+    ) -> tuple:
         result = (waveplate_angle, sample_angle)
         self.events.append(("measure", *result))
         return result
@@ -58,6 +65,15 @@ def main() -> None:
         ("prepare_intensity", 0.0),
         ("prepare_intensity", 5.0),
     ]
+
+    repeated = list(
+        ScanRunner(experiment=FakeExperiment(), monitor=FakeMonitor()).run(
+            waveplate_angles=[2.0],
+            sample_angles=[3.0],
+            spectra_per_point=3,
+        )
+    )
+    assert repeated == [(2.0, 3.0)] * 3
     print("ROTATION SCAN ORDER TEST PASSED")
 
 

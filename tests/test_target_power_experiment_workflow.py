@@ -20,6 +20,7 @@ from experiments.power_targeting import (
     TargetPowerBracketError,
     TargetPowerController,
 )
+from experiments.waveplate_calibration import fit_malus_calibration
 from experiments.rotation_intensity_scan import RotationIntensityExperiment
 from tests.test_experiment_workflow import DummyPlotManager
 from tests.test_power_experiment_workflow import FakePowerHardwareManager
@@ -64,6 +65,29 @@ def test_feedback_controller() -> None:
     decreasing_result = decreasing.set_target(17.0)
     assert abs(decreasing_result.waveplate_angle_deg - 3.0) <= 0.01
     assert abs(decreasing_result.achieved_power_mw - 17.0) <= 0.01
+
+    calibration = fit_malus_calibration(
+        list(range(0, 11)),
+        [10.0 + angle for angle in range(0, 11)],
+        waveplate_min_deg=0.0,
+        waveplate_max_deg=10.0,
+        monotonic_direction="increasing",
+    )
+    calibrated_angles: list[float] = []
+    calibrated = TargetPowerController(
+        measure_power_at_angle=lambda angle: (
+            calibrated_angles.append(float(angle)) or 10.0 + float(angle)
+        ),
+        waveplate_min_deg=0.0,
+        waveplate_max_deg=10.0,
+        monotonic_direction="increasing",
+        tolerance_mw=0.05,
+        maximum_iterations=6,
+        calibration=calibration,
+    )
+    calibrated_result = calibrated.set_target(15.0)
+    assert abs(calibrated_result.achieved_power_mw - 15.0) <= 0.05
+    assert len(calibrated_angles) == 3
 
 
 def test_target_power_experiment() -> None:
@@ -130,11 +154,14 @@ def test_target_power_experiment() -> None:
             4.0,
             4.0,
         ]
-        assert [measurement.sample_angle_deg for measurement in dataset] == [
+        assert [
+            measurement.sample_angle_deg
+            for measurement in dataset
+        ] == [
             0.0,
             10.0,
-            0.0,
             10.0,
+            0.0,
         ]
         # Each target uses one persistent probe insertion.  The fresh
         # monotonic bracket requires two endpoint traces plus one converged

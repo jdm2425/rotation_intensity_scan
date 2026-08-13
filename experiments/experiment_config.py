@@ -32,7 +32,24 @@ class SpectrometerConfig:
 
     averages: int = 1
 
+    # Independent acquisitions saved at each waveplate/sample-angle point.
+    # This is deliberately separate from ``averages``, which is performed
+    # inside one spectrometer acquisition and therefore cannot estimate
+    # between-spectrum uncertainty.
+    spectra_per_point: int = 1
+
     boxcar_width: int = 0
+
+    def __post_init__(self) -> None:
+        self.validate_for_run()
+
+    def validate_for_run(self) -> None:
+        """Validate settings, including values assigned after construction."""
+
+        if self.averages < 1:
+            raise ValueError("Spectrometer averages must be at least one.")
+        if self.spectra_per_point < 1:
+            raise ValueError("Spectra per point must be at least one.")
 
 
 # =============================================================================
@@ -94,15 +111,15 @@ class PowerMeasurementConfig:
     measurement_mode: str = "Power"
 
     # Ophir option label, deliberately not a fragile numeric option index.
-    # 30.0mW covers the configured 20mW sample-safety ceiling; select 300mW
-    # explicitly for a separately reviewed higher-range diagnostic.
-    range_option: str | None = "30.0mW"
+    # AUTO permits reads across the verified meter ranges. The independent
+    # raw-power safety ceiling still controls experiment continuation.
+    range_option: str | None = "AUTO"
 
     # Proceeding after a failed/invalid incident-power read would expose the
     # sample at unknown power. It therefore requires an explicit opt-in.
     continue_without_power_on_meter_error: bool = False
 
-    maximum_allowed_power_mw: float | None = 20.0
+    maximum_allowed_power_mw: float | None = 50.0
 
     def __post_init__(self) -> None:
         allowed_cadences = {
@@ -187,6 +204,8 @@ class TargetPowerConfig:
 
     minimum_angle_step_deg: float = 0.02
 
+    calibration_path: Path | None = None
+
     def validate_for_run(
         self,
         *,
@@ -225,6 +244,13 @@ class TargetPowerConfig:
         ):
             raise ValueError(
                 "Target-power minimum_angle_step_deg must be positive."
+            )
+        if self.calibration_path is not None and not Path(
+            self.calibration_path
+        ).is_file():
+            raise ValueError(
+                f"Target-power calibration file does not exist: "
+                f"{self.calibration_path}"
             )
         targets = [float(value) for value in target_powers_mw]
         if not targets:

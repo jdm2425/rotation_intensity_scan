@@ -718,6 +718,7 @@ def render_analysis_summary(
     for figure in figures:
         fixed_unit = figure.get("fixed_unit", "")
         unit_suffix = f" {fixed_unit}" if fixed_unit else ""
+        pdf_file = figure.get("pdf_file") or ""
         fixed_selection = (
             f"{figure.get('fixed_field', '')}="
             f"{figure.get('fixed_value', '')}{unit_suffix}"
@@ -732,7 +733,7 @@ def render_analysis_summary(
             f"{matched_range} | "
             f"{figure.get('row_count', '')} | "
             f"`{figure.get('png_file', '')}` | "
-            f"`{figure.get('pdf_file', '')}` | "
+            f"`{pdf_file}` | "
             f"`{figure.get('data_file', '')}` |"
         )
 

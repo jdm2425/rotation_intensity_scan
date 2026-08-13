@@ -123,12 +123,94 @@ Acquire three traces while keeping the probe inserted, then retract once:
 python -m tools.test_power_probe_hardware measure `
     --traces 3 `
     --duration-s 3 `
-    --settle-s 1
+    --settle-s 3 `
+    --initial-settle-s 5
 ```
+
+This standalone diagnostic uses the Ophir `AUTO` range by default and has no
+power abort threshold by default, so all requested traces are saved. To print
+a warning above 20 mW while continuing:
+
+```powershell
+python -m tools.test_power_probe_hardware measure `
+    --traces 3 `
+    --maximum-power-mw 20
+```
+
+Add `--abort-above-maximum` only when an aborting diagnostic threshold is
+deliberately wanted. This diagnostic behavior does not weaken experiment
+safety: experiment and target-power scans still abort before a spectrum when
+any positive raw sample exceeds their `--maximum-power-mw` ceiling.
 
 The tool prints its exact actions and requires `RUN` before connecting.
 Standalone trace CSV and JSON files are saved under
 `results/power_probe_hardware_tests/`.
+
+The longer initial settling period is deliberate: it separates first-exposure
+and first-stream startup from the normal per-trace settling period. All traces
+are still saved; no low or otherwise inconvenient reading is discarded.
+
+## Waveplate power-control commissioning
+
+Map power over an operator-reviewed angular interval and print the largest
+contiguous monotonic optical branch:
+
+```powershell
+python -m tools.waveplate_power_control scan `
+    --scan-start-deg 60 `
+    --scan-stop-deg 85 `
+    --step-deg 1
+```
+
+This identifies optical control limits for `waveplate_min_deg`,
+`waveplate_max_deg`, and `monotonic_direction`. It does not discover mechanical
+stage end stops and will not move outside the supplied interval. The waveplate
+returns to its starting angle after a successful mapping scan. The output
+directory contains `waveplate_power_map.png`, with the selected monotonic
+branch shaded and its minimum/maximum waveplate angles marked. If the scan
+contains multiple local minima and maxima, the tool evaluates the intervening
+contiguous branches and recommends the one with the largest measured power
+span (using point count as the tie-breaker).
+
+After reviewing that saved mapping, set power inside a requested range:
+
+```powershell
+python -m tools.waveplate_power_control set-range `
+    --minimum-power-mw 4.8 `
+    --maximum-power-mw 5.2 `
+    --waveplate-min-deg 66 `
+    --waveplate-max-deg 83 `
+    --direction increasing
+```
+
+Both commands close and verify the shutter before every waveplate or probe
+move, enforce the raw-sample power ceiling, save every feedback trace, retract
+the probe, and finish with the shutter closed.
+
+Power-meter range and power safety ceiling are separate. The standalone
+diagnostic, waveplate-control tool, and experiment configuration default to
+the verified Ophir `AUTO` range. Target-power experiments still reject targets
+above `--maximum-power-mw` and abort before spectra if any positive raw sample
+exceeds it; this catches overshoot and drift rather than trusting only the
+requested target.
+
+Each successful mapping scan now also saves `malus_calibration.json`. The fit
+uses the half-wave-plate form `c0 + c1*cos(4*angle) + c2*sin(4*angle)` on the
+recommended monotonic branch. To use it for a target-power scan:
+
+```powershell
+python run_target_power_scan.py `
+    ... `
+    --power-calibration `
+    results\waveplate_power_control\scan_20260729_160756\malus_calibration.json
+```
+
+The calibration supplies only the first candidate angle. At the start of each
+target block, the controller still measures both reviewed branch endpoints.
+The higher-power endpoint provides a fresh vertical-offset correction, similar
+to translating the empirical calibration curve in Morse et al. (2023), before
+the calibrated angle is calculated. Measured feedback and configured bounds
+remain authoritative.
 
 ## Environment
 
@@ -232,6 +314,14 @@ integration-time changes, axis controls, and persistent background capture.
 
 ## Offline analysis
 
+Independent repeat spectra can be collected at every sample/intensity point by
+setting `config.spectrometer.spectra_per_point` (or using
+`--spectra-per-point` with the target-power command). Every spectrum is saved
+as a separate measurement. Harmonic plots group repeats at the same coordinate
+and show their arithmetic mean with standard-error-of-the-mean (SEM) error
+bars; the underlying per-spectrum harmonic rows remain in
+`harmonic_signals.csv` and the per-figure CSV.
+
 ```powershell
 python -m tools.analyse_experiment `
     results\ExperimentName_YYYYMMDD_HHMMSS `
@@ -242,10 +332,23 @@ python -m tools.analyse_experiment `
 ```
 
 Analysis is separate from acquisition and does not overwrite raw detector data.
+When `--input-coordinate` is omitted, analysis now uses achieved `power_mw`
+automatically if it is present for every result; otherwise it retains
+waveplate-angle plots. Power-selected rotation figure filenames contain the
+recorded achieved power, and their titles report achieved power ± the recorded
+population standard deviation. Use
+`--input-coordinate waveplate_angle_deg` to request the older angle-based
+naming and selection explicitly.
+
+Figures are saved as PNG plus their exact CSV data by default. Add `--save-pdf`
+to also create PDF copies. Displayed power values and power-based filenames use
+one decimal place by default; change this with, for example,
+`--power-decimal-places 2`. CSV and JSON values always retain full precision.
 
 ## Repository guide
 
 - `AGENTS.md`: coding-agent and hardware-safety instructions.
+- `docs/COMMAND_REFERENCE.md`: central operator command and option reference.
 - `docs/PROJECT_CONTEXT.md`: scientific purpose and scope.
 - `docs/ARCHITECTURE.md`: data flow and interfaces.
 - `docs/HARDWARE.md`: verified device identities and hardware notes.

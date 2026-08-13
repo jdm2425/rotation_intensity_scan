@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 import numpy as np
 
 from analysis.data_products import (
@@ -23,11 +24,14 @@ def plot_figure_data(
     connect_points: bool = True,
     annotation: str | None = None,
     axes=None,
+    power_decimal_places: int = 1,
 ):
     """Render exactly the points stored in ``data``.
 
-    The function does not aggregate replicates, discard saturated values, or
-    modify negative corrected signals.  For a polar rotation plot it converts
+    Replicates at the same plotted coordinate are shown as their arithmetic
+    mean with a standard-error-of-the-mean error bar. A single acquisition has
+    a zero error bar. The raw replicate rows remain in ``FigureData`` and its
+    CSV export. For a polar rotation plot it converts
     the saved sample angles from degrees to radians only at render time.
     """
 
@@ -44,24 +48,48 @@ def plot_figure_data(
 
     for series_id in data.series_ids:
         records = data.records_for_series(series_id)
-        x = np.asarray([record.plot_x_value for record in records], dtype=float)
+        grouped: dict[float, list[float]] = {}
+        for record in records:
+            grouped.setdefault(float(record.plot_x_value), []).append(
+                float(record.plot_y_value)
+            )
+        x = np.asarray(sorted(grouped), dtype=float)
+        groups = [np.asarray(grouped[value], dtype=float) for value in x]
+        y = np.asarray([float(np.mean(values)) for values in groups])
+        y_error = np.asarray([
+            float(np.std(values, ddof=1) / np.sqrt(values.size))
+            if values.size > 1 else 0.0
+            for values in groups
+        ])
         if polar:
             x = np.deg2rad(x)
-        y = np.asarray([record.plot_y_value for record in records], dtype=float)
-        axes.plot(
+        axes.errorbar(
             x,
             y,
+            yerr=y_error,
             marker="o",
             linestyle="-" if connect_points else "None",
             label=records[0].series_label,
         )
 
+    if not 0 <= int(power_decimal_places) <= 9:
+        raise ValueError("power_decimal_places must be between 0 and 9.")
+    power_format = f".{int(power_decimal_places)}f"
     fixed_label, fixed_unit = _coordinate_label(data.fixed_field)
     title_value = f"{data.fixed_value:g}"
+    if data.fixed_field == "power_mw":
+        power_value, power_std = _recorded_power_summary(data)
+        title_value = format(power_value, power_format)
+        if power_std is not None:
+            title_value = f"{title_value} ± {format(power_std, power_format)}"
     if fixed_unit:
         title_value = f"{title_value} {fixed_unit}"
     if data.fixed_tolerance >= 1e-3:
-        tolerance = f"{data.fixed_tolerance:g}"
+        tolerance = (
+            format(data.fixed_tolerance, power_format)
+            if data.fixed_field == "power_mw"
+            else f"{data.fixed_tolerance:g}"
+        )
         if fixed_unit:
             tolerance = f"{tolerance} {fixed_unit}"
         title_value = f"{title_value} (tolerance ± {tolerance})"
@@ -71,6 +99,10 @@ def plot_figure_data(
         axes.set_xlabel(_label_with_unit(data.x_label, data.x_unit))
         axes.set_ylabel(_label_with_unit(data.y_label, data.y_unit))
         axes.grid(True, alpha=0.3)
+        if data.x_field == "power_mw":
+            axes.xaxis.set_major_formatter(
+                FormatStrFormatter(f"%.{int(power_decimal_places)}f")
+            )
     if annotation:
         axes.figure.text(
             0.5,
@@ -221,3 +253,35 @@ def _coordinate_label(field: str) -> tuple[str, str]:
         "intensity_w_cm2": ("Input intensity", "W/cm^2"),
     }
     return labels.get(field, (field, ""))
+
+
+def _recorded_power_summary(data: FigureData) -> tuple[float, float | None]:
+    """Summarise unique recorded traces without duplicating harmonics/angles."""
+
+    traces: dict[object, tuple[float, float | None]] = {}
+    for record in data.records:
+        result = record.result
+        if result.power_mw is None or not np.isfinite(result.power_mw):
+            continue
+        key = (
+            result.power_measurement_id
+            if result.power_measurement_id is not None
+            else result.measurement_number
+        )
+        standard_deviation = (
+            float(result.power_std_mw)
+            if result.power_std_mw is not None
+            and np.isfinite(result.power_std_mw)
+            else None
+        )
+        traces[key] = (float(result.power_mw), standard_deviation)
+    if not traces:
+        return float(data.fixed_value), None
+    powers = [value[0] for value in traces.values()]
+    deviations = [
+        value[1] for value in traces.values() if value[1] is not None
+    ]
+    return (
+        float(np.mean(powers)),
+        float(np.mean(deviations)) if deviations else None,
+    )

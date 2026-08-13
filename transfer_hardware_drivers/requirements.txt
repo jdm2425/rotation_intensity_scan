@@ -1,0 +1,2 @@
+pylablib==1.4.5
+PIPython==2.11.0.6

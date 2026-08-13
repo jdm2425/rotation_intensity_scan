@@ -203,9 +203,9 @@ def assert_manifest_outputs(
         assert "Transmission: fraction 0.5" in entry["correction_annotation"]
 
         resolved_files: dict[str, Path] = {}
+        assert entry["pdf_file"] is None
         for key, suffix in (
             ("png_file", ".png"),
-            ("pdf_file", ".pdf"),
             ("data_file", ".csv"),
         ):
             relative_path = Path(entry[key])
@@ -370,6 +370,8 @@ def main() -> None:
         assert len(recipe["harmonics"]) == 2
         assert recipe["warnings"] == []
         assert recipe["annotate_corrections"] is True
+        assert recipe["save_pdf"] is False
+        assert recipe["power_decimal_places"] == 1
         assert recipe["input_tolerance"] == 1e-6
         assert all(recipe["software"].get(name) for name in (
             "python",
@@ -440,7 +442,7 @@ def main() -> None:
         assert "Background subtraction : USED - pre_scan_dark" in console_output
         assert "Transmission correction: USED - scalar fraction 0.5" in console_output
         assert "Fixed-value tolerance" in console_output
-        assert "1e-06 deg" in console_output
+        assert "1e-06 mW" in console_output
         assert "Warnings: none" in console_output
         assert "Figure bundles:    6 (PNG/PDF/CSV)" in console_output
 
@@ -451,17 +453,18 @@ def main() -> None:
             manifest,
         )
 
-        decimal_entries = [
+        power_entries = [
             entry
             for entry in manifest
-            if entry["fixed_field"] == "waveplate_angle_deg"
-            and np.isclose(entry["fixed_value"], 7.5)
+            if entry["fixed_field"] == "power_mw"
+            and np.isclose(entry["fixed_value"], 2.0)
         ]
-        assert len(decimal_entries) == 2
-        for entry in decimal_entries:
-            assert "_7.5." in entry["png_file"]
-            assert "_7.5." in entry["pdf_file"]
-            assert "_7.5." in entry["data_file"]
+        assert len(power_entries) == 2
+        for entry in power_entries:
+            assert "rotation_" in entry["png_file"]
+            assert "power_mw_2.0." in entry["png_file"]
+            assert entry["pdf_file"] is None
+            assert "power_mw_2.0." in entry["data_file"]
 
         explicit_directory = temporary_root / "analysis-explicit-none"
         explicit, explicit_rows, explicit_summary, explicit_console = (

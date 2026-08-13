@@ -48,6 +48,7 @@ def make_result(
         sample_angle_deg=sample_angle_deg,
         waveplate_angle_deg=7.5,
         power_mw=power_mw,
+        power_std_mw=0.03,
         target_power_mw=target_power_mw,
         integrated_signal=integrated_signal,
         raw_integrated_signal=integrated_signal + 10.0,
@@ -264,8 +265,9 @@ def test_raw_annotation_and_fixed_tolerance_plot() -> None:
     assert all(record.result.power_mw == 2.04 for record in data.records)
 
     figure, axes = plot_figure_data(data, annotation=raw_annotation)
+    assert "2.0 ± 0.0 mW" in axes.get_title()
     assert "tolerance" in axes.get_title()
-    assert "0.05 mW" in axes.get_title()
+    assert "0.1 mW" in axes.get_title()
     assert len(figure.texts) == 1
     assert figure.texts[0].get_text() == raw_annotation
     plt.close(figure)
@@ -288,7 +290,7 @@ def test_raw_annotation_and_fixed_tolerance_plot() -> None:
         raise AssertionError("An out-of-tolerance power point was selected.")
 
 
-def test_automatic_power_centres_use_complete_targets() -> None:
+def test_automatic_power_centres_use_recorded_achieved_values() -> None:
     complete = (
         make_result(
             1,
@@ -304,8 +306,8 @@ def test_automatic_power_centres_use_complete_targets() -> None:
         ),
     )
     values, source = _automatic_input_values(complete, "power_mw")
-    assert values == [10.0]
-    assert source == "target_power_mw"
+    assert values == [9.7, 10.3]
+    assert source == "power_mw"
 
     partial = (
         complete[0],
@@ -399,7 +401,7 @@ def test_attempts_without_spectra_are_included_in_reporting() -> None:
 def main() -> None:
     test_warning_modes_and_reporting_text()
     test_raw_annotation_and_fixed_tolerance_plot()
-    test_automatic_power_centres_use_complete_targets()
+    test_automatic_power_centres_use_recorded_achieved_values()
     test_power_attempt_warnings_are_grouped_by_attempt()
     test_attempts_without_spectra_are_included_in_reporting()
     print("ANALYSIS REPORTING TEST PASSED")

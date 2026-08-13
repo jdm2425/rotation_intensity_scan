@@ -28,8 +28,13 @@ class ScanRunner:
         sample_angles,
         waveplate_angles=None,
         target_powers_mw=None,
+        spectra_per_point=1,
     ):
         """Execute an angle-controlled or target-power-controlled scan."""
+
+        spectra_per_point = int(spectra_per_point)
+        if spectra_per_point < 1:
+            raise ValueError("spectra_per_point must be at least one.")
 
         angle_mode = waveplate_angles is not None
         power_mode = target_powers_mw is not None
@@ -42,21 +47,53 @@ class ScanRunner:
             self.experiment.scan_started()
 
         if power_mode:
-            for target_power_mw in target_powers_mw:
-                waveplate_angle = self.experiment.prepare_target_power(
-                    target_power_mw=target_power_mw,
+            sample_angles = tuple(
+                float(angle)
+                for angle in sample_angles
+            )
+
+            for power_index, target_power_mw in enumerate(
+                target_powers_mw
+            ):
+                waveplate_angle = (
+                    self.experiment.prepare_target_power(
+                        target_power_mw=target_power_mw,
+                    )
                 )
-                for sample_angle in sample_angles:
-                    self.monitor.measurement_started(
-                        sample_angle=sample_angle,
-                        waveplate_angle=waveplate_angle,
-                        target_power_mw=target_power_mw,
-                    )
-                    yield self.experiment.measure(
-                        waveplate_angle=waveplate_angle,
-                        sample_angle=sample_angle,
-                        target_power_mw=target_power_mw,
-                    )
+
+                if power_index % 2 == 0:
+                    block_sample_angles = sample_angles
+                    scan_direction = "forward"
+                else:
+                    block_sample_angles = sample_angles[::-1]
+                    scan_direction = "reverse"
+
+                logger.info(
+                    "Sample-angle scan for target %.6g mW: %s.",
+                    target_power_mw,
+                    scan_direction,
+                )
+
+                for sample_angle in block_sample_angles:
+                    for replicate_index in range(1, spectra_per_point + 1):
+                        self.monitor.measurement_started(
+                            sample_angle=sample_angle,
+                            waveplate_angle=waveplate_angle,
+                            target_power_mw=target_power_mw,
+                        )
+
+                        arguments = {
+                            "waveplate_angle": waveplate_angle,
+                            "sample_angle": sample_angle,
+                            "target_power_mw": target_power_mw,
+                        }
+                        if spectra_per_point > 1:
+                            arguments.update(
+                                replicate_index=replicate_index,
+                                replicate_count=spectra_per_point,
+                            )
+                        yield self.experiment.measure(**arguments)
+
             return
 
         # Angle-major ordering is intentional.  The waveplate is set once,
@@ -68,14 +105,21 @@ class ScanRunner:
                     waveplate_angle=waveplate_angle,
                 )
             for sample_angle in sample_angles:
-                self.monitor.measurement_started(
-                    sample_angle=sample_angle,
-                    waveplate_angle=waveplate_angle,
-                )
-                yield self.experiment.measure(
-                    waveplate_angle=waveplate_angle,
-                    sample_angle=sample_angle,
-                )
+                for replicate_index in range(1, spectra_per_point + 1):
+                    self.monitor.measurement_started(
+                        sample_angle=sample_angle,
+                        waveplate_angle=waveplate_angle,
+                    )
+                    arguments = {
+                        "waveplate_angle": waveplate_angle,
+                        "sample_angle": sample_angle,
+                    }
+                    if spectra_per_point > 1:
+                        arguments.update(
+                            replicate_index=replicate_index,
+                            replicate_count=spectra_per_point,
+                        )
+                    yield self.experiment.measure(**arguments)
 
     def single(
         self,

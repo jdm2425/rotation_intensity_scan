@@ -12,17 +12,13 @@ All PRM1-Z8 rotation stages in the project should use this class.
 from __future__ import annotations
 
 import logging
-import math
 import time
 
-from pylablib.devices import Thorlabs
+from .base import HardwareError
+from .rotation_base import BaseRotationStage
 
-from hardware.devices.base import HardwareError
-from hardware.devices.rotation.base import BaseRotationStage
-from hardware.config import (
-    DEFAULT_POLL_INTERVAL,
-    DEFAULT_TIMEOUT,
-)
+DEFAULT_TIMEOUT = 30.0
+DEFAULT_POLL_INTERVAL = 0.05
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +36,6 @@ class RotationStage(BaseRotationStage):
         scale: str = "PRM1-Z8",
         timeout: float = DEFAULT_TIMEOUT,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
-        maximum_velocity_deg_s: float | None = None,
     ):
 
         super().__init__(
@@ -51,21 +46,6 @@ class RotationStage(BaseRotationStage):
         self.scale = scale
         self.timeout = timeout
         self.poll_interval = poll_interval
-        self.maximum_velocity_deg_s = (
-            None
-            if maximum_velocity_deg_s is None
-            else float(maximum_velocity_deg_s)
-        )
-        if (
-            self.maximum_velocity_deg_s is not None
-            and (
-                not math.isfinite(self.maximum_velocity_deg_s)
-                or not 0 < self.maximum_velocity_deg_s <= 25.0
-            )
-        ):
-            raise ValueError(
-                "maximum_velocity_deg_s must be within (0, 25] for PRM1-Z8."
-            )
 
         self._device = None
 
@@ -85,6 +65,7 @@ class RotationStage(BaseRotationStage):
         )
 
         try:
+            from pylablib.devices import Thorlabs
 
             self._device = Thorlabs.KinesisMotor(
                 self.serial,
@@ -98,27 +79,6 @@ class RotationStage(BaseRotationStage):
             ) from exc
 
         self._set_connected(True)
-
-        if self.maximum_velocity_deg_s is not None:
-            try:
-                parameters = self._device.setup_velocity(
-                    max_velocity=self.maximum_velocity_deg_s,
-                )
-                observed = float(parameters.max_velocity)
-                if not math.isclose(
-                    observed,
-                    self.maximum_velocity_deg_s,
-                    rel_tol=1e-6,
-                    abs_tol=1e-6,
-                ):
-                    raise HardwareError(
-                        f"{self.name} velocity readback {observed:.6g} deg/s "
-                        f"does not match requested "
-                        f"{self.maximum_velocity_deg_s:.6g} deg/s."
-                    )
-            except Exception:
-                self.disconnect()
-                raise
 
         logger.info(
             "%s connected.",
@@ -167,7 +127,7 @@ class RotationStage(BaseRotationStage):
         self.require_connection()
 
         logger.info(
-            "%s -> %.4f°",
+            "%s -> %.4fÂ°",
             self.name,
             angle_deg,
         )
@@ -184,7 +144,7 @@ class RotationStage(BaseRotationStage):
         self.require_connection()
 
         logger.info(
-            "%s %+0.4f°",
+            "%s %+0.4fÂ°",
             self.name,
             angle_deg,
         )
@@ -252,7 +212,7 @@ class RotationStage(BaseRotationStage):
             return (
                 f"<RotationStage "
                 f"serial='{self.serial}' "
-                f"position={self.position:.4f}°>"
+                f"position={self.position:.4f}Â°>"
             )
 
         return (

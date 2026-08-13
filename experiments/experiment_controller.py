@@ -61,6 +61,7 @@ class ExperimentController:
                 "Supply exactly one of waveplate_angles or target_powers_mw."
             )
 
+        self.config.spectrometer.validate_for_run()
         self.config.power_meter.validate_for_run()
         if target_power_mode:
             self.config.target_power.validate_for_run(
@@ -74,6 +75,7 @@ class ExperimentController:
         total_measurements = (
             len(intensity_values)
             * len(sample_angles)
+            * self.config.spectrometer.spectra_per_point
         )
 
         power_enabled = bool(
@@ -188,6 +190,9 @@ class ExperimentController:
                         waveplate_angles=waveplate_angles,
                         target_powers_mw=target_powers_mw,
                         sample_angles=sample_angles,
+                        spectra_per_point=(
+                            self.config.spectrometer.spectra_per_point
+                        ),
                     ):
 
                         #

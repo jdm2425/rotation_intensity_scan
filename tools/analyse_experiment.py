@@ -140,10 +140,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--input-coordinate",
         choices=EXCITATION_FIELDS,
-        default="waveplate_angle_deg",
+        default=None,
         help=(
             "Excitation coordinate for input scans and fixed-value rotation "
-            "selection. Missing calibrated values are never inferred."
+            "selection. By default, achieved power is used when every row has "
+            "recorded power; otherwise waveplate angle is used."
         ),
     )
     parser.add_argument(
@@ -188,6 +189,21 @@ def parse_arguments() -> argparse.Namespace:
         help="Also create polar versions of requested rotation plots.",
     )
     parser.add_argument(
+        "--save-pdf",
+        action="store_true",
+        help="Also save PDF copies of figures (disabled by default).",
+    )
+    parser.add_argument(
+        "--power-decimal-places",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Decimal places for displayed power values and power-based "
+            "filenames (default: 1). Full precision remains in CSV/JSON."
+        ),
+    )
+    parser.add_argument(
         "--plot-all",
         action="store_true",
         help=(
@@ -227,6 +243,8 @@ def main() -> None:
         or arguments.input_tolerance < 0
     ):
         raise ValueError("--input-tolerance must be finite and non-negative.")
+    if not 0 <= arguments.power_decimal_places <= 9:
+        raise ValueError("--power-decimal-places must be between 0 and 9.")
     dataset = load_experiment(arguments.experiment_directory)
 
     available_backgrounds = [
@@ -266,6 +284,12 @@ def main() -> None:
             arguments.minimum_transmission_fraction
         ),
     )
+    if arguments.input_coordinate is None:
+        arguments.input_coordinate = (
+            "power_mw"
+            if results and all(result.power_mw is not None for result in results)
+            else "waveplate_angle_deg"
+        )
 
     if (
         arguments.waveplate_angle
@@ -358,6 +382,8 @@ def main() -> None:
             transmission_record,
         ),
         "normalise_plots": arguments.normalise,
+        "save_pdf": arguments.save_pdf,
+        "power_decimal_places": arguments.power_decimal_places,
         "annotate_corrections": arguments.annotate_corrections,
         "plot_signal": arguments.signal,
         "input_coordinate": arguments.input_coordinate,
@@ -424,6 +450,7 @@ def main() -> None:
         figure, _ = plot_figure_data(
             figure_data,
             annotation=figure_annotation,
+            power_decimal_places=arguments.power_decimal_places,
         )
         figure_manifest.append(_save_figure(
             figure,
@@ -432,8 +459,10 @@ def main() -> None:
             plot_type="excitation_cartesian",
             analysis_directory=output_directory,
             annotation=figure_annotation,
+            save_pdf=arguments.save_pdf,
         ))
 
+    used_rotation_filename_values: dict[str, float] = {}
     for input_value in sorted(input_values):
         figures_directory.mkdir(exist_ok=True)
         figure_data = rotation_scan_data(
@@ -447,14 +476,39 @@ def main() -> None:
         figure, _ = plot_figure_data(
             figure_data,
             annotation=figure_annotation,
+            power_decimal_places=arguments.power_decimal_places,
         )
+        filename_value = _rotation_filename_value(figure_data)
+        filename_text = _coordinate_filename_value(
+            filename_value,
+            field=arguments.input_coordinate,
+            power_decimal_places=arguments.power_decimal_places,
+        )
+        previous_value = used_rotation_filename_values.get(filename_text)
+        if (
+            arguments.input_coordinate == "power_mw"
+            and previous_value is not None
+            and not math.isclose(
+            previous_value,
+            filename_value,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"Power values {previous_value:g} and {filename_value:g} mW "
+                f"both format as {filename_text} mW. Increase "
+                "--power-decimal-places to prevent filename collisions."
+            )
+        used_rotation_filename_values[filename_text] = filename_value
         figure_manifest.append(_save_figure(
             figure,
-            figures_directory / f"rotation_{coordinate_slug}_{input_value:g}",
+            figures_directory / f"rotation_{coordinate_slug}_{filename_text}",
             figure_data,
             plot_type="rotation_cartesian",
             analysis_directory=output_directory,
             annotation=figure_annotation,
+            save_pdf=arguments.save_pdf,
         ))
 
         if arguments.polar:
@@ -462,15 +516,17 @@ def main() -> None:
                 figure_data,
                 polar=True,
                 annotation=figure_annotation,
+                power_decimal_places=arguments.power_decimal_places,
             )
             figure_manifest.append(_save_figure(
                 figure,
                 figures_directory
-                / f"rotation_polar_{coordinate_slug}_{input_value:g}",
+                / f"rotation_polar_{coordinate_slug}_{filename_text}",
                 figure_data,
                 plot_type="rotation_polar",
                 analysis_directory=output_directory,
                 annotation=figure_annotation,
+                save_pdf=arguments.save_pdf,
             ))
 
     recipe["figures"] = figure_manifest
@@ -504,6 +560,7 @@ def _save_figure(
     plot_type: str,
     analysis_directory: Path,
     annotation: str | None,
+    save_pdf: bool,
 ) -> dict:
     png_path = _append_extension(base_path, ".png")
     pdf_path = _append_extension(base_path, ".pdf")
@@ -513,13 +570,18 @@ def _save_figure(
     else:
         figure.tight_layout()
     figure.savefig(png_path, dpi=300)
-    figure.savefig(pdf_path)
+    if save_pdf:
+        figure.savefig(pdf_path)
     save_figure_data_csv(data, csv_path)
     plt.close(figure)
     return {
         "plot_type": plot_type,
         "png_file": png_path.relative_to(analysis_directory).as_posix(),
-        "pdf_file": pdf_path.relative_to(analysis_directory).as_posix(),
+        "pdf_file": (
+            pdf_path.relative_to(analysis_directory).as_posix()
+            if save_pdf
+            else None
+        ),
         "data_file": csv_path.relative_to(analysis_directory).as_posix(),
         "x_field": data.x_field,
         "x_label": data.x_label,
@@ -558,15 +620,34 @@ def _automatic_input_values(
     results: list[HarmonicResult],
     field: str,
 ) -> tuple[list[float], str]:
-    if field == "power_mw":
-        target_values = [
-            result.target_power_mw
-            for result in results
-            if result.target_power_mw is not None
-        ]
-        if target_values and len(target_values) == len(results):
-            return sorted(set(target_values)), "target_power_mw"
     return coordinate_values(results, field), field
+
+
+def _rotation_filename_value(data: FigureData) -> float:
+    """Use recorded achieved power in power-selected rotation filenames."""
+
+    if data.fixed_field != "power_mw":
+        return float(data.fixed_value)
+    values = {
+        float(record.result.power_mw)
+        for record in data.records
+        if record.result.power_mw is not None
+        and math.isfinite(record.result.power_mw)
+    }
+    if not values:
+        return float(data.fixed_value)
+    return float(np.mean(sorted(values)))
+
+
+def _coordinate_filename_value(
+    value: float,
+    *,
+    field: str,
+    power_decimal_places: int,
+) -> str:
+    if field == "power_mw":
+        return f"{value:.{power_decimal_places}f}"
+    return f"{value:g}"
 
 
 def _background_recipe(

@@ -63,11 +63,11 @@ An approved live connection verified:
 
 The experiment records the physical fundamental wavelength separately as
 2000 nm while selecting the sensor's coarse returned option `>800`. The default
-fixed range is `30.0mW`, which covers the configured 20 mW sample-safety
-ceiling. Reverify the returned option names if the sensor is changed; the
+range is `AUTO`; the independent raw-power safety ceiling controls whether an
+experiment may continue. Reverify the returned option names if the sensor is changed; the
 driver selects by returned name and verifies readback rather than hardcoding a
 fragile list index. A different fixed range can be selected explicitly in the
-experiment config, but no range is inferred from a requested power setpoint.
+experiment config, but no safety limit is inferred from a requested power setpoint.
 
 The stated operating context is a 1 kHz source, approximately 5 mm beam at the
 sensor, and anticipated meter readings within roughly 0--50 mW. The current

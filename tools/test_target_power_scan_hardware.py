@@ -32,7 +32,7 @@ import numpy as np
 
 
 DEFAULT_WAVELENGTH_OPTION = ">800"
-DEFAULT_RANGE_OPTION = "30.0mW"
+DEFAULT_RANGE_OPTION = "AUTO"
 
 
 @dataclass(frozen=True, slots=True)

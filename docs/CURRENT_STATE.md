@@ -3,6 +3,15 @@
 ```markdown
 # Current State
 
+Independent spectral replicates are supported through
+`SpectrometerConfig.spectra_per_point` (default `1`). Each replicate is saved
+immediately as its own `Measurement`, with its one-based index and requested
+count in `measurement.metadata["replicate"]`. Offline harmonic plots retain the
+raw result rows and display the arithmetic mean at each coordinate with SEM
+error bars (sample standard deviation divided by the square root of the number
+of spectra). This path has been verified only with hardware-free tests; no live
+spectrometer or scan was run for this change.
+
 Last reviewed: 19 July 2026
 
 Update this file whenever a feature is verified, abandoned, or materially redesigned.
@@ -269,9 +278,17 @@ Fixed-value rotation selection records an absolute tolerance. When
 `power_mw` is selected, matching uses achieved mean power, not target power.
 The tolerance is present in every figure CSV and manifest record; the manifest
 and summary also show the minimum and maximum achieved values that matched.
-For `--plot-all`, complete target-power coverage supplies nominal automatic
-centres, but the selector still matches achieved power; otherwise achieved
-values supply the centres. The recipe records that automatic source.
+For `--plot-all`, recorded achieved values supply automatic power centres.
+The analysis CLI defaults to achieved `power_mw` whenever every analysed row
+contains recorded power; otherwise it defaults to waveplate angle.
+Power-selected rotation filenames contain achieved power rather than
+waveplate angle, and plot titles show achieved power plus its recorded
+population standard deviation. Explicit
+`--input-coordinate waveplate_angle_deg` retains angle-based output.
+Quick-look figures save PNG and exact CSV data by default; PDF output is
+opt-in with `--save-pdf`. Power labels and filenames default to one decimal
+place and can be changed with `--power-decimal-places`; quantitative CSV/JSON
+values retain full precision.
 
 The hardware-free analysis regressions include:
 
@@ -524,7 +541,41 @@ and the probe retracts once before any sample spectrum.
 `tools/test_power_probe_hardware.py` provides separate `inspect`, `move`, and
 `measure` workflows for the shutter, PI stage, and Ophir meter without
 connecting the rotation stages or spectrometer. The `measure` workflow can
-record multiple traces during one insertion and saves CSV/JSON output.
+record multiple traces during one insertion and saves CSV/JSON output. It uses
+a distinct, longer initial settling period before the first post-connection
+trace (default 5 s) and the experiment-standard 3 s settling period thereafter;
+all traces remain saved without clipping or substitution.
+
+The standalone `measure` diagnostic now selects the verified Ophir `AUTO`
+range by default and has no abort threshold by default. Its optional
+`--maximum-power-mw` is warning-only unless paired with
+`--abort-above-maximum`. This is intentionally separate from the experiment's
+hard raw-sample safety ceiling, which continues to abort before spectrum
+acquisition on overshoot, drift, or an unsafe meter sample.
+
+`tools/waveplate_power_control.py` adds two operator-confirmed commissioning
+workflows. `scan` moves only through explicitly supplied reviewed angles,
+saves the raw traces and angle/power table, returns the waveplate to its
+starting angle, and prints the largest contiguous monotonic optical branch.
+It also saves `waveplate_power_map.png`, shading the recommended branch and
+marking its lower and upper angular endpoints. Multiple local extrema are
+supported: candidate contiguous branches are compared by measured power span,
+then by point count when spans tie.
+
+Mapping scans also save a linearised half-wave-plate Malus-law calibration.
+Target-power scans can load it as an initial-guess model. Fresh endpoint
+measurements vertically translate the calibration for current laser output,
+and the existing bounded feedback then verifies or corrects that guess. The
+calibration never replaces measured power, branch checks, or raw-power aborts.
+
+The sample PRM1-Z8 is configured for a 25 deg/s maximum move velocity, matching
+the manufacturer's stated maximum. The waveplate stage retains its controller
+velocity. Connection applies and verifies the sample-stage velocity readback;
+failure aborts the connection.
+It does not search for mechanical end stops. `set-range` reuses the bounded
+target-power controller to leave the waveplate at a power inside a requested
+range. Both workflows connect only the waveplate, shutter, PI insertion stage,
+and Ophir meter, and preserve the shutter/probe motion interlocks.
 
 Hardware-free tests pass. Complete physical target-power operation remains
 unverified. Resolve the disagreement between the configured `+1/-1 mm` probe

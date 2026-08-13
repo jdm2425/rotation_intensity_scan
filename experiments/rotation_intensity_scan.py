@@ -17,6 +17,7 @@ from uuid import uuid4
 from analysis.measurement import Measurement
 from data.power_measurement import PowerMeasurementAttempt
 from experiments.power_targeting import TargetPowerController
+from experiments.waveplate_calibration import MalusLawCalibration
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,11 @@ class RotationIntensityExperiment:
         target_power_mw = float(target_power_mw)
         self._current_target_power_mw = target_power_mw
         if self._target_power_controller is None:
+            calibration = (
+                None
+                if target_config.calibration_path is None
+                else MalusLawCalibration.load(target_config.calibration_path)
+            )
             self._target_power_controller = TargetPowerController(
                 measure_power_at_angle=self._measure_power_at_angle,
                 waveplate_min_deg=target_config.waveplate_min_deg,
@@ -119,6 +125,7 @@ class RotationIntensityExperiment:
                 tolerance_mw=target_config.tolerance_mw,
                 maximum_iterations=target_config.maximum_iterations,
                 minimum_angle_step_deg=target_config.minimum_angle_step_deg,
+                calibration=calibration,
             )
 
         power_probe = getattr(self.hardware, "power_probe", None)
@@ -192,6 +199,8 @@ class RotationIntensityExperiment:
         waveplate_angle: float,
         sample_angle: float,
         target_power_mw: float | None = None,
+        replicate_index: int = 1,
+        replicate_count: int = 1,
     ) -> Measurement:
         """
         Perform one complete measurement.
@@ -251,7 +260,12 @@ class RotationIntensityExperiment:
         # Build measurement.
         #
 
-        measurement_metadata = {}
+        measurement_metadata = {
+            "replicate": {
+                "index": int(replicate_index),
+                "count": int(replicate_count),
+            }
+        }
         if self._power_state:
             measurement_metadata["incident_power"] = {
                 "status": self._power_state.get("status"),

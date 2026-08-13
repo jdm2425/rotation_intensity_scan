@@ -30,3 +30,6 @@ python run_target_power_scan.py `
     --integration-time-ms 10 `
     --averages 3 `
     --experiment-name Rubrene-power-1-to-10mW-rotation-0-to-359deg
+
+
+# python -m tools.analyse_experiment results\testing-hardware-with-laser-ZnO_20260721_123913 --harmonic H5:390:410 --use-background --plot-all --polar

@@ -29,6 +29,7 @@ class RotationStageConfig:
 
     serial: str
     name: str
+    maximum_velocity_deg_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class LinearStageConfig:
     out_position_mm: float | None = None
     velocity_mm_s: float | None = 5.0
     position_tolerance_mm: float = 0.1
-    motion_timeout_s: float = 30.0
+    motion_timeout_s: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ WAVEPLATE = RotationStageConfig(
 SAMPLE_STAGE = RotationStageConfig(
     serial="27268870",
     name="Sample Stage",
+    maximum_velocity_deg_s=25.0,
 )
 
 #

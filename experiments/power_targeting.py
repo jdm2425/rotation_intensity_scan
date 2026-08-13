@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import math
 from typing import Callable
 
+from experiments.waveplate_calibration import MalusLawCalibration
+
 
 class TargetPowerError(RuntimeError):
     """Base error for target-power feedback."""
@@ -73,6 +75,7 @@ class TargetPowerController:
         tolerance_mw: float,
         maximum_iterations: int,
         minimum_angle_step_deg: float = 0.01,
+        calibration: MalusLawCalibration | None = None,
     ) -> None:
         self._measure_callback = measure_power_at_angle
         self.waveplate_min_deg = self._finite(waveplate_min_deg, "waveplate_min_deg")
@@ -101,6 +104,25 @@ class TargetPowerController:
         )
         if self.minimum_angle_step_deg <= 0:
             raise ValueError("minimum_angle_step_deg must be positive.")
+        self.calibration = calibration
+        if calibration is not None:
+            if (
+                not math.isclose(
+                    calibration.waveplate_min_deg,
+                    self.waveplate_min_deg,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    calibration.waveplate_max_deg,
+                    self.waveplate_max_deg,
+                    abs_tol=1e-9,
+                )
+                or calibration.monotonic_direction != self.monotonic_direction
+            ):
+                raise ValueError(
+                    "Calibration branch bounds/direction do not match the "
+                    "configured target-power branch."
+                )
 
         self._observations: dict[float, float] = {}
         self._last_measured_angle: float | None = None
@@ -165,6 +187,40 @@ class TargetPowerController:
             low_angle, low_power, high_angle, high_power = self._bracket_from_observations(
                 target
             )
+
+        if self.calibration is not None:
+            reference_angle, reference_power = max(
+                ((low_angle, low_power), (high_angle, high_power)),
+                key=lambda item: item[1],
+            )
+            adjusted_calibration = self.calibration.with_reference(
+                angle_deg=reference_angle,
+                measured_power_mw=reference_power,
+            )
+            candidate = adjusted_calibration.angle_for_power_mw(target)
+            candidate = max(low_angle, min(high_angle, candidate))
+            if (
+                candidate > low_angle + self.minimum_angle_step_deg
+                and candidate < high_angle - self.minimum_angle_step_deg
+            ):
+                achieved = self._measure(candidate)
+                if abs(achieved - target) <= self.tolerance_mw:
+                    return self._result(
+                        target,
+                        candidate,
+                        achieved,
+                        measurement_count_before,
+                    )
+                if self.monotonic_direction == "increasing":
+                    if achieved < target:
+                        low_angle, low_power = candidate, achieved
+                    else:
+                        high_angle, high_power = candidate, achieved
+                else:
+                    if achieved > target:
+                        low_angle, low_power = candidate, achieved
+                    else:
+                        high_angle, high_power = candidate, achieved
 
         for _ in range(self.maximum_iterations):
             candidate = self._interpolated_candidate(

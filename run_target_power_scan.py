@@ -118,6 +118,15 @@ def parse_arguments() -> argparse.Namespace:
         help="Smallest feedback angle resolution in degrees (default: 0.02).",
     )
     parser.add_argument(
+        "--power-calibration",
+        type=Path,
+        default=None,
+        help=(
+            "Optional saved Malus-law JSON used only for the first feedback "
+            "guess; fresh measured feedback remains authoritative."
+        ),
+    )
+    parser.add_argument(
         "--maximum-power-mw",
         type=float,
         default=20.0,
@@ -148,6 +157,15 @@ def parse_arguments() -> argparse.Namespace:
         help="Spectra averaged per sample point (default: 1).",
     )
     parser.add_argument(
+        "--spectra-per-point",
+        type=int,
+        default=1,
+        help=(
+            "Independent spectra saved at each point for uncertainty "
+            "estimation (default: 1)."
+        ),
+    )
+    parser.add_argument(
         "--output-directory",
         type=Path,
         default=Path("results"),
@@ -176,6 +194,7 @@ def build_config(arguments: argparse.Namespace) -> ExperimentConfig:
 
     config.spectrometer.integration_time_ms = arguments.integration_time_ms
     config.spectrometer.averages = arguments.averages
+    config.spectrometer.spectra_per_point = arguments.spectra_per_point
     config.background.enabled = not arguments.no_background
 
     config.power_meter.enabled = True
@@ -190,6 +209,7 @@ def build_config(arguments: argparse.Namespace) -> ExperimentConfig:
     config.target_power.tolerance_mw = arguments.tolerance_mw
     config.target_power.maximum_iterations = arguments.maximum_iterations
     config.target_power.minimum_angle_step_deg = arguments.minimum_angle_step_deg
+    config.target_power.calibration_path = arguments.power_calibration
 
     config.saving.output_directory = arguments.output_directory
     config.saving.experiment_name = arguments.experiment_name
@@ -218,9 +238,11 @@ def print_run_summary(arguments: argparse.Namespace) -> None:
     print(f"Maximum raw power   : {arguments.maximum_power_mw} mW")
     print(f"Power trace         : {arguments.power_duration_s} s")
     print(f"Power settle        : {arguments.power_settle_s} s")
+    print(f"Spectra per point   : {arguments.spectra_per_point}")
+    print(f"Power calibration   : {arguments.power_calibration}")
     print(
         "Measurements        : "
-        f"{len(arguments.sample_angles) * len(arguments.target_powers_mw)} spectra"
+        f"{len(arguments.sample_angles) * len(arguments.target_powers_mw) * arguments.spectra_per_point} spectra"
     )
     print("Final safe state    : shutter closed, power probe retracted")
     print("=" * 72)

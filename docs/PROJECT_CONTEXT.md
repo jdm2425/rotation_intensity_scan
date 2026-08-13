@@ -226,8 +226,8 @@ cadence, persistence, and analysis propagation are implemented. The default is
 one power trace after each waveplate setting and before its sample-angle block;
 `per_measurement` and `disabled` cadences are also available. The standard
 settings are a 10 s trace after 3 s settling, physical fundamental wavelength
-2000 nm, sensor option `>800`, fixed range `30.0mW`, and a 20 mW maximum raw
-positive reading.
+2000 nm, sensor option `>800`, automatic meter range selection, and a
+separately configured maximum raw positive reading.
 
 Zero, negative, missing, non-finite, or status-flagged raw readings are retained
 but excluded from statistics. They are never predicted, substituted, or
