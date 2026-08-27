@@ -3,6 +3,81 @@
 ```markdown
 # Architecture
 
+## Campaign GUI boundary
+
+The `gui/` package defaults to simulation and has an explicit,
+capability-limited Ocean SR hardware mode. Qt widgets
+run on the main thread; one `HardwareWorker` is moved to a dedicated `QThread`,
+where it exclusively owns the backend. Immutable `GuiSnapshot` objects and
+completed canonical `Measurement` objects are emitted to the GUI. Cancellation
+uses a thread-safe event because a queued Qt slot cannot execute while a
+blocking scan operation owns the worker event loop.
+
+The current `SimulatedCampaignBackend` intentionally imports no live hardware
+manager or device driver. Synthetic measurements use the normal
+`Measurement -> Spectrum` model and `DataWriter`, exercising immediate format-5
+persistence without creating a second data path.
+
+`SpectrometerCampaignBackend` currently owns the Ocean SR, two rotation stages,
+beam shutter, PI probe stage, and Ophir Juno. It lazily imports drivers after an explicit
+operator connection action, so startup and mode selection do not touch
+hardware. Connect-all establishes and verifies shutter-closed before connecting
+either stage. Angle-controlled scans use `Acquisition`, canonical `Measurement`
+objects, and `DataWriter` directly from that same worker-owned device stack.
+Bounded target-power scans reuse `TargetPowerController`; calibration execution
+remains disabled. The worker refuses mode changes
+while connected or busy.
+
+The continuous alignment stream also runs on the worker thread. Since that loop
+temporarily owns the Qt worker event loop, GUI interactions place small commands
+(settings, background capture/toggle, and manual save) onto a thread-safe queue;
+the worker processes them between acquisitions. Stop is a thread-safe event.
+This design keeps thread-affine Ocean/Ophir drivers off the GUI thread.
+
+Real manual power measurement is refused during live view and delegates the
+complete sequence to `RetractablePowerProbe`. Raw traces are persisted before
+statistics/safety acceptance. Simulation continues to model the same final
+shutter-closed, probe-out state.
+
+For a hardware angle scan, one `PowerMeasurementAttempt` and raw `PowerTrace`
+are persisted before any spectra in each waveplate block. The trace statistics
+and IDs are shared by every sample-angle replicate in that block. Spectrum
+illumination passes through an immediate live probe-out guard, and `Acquisition`
+closes the shutter in `finally`. Cancellation occurs only at safe boundaries;
+completed measurements remain loadable.
+
+Target-power blocks create one persistent `RetractablePowerProbe` session.
+The bounded controller moves only inside the operator-entered monotonic branch,
+and its callback durably saves every endpoint/candidate attempt and trace. The
+session retracts before sample acquisition. An optional compatible Malus-law
+file affects only the first candidate; fresh endpoints and measured feedback
+remain authoritative.
+
+GUI calibration reuses the pure `scan_angles`, monotonic-branch selection,
+Malus fitting, CSV, and plotting functions from `tools.waveplate_power_control`.
+The backend owns only the worker-thread hardware sequence and incremental trace
+persistence; the GUI receives numeric point updates and the final recommended
+branch rather than device objects.
+
+GUI connection state is represented per device. The aggregate health indicator
+is derived from immutable snapshots rather than button state: green means every
+device is connected, amber means an initial partial connection, grey means no
+connection has been attempted, and red means a formerly complete connection
+was lost or a connection operation failed. Editable serial/identity choices and
+window geometry are stored with Qt `QSettings`; connection state itself is not
+restored and the application never auto-connects.
+
+Operator-adjustable validation/display preferences are also held in
+`QSettings` and passed to the active backend through the worker thread. They do
+not mutate `hardware/config.py`. Hardware identities, interlock mappings,
+travel limits, driver tolerances, and power-meter semantics remain outside this
+preference layer. Operator-confirmed probe in/out targets are the deliberate
+exception and remain bounded by the locked PI travel envelope.
+
+The future real backend must preserve this boundary. Ophir connection, calls,
+and cleanup must remain on the same worker thread, PI calls must retain their
+existing locking rules, and GUI widgets must never call device methods directly.
+
 ## Architectural goals
 
 The codebase separates:

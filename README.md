@@ -312,6 +312,87 @@ python -m tools.live_spectrometer
 This utility connects only to the Ocean SR. It supports manual saving, live
 integration-time changes, axis controls, and persistent background capture.
 
+## Campaign GUI
+
+The GUI starts in Hardware mode for campaign convenience, but never connects or
+reconnects hardware automatically. Simulation remains selectable explicitly.
+An explicit mode selector exposes a capability-limited Hardware mode for the
+Ocean SR, waveplate/sample rotation stages, and beam shutter. Selecting that
+mode is inert; `Connect alignment devices` performs the physical connections,
+closing and verifying the shutter before connecting either stage. Hardware
+mode supports absolute manual rotation, guarded probe/power operations, and
+angle-controlled and bounded closed-loop target-power scans. Calibration
+execution remains disabled. Install and launch:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe run_gui.py
+```
+
+The current interface provides a persistent safety header, simulated connection
+and manual-control panels, a continuous Alignment / Live Spectrum workspace,
+scan preflight, synthetic scan spectra/progress, incremental format-5 saving,
+safe cancellation, and saved-experiment summary loading. The alignment view
+supports live integration-time and averaging changes, background capture and
+subtraction, axis limits, autoscaling, pause/resume, and pickle-free manual
+spectrum saves. A prominent banner identifies the active mode.
+
+Motion and incident-power controls are duplicated intentionally in the
+Alignment workspace so initial setup does not require switching tabs. Simulated
+waveplate/sample moves, target-power setting, and shutter-interlocked incident
+power measurements can be requested while the spectrum is streaming; commands
+are executed serially between frames. Buttons reserve their full text width to
+avoid clipped operator actions under Windows display scaling.
+
+The Devices tab supports connect-all/safe-disconnect plus individual simulated
+device connect and disconnect actions. Serial/identity fields are editable and
+remembered between GUI sessions; the application never reconnects automatically.
+A top-right health light is green only when every configured device is
+connected, amber during partial initial connection, and red after a connection
+loss or connection error. Connection events and actionable errors are mirrored
+to a diagnostic log on the Devices tab.
+
+The Settings tab remembers the rotation-stage readback tolerance (default
+`0.05 deg`) and detector saturation-warning threshold. Safety-critical hardware
+identity, shutter mapping, motion limits/homing, PI driver tolerance, and power-meter
+semantics remain locked in reviewed project configuration.
+
+Devices and Alignment both provide shutter Open/Close and arbitrary bounded PI
+position controls. Opening is direct when probe-out is verified; a stopped
+operator can explicitly accept a laser-risk warning to override unknown/not-out
+state. PI moves always close/verify the shutter and verify final position. Probe
+insertion/retraction positions are persistent Settings values.
+
+An unreferenced PI axis triggers a logged, operator-confirmed recovery offer.
+The application can run optical-switch `FRF`, verify referenced state, and
+resume connection. Manual PI reference and rotation-stage Home buttons are
+available on both setup tabs; none starts without a path warning and approval.
+
+Hardware mode also owns the Ophir Juno and enables guarded incident-power
+measurement. The existing retractable-probe interlock performs the motion and
+shutter sequence, while every raw trace is saved under
+`results/power_measurements`. The GUI uses `>800`, fixed `30.0mW`, and rejects
+invalid/status-flagged samples or a positive raw sample above 20 mW.
+
+The Scan Setup tab enables real scans when `Waveplate angle (deg)` is selected.
+It measures one guarded power trace per waveplate block, then records every
+requested sample angle and independent spectrum replicate. Format-5 metadata,
+power attempts/traces, backgrounds, and completed spectra are flushed into one
+experiment directory as they are acquired. Cancellation is accepted before the
+next intensity block or spectrum, and cleanup leaves the shutter closed.
+
+Selecting `Target power (mW)` exposes the reviewed monotonic branch endpoints,
+direction, tolerance, iteration/angle-step bounds, and an optional saved
+Malus-law calibration. Each target starts with fresh endpoint measurements and
+keeps the probe inserted only for its bounded feedback block. Every feedback
+attempt and trace is persisted before sample spectra; calibration supplies only
+an initial guess and never replaces measured feedback.
+
+The Calibration tab can build that file from a reviewed start/stop/step map.
+It plots measurements live, saves raw traces and the growing CSV, identifies the
+largest monotonic branch, saves an annotated map and Malus fit, restores the
+starting waveplate angle, and copies the recommendation into Scan Setup.
+
 ## Offline analysis
 
 Independent repeat spectra can be collected at every sample/intensity point by

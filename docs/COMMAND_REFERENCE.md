@@ -20,6 +20,134 @@ be no spaces after the backtick.
 - The Ophir range and a power safety ceiling are different settings. `AUTO`
   chooses a supported meter range; it does not disable experiment safety.
 
+## 0. Campaign GUI
+
+**Offline by default; hardware motion/acquisition after explicit approval.** The GUI
+starts in Hardware mode but connects nothing until the operator explicitly
+requests it. Simulation mode remains available and uses synthetic device state
+and spectra while exercising the real measurement persistence format.
+
+Install and launch:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe run_gui.py
+```
+
+The title and banner must say `HARDWARE` at startup. The operating-mode
+selector offers `Hardware — alignment devices`. Selecting it does not connect;
+`Connect alignment devices` accesses the physical shutter, waveplate/sample
+rotation stages, and Ocean SR. Connect-all closes and verifies the shutter
+before either stage connects. Every manual move also closes and verifies the
+shutter before motion. Completion requires live position readback within the
+configured tolerance (default `0.05 deg`). A controller connected without its mount will
+therefore report a verification failure rather than a completed move. Manual
+absolute stage movement and shutter-close
+are enabled. Shutter opening is present but remains probe-out interlocked as
+described below. These new paths are not yet
+hardware-validated. Do not use them without an approved, supervised test.
+Probe, power, angle-scan, and bounded closed-loop target-power controls are
+enabled.
+
+`Open shutter` and `Close shutter` controls are present on both Devices and
+Alignment. Close is enabled whenever the shutter is connected. Open proceeds
+directly when probe-out is live-verified. If it is unknown or not out, a stopped
+operator may use the explicit laser-risk warning to override; override is
+refused during live acquisition. Live spectra themselves require verified
+probe-out. Closing during live view is processed between frames.
+
+The PI stage can be moved to any absolute position within the intersection of
+the configured application envelope and controller-reported live limits. Each
+move requires confirmation, closes and verifies the shutter first, and verifies
+final readback. Settings contains insertion and retraction positions; defaults
+are `+12 mm` and `-12 mm`. Changing them affects GUI classification and guarded
+probe actions but does not expand travel limits.
+
+If PI connection reports axis 1 unreferenced, the GUI retains the controller
+and shutter connection, logs `PI REFERENCE REQUIRED`, and automatically offers
+the operator-confirmed reference workflow. Approval closes/verifies the
+shutter, enables the axis, issues `FRF` to the optical reference switch,
+verifies `FRF? = true`, then enables/verifies the servo, logs completion, and
+resumes remaining connections. SVO is deliberately not enabled before FRF on
+this C-891 workflow.
+Cancellation requests a smooth halt. Reference motion never starts without
+confirmation. `Reference / home PI stage` exposes the workflow manually.
+
+Devices and Alignment also provide `Home waveplate` and `Home sample`. Each
+closes/verifies the shutter, warns about full-path motion, requires approval,
+uses the existing stage homing routine, and verifies readback near zero.
+
+`Measure incident power` is enabled in Hardware mode when shutter, PI stage,
+and Ophir are connected and live spectra are stopped. It performs the guarded
+one-shot probe sequence and saves a pickle-free raw trace under
+`results/power_measurements`. Duration, settling, and polling default to 10 s,
+3 s, and 0.1 s and are configurable in Settings. The GUI selects `>800` and
+fixed `30.0mW`; invalid/status-flagged samples or a positive raw sample above
+20 mW reject the mean while preserving the trace.
+
+In Scan Setup, select `Waveplate angle (deg)` to run a guarded real scan. The
+GUI requests operator confirmation, closes the shutter for stage moves,
+measures and persists one power trace per waveplate block, verifies probe-out
+before every illuminated spectrum, saves every independent replicate
+immediately, and finishes shutter-closed. A failed power attempt is persisted
+before the scan aborts.
+
+For `Target power (mW)`, enter the physically reviewed monotonic waveplate
+minimum/maximum, direction, tolerance, maximum iterations, and minimum angle
+step. An optional `malus_calibration.json` may supply the first candidate only.
+Each target freshly measures both endpoints, persists every feedback trace,
+and keeps the PI probe inserted for that bounded feedback block before
+retracting it for spectra. This GUI path is hardware-free tested but not yet
+physically commissioned.
+
+The `Settings` tab stores operator preferences between sessions. It currently
+contains rotation readback tolerance (`0.001`–`5 deg`, default `0.05 deg`),
+detector saturation-warning threshold (default `65535 counts`), probe in/out
+positions, and power duration/settling/polling. Restore Safe Defaults resets
+them. Hardware identity, shutter mapping, motion limits,
+homing, PI travel limits/driver tolerance, and Ophir safety semantics are
+deliberately not exposed. Probe insertion/retraction positions are exposed.
+
+The `Calibration` tab maps a strictly bounded, operator-reviewed waveplate
+interval. Hardware execution requires confirmation, uses one persistent probe
+insertion, closes the shutter for each waveplate move, saves every raw trace
+and the growing CSV, recommends the largest monotonic branch, saves the map and
+`malus_calibration.json`, returns the waveplate to its starting angle, and
+copies the recommended settings into Scan Setup. The laser-off Simulation mode
+exercises the same GUI and output products with deterministic power values.
+
+The `Alignment / Live Spectrum` tab provides continuous synthetic spectra for
+reviewing the intended alignment workflow. Connect simulated hardware, open the
+tab, and select `Start simulated live view`. Integration time and averaging can
+be changed while streaming. Background capture enables subtraction, and
+`Save displayed spectrum` writes a pickle-free `.npz` under
+`results/live_spectrometer` unless another directory is selected. In Hardware
+mode the corresponding controls acquire from the connected Ocean SR; in
+Simulation mode they remain synthetic. Hardware live view publishes every
+completed acquisition immediately; there is no additional refresh delay. The
+refresh-interval field applies only to Simulation mode.
+
+The same tab contains alignment motion and power controls. In simulation,
+`Set target power` adjusts the synthetic waveplate/power state and `Measure
+incident power` models closing the shutter, inserting the probe, measuring,
+retracting the probe, and finishing shutter-closed. `Set target power` remains
+simulation-only. Hardware `Measure incident power` uses the guarded Ophir
+workflow described above.
+
+On the Devices tab, serial/identity fields can be edited and each simulated
+device can be connected or disconnected independently. Disconnect a device
+before changing its identity. Choices are remembered between application
+sessions, but devices are never connected automatically. The top-right health
+light means:
+
+- Grey: no devices connected.
+- Amber: only part of the configured stack is connected.
+- Green: every configured device is connected.
+- Red: a complete connection was lost or a connection attempt failed.
+
+The Devices-tab log records connection requests, completion messages, and
+errors. Press `F11` to enter or leave full-screen mode.
+
 ## 1. Full target-power rotation scan
 
 **Hardware motion/acquisition.** Connects the complete experiment, targets

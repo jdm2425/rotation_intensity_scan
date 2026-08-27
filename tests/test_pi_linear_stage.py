@@ -145,6 +145,11 @@ class FakeGCSDevice:
         self.target_mm = float(value)
         self.on_target = False
 
+    def FRF(self, axis: str) -> None:
+        self.calls.append(("FRF", axis))
+        self.commands.append(("FRF", axis))
+        self.referenced = True
+
     def HLT(self, axis: str, noraise: bool = False) -> None:
         self.calls.append(("HLT", axis, noraise))
         self.commands.append(("HLT", axis, noraise))

@@ -487,7 +487,7 @@ def plot_waveplate_power_map(
         [branch.start_deg, branch.stop_deg],
         [branch.start_power_mw, branch.stop_power_mw],
         s=85,
-        color=("tab:blue", "tab:red"),
+        c=["tab:blue", "tab:red"],
         edgecolors="black",
         linewidths=0.7,
         zorder=4,

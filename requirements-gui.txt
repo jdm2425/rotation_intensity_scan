@@ -1,0 +1,5 @@
+# GUI-only dependency. Hardware vendor dependencies remain in
+# requirements-hardware.txt.
+# Core, GUI and Widgets modules only. The full PySide6 bundle pulls optional
+# QML add-ons with paths that exceed common Windows/OneDrive path limits.
+PySide6-Essentials==6.7.3

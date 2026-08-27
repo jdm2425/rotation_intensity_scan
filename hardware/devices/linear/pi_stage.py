@@ -528,6 +528,49 @@ class PILinearStage(HardwareDevice):
             servo_was_enabled=servo_was_enabled,
         )
 
+    def reference_to_switch(
+        self,
+        *,
+        timeout_s: float | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> PIStageSnapshot:
+        """Run an explicit FRF reference-switch move and verify ``FRF?``.
+
+        This method does not select a stage database entry or run automatically
+        during connection. Callers must establish their external motion
+        interlocks and obtain operator approval first.
+        """
+
+        self.require_connection()
+        timeout = self.config.motion_timeout_s if timeout_s is None else float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("PI reference timeout must be finite and positive.")
+        cancel = cancel_requested or (lambda: False)
+        if self._required_bool_query("qFRF"):
+            return self.refresh_snapshot()
+        if not self._required_bool_query("qEAX"):
+            self._closed_loop_command("EAX", True)
+        start = self._monotonic()
+        try:
+            # PI's GCS2 startup sequence issues FRF before restoring/enabling
+            # servo state. C-891 can reject SVO=True while still unreferenced.
+            self._command("FRF", self.axis)
+            while not self._required_bool_query("qFRF"):
+                if cancel():
+                    raise PIStageMotionError("PI reference move cancelled by operator.")
+                if self._monotonic() - start >= timeout:
+                    raise PIStageTimeoutError(
+                        f"PI axis {self.axis!r} did not verify referenced within {timeout} s."
+                    )
+                self._sleep(float(self.config.poll_interval_s))
+        except Exception:
+            self._halt_best_effort()
+            raise
+        snapshot = self.refresh_snapshot()
+        if snapshot.referenced is not True:
+            raise PIStageStateError("PI reference workflow ended without FRF? = true.")
+        return snapshot
+
     def apply_configured_velocity(self) -> float:
         """
         Apply and verify the configured controller velocity.
@@ -943,7 +986,7 @@ class PILinearStage(HardwareDevice):
         except Exception as exc:
             raise PIStageStateError(
                 f"Failed to set {command_name}={state} for PI axis "
-                f"{self.axis!r}."
+                f"{self.axis!r}: {exc}"
             ) from exc
 
     def _halt_best_effort(self) -> None:

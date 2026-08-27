@@ -3,6 +3,34 @@
 ```markdown
 # Development Workflow
 
+## Campaign GUI regression
+
+The GUI backend has a hardware-free regression test:
+
+```powershell
+python -m tests.test_gui_simulation
+python -m tests.test_gui_spectrometer_backend
+python -m tests.test_gui_widgets
+python -m tests.test_pi_reference_workflow
+```
+
+The first test uses synthetic spectra and temporary-directory persistence. The
+spectrometer-backend test injects a fake Ocean SR and verifies single-threaded
+ownership, live acquisition, saving, and capability rejection. The widget test
+uses the offscreen Qt platform and requires `requirements-gui.txt`. No test
+connects hardware. Launching starts in Simulation mode; selecting Hardware is
+also inert, but pressing `Connect alignment devices` attempts physical shutter,
+rotation-stage, and Ocean SR connections.
+
+`tests.test_gui_widgets` also iterates across all tabs at 1920×1080 and calls
+the window's layout audit. It rejects clipped button labels, undersized visible
+text fields, hidden connection-health indication, and unusably small plot
+canvases. Persistent settings are disabled during this test so it does not read
+or overwrite an operator's remembered serial choices or window geometry.
+It additionally reduces the Devices tab to a 1280×650 viewport, verifies that
+the outer scrollbar activates, scrolls to the bottom, and confirms the device
+log becomes visible.
+
 ## Purpose
 
 This workflow is designed for a software project that controls real laboratory hardware.

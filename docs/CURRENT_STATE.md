@@ -3,6 +3,133 @@
 ```markdown
 # Current State
 
+## Campaign GUI
+
+A campaign GUI is implemented under `gui/` and launched by `run_gui.py`. It
+starts in Hardware mode but performs no automatic connection. Hardware mode owns the Ocean SR, waveplate
+and sample stages, and shutter; drivers are imported lazily on an
+operator-requested connection. Selecting Hardware mode alone connects nothing.
+Connect-all establishes and verifies shutter-closed before connecting stages.
+Manual absolute stage moves close and verify the shutter before motion and are
+routed through the worker alongside shutter-close. A move is reported complete
+only when finite live readback is within the operator-configured tolerance
+(default 0.05 degrees); otherwise
+the GUI reports requested versus observed position and marks an operation error.
+The interface includes a persistent safety/status header and device dashboard.
+Open/close shutter controls are duplicated on Devices and Alignment. Open is
+normally probe-out interlocked; when stopped, the operator can explicitly
+override an unknown/not-out state through a laser-risk confirmation. Overrides
+are refused during live acquisition, and live spectra require verified
+probe-out. The PI stage is now connectable and supports confirmed arbitrary
+absolute moves inside intersected application/live limits, always after
+verified shutter closure. Settings persists probe insertion/retraction values.
+
+An unreferenced PI axis is retained as a connected device and logged, after
+which the GUI automatically offers an operator-confirmed optical-switch `FRF`
+recovery. Approval closes/verifies the shutter, references and verifies the
+axis, prepares closed loop, and resumes remaining connections. The sequence
+enables the axis, issues and verifies `FRF`, and only then enables/verifies
+closed-loop servo state; the C-891 rejects premature `SVO=True` while
+unreferenced. The same action is available manually. Devices and Alignment
+also provide confirmed waveplate/sample homing with shutter closure and final
+near-zero readback.
+
+Hardware GUI incident-power measurement is implemented. Ophir connects as
+controller `3144168` with sensor `3141552`, returned wavelength `>800`, and
+fixed range `30.0mW`. `RetractablePowerProbe` performs the verified sequence.
+Raw traces are saved pickle-free under `results/power_measurements` before
+acceptance; invalid/status-flagged samples or a positive raw sample above 20 mW
+reject the mean. Duration, settling, and poll interval persist in Settings with
+defaults 10 s, 3 s, and 0.1 s. The GUI also includes simulated manual controls,
+calibration-workflow mock-up, scan
+configuration and preflight, live synthetic views, cancel-at-safe-point
+behavior, immediate format-5 saving, and saved-experiment summary loading.
+
+Hardware waveplate-angle scans are implemented in the GUI. Each intensity
+block closes the shutter for the verified waveplate move, acquires and persists
+one guarded Ophir attempt/raw trace, retracts and verifies the probe, and then
+acquires every requested sample-angle replicate through the live probe-out
+guard. Backgrounds and completed measurements are saved incrementally in one
+format-5 experiment directory. Cancellation is checked before intensity blocks
+and spectra; cleanup leaves the shutter closed. Closed-loop target-power scans
+remain blocked until the GUI exposes reviewed monotonic-branch and feedback
+settings. Hardware-free fake-device coverage verifies endpoint bracketing,
+convergence, persistent insertion, final retraction, format-5 trace/attempt
+links, and target/achieved power reload.
+
+The Calibration tab now executes the existing bounded waveplate-map analysis
+through the GUI. It shows an estimated duration, plots points as they arrive,
+uses one persistent probe insertion, saves every trace and the incremental map,
+recommends a monotonic branch, writes `malus_calibration.json` plus the annotated
+PNG, returns the waveplate to its starting position, and copies the result into
+Scan Setup. Simulation and fake-hardware paths cover the complete workflow; no
+real laser-on calibration has yet been run.
+The complete Calibration workspace is inside a minimum-size-aware vertical
+scroll area. Its live plot retains a 420-pixel minimum height, and the scroll
+range includes the full canvas and bottom margin under fullscreen/high-DPI
+layouts.
+
+Scan Setup now uses a minimum-size-aware outer scroll area for both form and
+preflight columns. Long labels and the output-path row retain usable widths,
+the preflight report is independently scrollable, and the run action remains
+reachable at the bottom under fullscreen/high-DPI layouts. Wheel events over
+single-line inputs continue to scroll the containing page without changing
+field values.
+
+The Alignment / Live Spectrum tab continuously streams a deterministic
+synthetic Ocean SR spectrum. It supports integration time, internal averages,
+refresh interval, background capture/subtraction with integration-time scaling,
+automatic or explicit axes, pause/resume, saturation display, and manual `.npz`
+saving under `results/live_spectrometer` by default. Saved arrays and metadata
+remain pickle-free. The existing physical `tools.live_spectrometer` is not
+invoked by the GUI.
+
+In Ocean SR Hardware mode, live refresh is acquisition-limited: every completed
+spectrum is published immediately without an added timer delay. Integration
+time, internal averaging, driver/USB transfer, and plot rendering therefore set
+the achievable rate. The refresh-interval field applies only to Simulation.
+
+The Alignment tab also embeds waveplate and sample motion, simulated
+target-power setting, and simulated incident-power measurement. These commands
+remain available during synthetic streaming and are processed between frames.
+Power operations finish with simulated shutter closed and probe out. Button
+minimum widths are derived from Qt size hints so action labels remain visible
+under Windows display scaling and window resizing.
+
+A full-screen layout audit covers all six tabs at 1920×1080 in the offscreen
+widget regression. Long alignment controls are scroll-contained, forms wrap
+long rows, plots enforce usable minimum geometry, and buttons/input fields use
+their Qt size hints as minimums. F11 toggles full screen. Window geometry,
+selected tab, and per-device simulated serial/identity text are remembered.
+
+The Devices tab now has an aggregate connection-health lamp, per-device serial
+fields and connect/disconnect buttons, connect-all and safe-disconnect actions,
+and a dedicated connection/error log. A loss after complete connection turns
+the lamp red; reconnecting every device restores green. These controls remain
+simulation-only and do not alter `hardware/config.py`.
+
+The complete Devices tab is contained in one vertical scroll area. The device
+table retains its independent row scrolling, while the outer scroll area keeps
+the connect controls, safe manual controls, and connection/error log accessible
+without overlap at reduced window heights or high Windows display scaling.
+
+A seventh Settings tab persists validated operator preferences separately from
+hardware configuration. It currently exposes rotation readback tolerance and
+the saturation-warning threshold, with safe-default restoration. Serial/model
+assignments, shutter mapping, stage limits/velocity/timeouts/homing, PI
+positions/tolerance, and Ophir range/wavelength/status/safety semantics remain
+locked in reviewed project configuration.
+
+The backend and persistence path are covered by
+`python -m tests.test_gui_simulation`; fake-backed Ocean SR ownership is covered
+by `python -m tests.test_gui_spectrometer_backend`. PySide6 is isolated in
+`requirements-gui.txt`. Ocean SR live view has been operator-reported working;
+the newly added stage/shutter GUI paths have not been hardware-validated. The
+The Ophir one-shot workflow has been operator-reported working. Hardware GUI
+angle scans are fake-tested but have not yet been physically commissioned;
+The newly exposed calibration and target-power GUI paths have not yet been
+physically commissioned.
+
 Independent spectral replicates are supported through
 `SpectrometerConfig.spectra_per_point` (default `1`). Each replicate is saved
 immediately as its own `Measurement`, with its one-based index and requested
@@ -12,7 +139,7 @@ error bars (sample standard deviation divided by the square root of the number
 of spectra). This path has been verified only with hardware-free tests; no live
 spectrometer or scan was run for this change.
 
-Last reviewed: 19 July 2026
+Last reviewed: 27 August 2026
 
 Update this file whenever a feature is verified, abandoned, or materially redesigned.
 
