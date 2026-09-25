@@ -5,6 +5,6 @@
 # - PI Software Suite / 64-bit PI_GCS2_DLL for the C-891
 # - Ophir StarLab with registered OphirLMMeasurement COM server for Juno
 pylablib==1.4.5
-seabreeze==2.11.0
+seabreeze[pyseabreeze]==2.11.0
 PIPython==2.11.0.6
 pywin32==312

@@ -941,3 +941,24 @@ class OphirJunoPowerMeter(HardwareDevice):
             ),
             "streaming": self.streaming,
         }
+
+    def check_connection(self) -> bool:
+        """Verify USB presence, then the controller and sensor identities."""
+
+        self.require_connection()
+        self._require_owner_thread()
+        scanned_serials = tuple(
+            str(serial).strip()
+            for serial in _as_sequence(
+                self._invoke("ScanUSB"),
+                description="ScanUSB serial numbers",
+            )
+        )
+        if self.controller_serial not in scanned_serials:
+            found = ", ".join(scanned_serials) or "none"
+            raise OphirConnectionError(
+                f"Ophir controller {self.controller_serial!r} is no longer "
+                f"present on USB (found: {found})."
+            )
+        self._identity = self._read_and_validate_identity()
+        return True

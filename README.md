@@ -249,7 +249,12 @@ hardware-free:
 ```powershell
 python -m tests.test_pi_linear_stage
 python -m tests.test_ophir_power_meter
+python -m tests.test_ocean_sr_health
 ```
+
+The Ocean SR health test injects fake SeaBreeze APIs. It verifies explicit
+`pyseabreeze`, explicit `cseabreeze` (also accepted as `seabreeze`), and
+`auto` fallback without enumerating USB or connecting hardware.
 
 Do not assume every file under `tests/` is hardware-free. In particular,
 `tests.test_hardware_manager`, stage tests, shutter tests, and spectrometer tests
@@ -311,6 +316,10 @@ python -m tools.live_spectrometer
 
 This utility connects only to the Ocean SR. It supports manual saving, live
 integration-time changes, axis controls, and persistent background capture.
+Select a model-compatible implementation with `--backend pyseabreeze`,
+`--backend cseabreeze`, or `--backend auto`. Without that option it uses
+`SPECTROMETER.backend` from `hardware/config.py`; the verified SR600415 default
+remains `pyseabreeze`.
 
 ## Campaign GUI
 
@@ -319,7 +328,10 @@ reconnects hardware automatically. Simulation remains selectable explicitly.
 An explicit mode selector exposes a capability-limited Hardware mode for the
 Ocean SR, waveplate/sample rotation stages, and beam shutter. Selecting that
 mode is inert; `Connect alignment devices` performs the physical connections,
-closing and verifying the shutter before connecting either stage. Hardware
+attempting the shutter first and then every configured device independently.
+Unavailable devices do not roll back successful connections or prevent later
+devices from being attempted. Connection progress is shown immediately in the
+persistent safety heading. Hardware
 mode supports absolute manual rotation, guarded probe/power operations, and
 angle-controlled and bounded closed-loop target-power scans. Calibration
 execution remains disabled. Install and launch:
@@ -344,7 +356,7 @@ power measurements can be requested while the spectrum is streaming; commands
 are executed serially between frames. Buttons reserve their full text width to
 avoid clipped operator actions under Windows display scaling.
 
-The Devices tab supports connect-all/safe-disconnect plus individual simulated
+The Devices tab supports best-effort connect-all/safe-disconnect plus individual
 device connect and disconnect actions. Serial/identity fields are editable and
 remembered between GUI sessions; the application never reconnects automatically.
 A top-right health light is green only when every configured device is
@@ -381,6 +393,13 @@ power attempts/traces, backgrounds, and completed spectra are flushed into one
 experiment directory as they are acquired. Cancellation is accepted before the
 next intensity block or spectrum, and cleanup leaves the shutter closed.
 
+`Second rotation stage carries` identifies whether the existing second
+PRM1-Z8 is moving the sample or a polarisation half-waveplate. The remembered
+selection is shared with Alignment, updates controls, preflight, logs, and live
+plot labels, and is saved in run and measurement metadata. Angles remain
+physical mount angles in both modes; the application does not silently apply a
+two-times optical-polarisation conversion.
+
 Selecting `Target power (mW)` exposes the reviewed monotonic branch endpoints,
 direction, tolerance, iteration/angle-step bounds, and an optional saved
 Malus-law calibration. Each target starts with fresh endpoint measurements and
@@ -392,6 +411,26 @@ The Calibration tab can build that file from a reviewed start/stop/step map.
 It plots measurements live, saves raw traces and the growing CSV, identifies the
 largest monotonic branch, saves an annotated map and Malus fit, restores the
 starting waveplate angle, and copies the recommendation into Scan Setup.
+
+During a scan, Live Run groups independent replicates at each coordinate. The
+upper plot shows the replicate-mean spectrum with a SEM band; the lower plot
+shows mean integrated counts with SEM error bars and a separate curve for each
+target power or waveplate angle. The dashboard reports requested/achieved
+power, population STD and sample counts, saturation/power-quality warnings,
+elapsed and estimated remaining time, and the active experiment directory.
+
+Scan Setup accepts either manual coordinate lists or inclusive start/stop/step
+ranges for both sample angle and intensity. Driving wavelength plus harmonic
+orders and a half-width auto-generate editable `NAME:MIN:MAX` wavelength
+windows. These definitions are saved in run configuration and drive the raw
+live quick-look integration; they never crop or replace saved spectra.
+
+Live plotting adapts to the requested scan: varying sample angles produce
+rotation curves separated by intensity, varying intensity at one sample angle
+produces an excitation curve, and a single coordinate shows replicate
+convergence. The operator can switch the displayed harmonic while the run is
+active. Pause waits for a shutter-closed safe point; Stop preserves completed
+measurements and ends at the next safe point.
 
 ## Offline analysis
 

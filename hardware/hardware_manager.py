@@ -83,6 +83,7 @@ class HardwareManager:
         self.spectrometer = OceanSR(
             serial=SPECTROMETER.serial,
             integration_time_ms=SPECTROMETER.integration_time_ms,
+            backend=SPECTROMETER.backend,
         )
 
         self.power_meter_stage = None

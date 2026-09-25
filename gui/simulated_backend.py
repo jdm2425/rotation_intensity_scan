@@ -54,6 +54,7 @@ class SimulatedCampaignBackend:
         self.sample_angle_deg = 0.0
         self.beam_power_mw: float | None = None
         self._cancel = threading.Event()
+        self._scan_pause = threading.Event()
         self._live_stop = threading.Event()
         self._live_commands: SimpleQueue[tuple[str, object]] = SimpleQueue()
         self._live_raw_spectrum: Spectrum | None = None
@@ -115,20 +116,34 @@ class SimulatedCampaignBackend:
         self,
         publish: SnapshotCallback,
         serials: dict[str, str] | None = None,
-    ) -> None:
+    ) -> dict:
         if self.busy:
             raise RuntimeError("Cannot connect while another operation is active.")
+        failures = []
         for key, serial in (serials or {}).items():
             self._require_device_key(key)
             serial = str(serial).strip()
             if not serial:
-                raise ValueError(f"Serial/identity for {key} must not be empty.")
+                failures.append((key, "serial/identity must not be empty"))
+                self._device_connections[key] = False
+                continue
             self._device_serials[key] = serial
         for key in self._device_connections:
-            self._device_connections[key] = True
+            if not serials or str(serials.get(key, self._device_serials[key])).strip():
+                self._device_connections[key] = True
         self.shutter_closed = True
         self.probe_out = True
-        publish(self.snapshot())
+        snapshot = self.snapshot()
+        publish(snapshot)
+        return {
+            "connected": tuple(
+                key for key, connected in self._device_connections.items() if connected
+            ),
+            "already_connected": (),
+            "failures": tuple(failures),
+            "pi_reference_required": None,
+            "snapshot": snapshot,
+        }
 
     def safe_disconnect(self, publish: SnapshotCallback) -> None:
         self.safe_state(publish)
@@ -221,12 +236,23 @@ class SimulatedCampaignBackend:
         self.shutter_closed = True
         publish(self.snapshot())
 
-    def set_power(self, target_power_mw: float, publish: SnapshotCallback) -> None:
+    def set_power(
+        self,
+        request,
+        publish: SnapshotCallback,
+        *,
+        publish_log=None,
+    ) -> None:
         """Simulate bounded power targeting and finish shutter-closed/probe-out."""
 
         self._require_idle()
+        target_power_mw = float(
+            getattr(request, "target_power_mw", request)
+        )
         self._perform_set_power(target_power_mw)
         publish(self.snapshot())
+        if publish_log is not None:
+            publish_log(f"Simulated target power set to {target_power_mw:g} mW.")
 
     def measure_power(self, publish: SnapshotCallback) -> float:
         """Simulate one shutter-interlocked probe measurement session."""
@@ -245,6 +271,23 @@ class SimulatedCampaignBackend:
 
     def request_cancel(self) -> None:
         self._cancel.set()
+        self._scan_pause.clear()
+
+    def request_pause(self, paused: bool) -> None:
+        if paused:
+            self._scan_pause.set()
+        else:
+            self._scan_pause.clear()
+
+    def _wait_for_scan_resume(self, publish_log) -> None:
+        announced = False
+        while self._scan_pause.is_set() and not self._cancel.is_set():
+            if not announced:
+                publish_log("Scan paused at a safe point; shutter remains closed.")
+                announced = True
+            time.sleep(0.05)
+        if announced and not self._cancel.is_set():
+            publish_log("Scan resumed from safe point.")
 
     def request_live_stop(self) -> None:
         """Request a stop without waiting for the worker event loop."""
@@ -535,32 +578,50 @@ class SimulatedCampaignBackend:
         publish_snapshot: SnapshotCallback,
         publish_measurement: MeasurementCallback,
         publish_log: LogCallback,
+        publish_run_directory=None,
     ) -> bool:
         """Run a short deterministic scan and return True if completed."""
 
         self._require_idle()
         self.busy = True
         self._cancel.clear()
+        self._scan_pause.clear()
         completed = 0
         publish_snapshot(self.snapshot())
         publish_log(
-            f"Simulation started: {request.total_spectra} spectra requested."
+            f"Simulation started: {request.total_spectra} spectra requested; "
+            f"rotating the {request.rotation_target_name} on the second PRM1-Z8."
         )
         try:
             with DataWriter(
                 output_directory=request.output_directory,
                 experiment_name=request.experiment_name,
             ) as writer:
+                if publish_run_directory is not None:
+                    publish_run_directory(str(writer.experiment_directory.resolve()))
                 writer.save_metadata(
                     config={
                         "simulation": True,
                         "sample_angles_deg": list(request.sample_angles_deg),
+                        "rotation_target": request.rotation_target,
+                        "rotation_target_name": request.rotation_target_name,
+                        "rotation_stage_key": "sample",
+                        "rotation_angle_semantics": "physical_mount_angle_deg",
                         "intensity_values": list(request.intensity_values),
                         "intensity_mode": request.intensity_mode,
                         "spectra_per_point": request.spectra_per_point,
                         "integration_time_ms": request.integration_time_ms,
                         "averages": request.averages,
                         "acquire_background": request.acquire_background,
+                        "driving_wavelength_nm": request.driving_wavelength_nm,
+                        "harmonic_windows": [
+                            {
+                                "name": window.name,
+                                "wavelength_min_nm": window.wavelength_min_nm,
+                                "wavelength_max_nm": window.wavelength_max_nm,
+                            }
+                            for window in request.harmonic_windows
+                        ],
                     },
                     hardware_info={
                         device.key: {
@@ -589,6 +650,7 @@ class SimulatedCampaignBackend:
                 for intensity_index, intensity_value in enumerate(
                     request.intensity_values
                 ):
+                    self._wait_for_scan_resume(publish_log)
                     if request.intensity_mode == "target_power_mw":
                         self.beam_power_mw = float(intensity_value)
                         self.waveplate_angle_deg = 4.0 * intensity_index
@@ -602,6 +664,8 @@ class SimulatedCampaignBackend:
                         for replicate_index in range(
                             1, request.spectra_per_point + 1
                         ):
+                            self.shutter_closed = True
+                            self._wait_for_scan_resume(publish_log)
                             if self._cancel.is_set():
                                 publish_log(
                                     "Cancellation accepted before the next spectrum; "
@@ -719,7 +783,11 @@ class SimulatedCampaignBackend:
         wavelengths = np.linspace(350.0, 850.0, 1024)
         angle_factor = 0.35 + np.cos(np.deg2rad(2 * self.sample_angle_deg)) ** 2
         power = float(self.beam_power_mw or 0.0)
-        peak = 475.0 + 0.08 * self.sample_angle_deg
+        peak = (
+            475.0
+            if request.rotation_target == "polarization_half_waveplate"
+            else 475.0 + 0.08 * self.sample_angle_deg
+        )
         signal = 700.0 + 2500.0 * angle_factor * max(power, 0.5)
         harmonic = signal * np.exp(-0.5 * ((wavelengths - peak) / 7.0) ** 2)
         ripple = 25.0 * np.sin(wavelengths / 8.0 + replicate_index)
@@ -744,6 +812,14 @@ class SimulatedCampaignBackend:
             spectrum=spectrum,
             metadata={
                 "simulation": True,
+                "rotation": {
+                    "target": request.rotation_target,
+                    "target_name": request.rotation_target_name,
+                    "stage_key": "sample",
+                    "angle_name": request.rotation_angle_name,
+                    "angle_semantics": "physical_mount_angle_deg",
+                    "physical_mount_angle_deg": self.sample_angle_deg,
+                },
                 "replicate": {
                     "index": replicate_index,
                     "count": request.spectra_per_point,

@@ -133,6 +133,12 @@ class BeamShutter(HardwareDevice):
 
         return self.state == self.CLOSED
 
+    def check_connection(self) -> bool:
+        """Perform one read-only flipper-state query."""
+
+        _ = self.state
+        return True
+
     # ---------------------------------------------------------
     # Waiting
     # ---------------------------------------------------------

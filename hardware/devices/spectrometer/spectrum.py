@@ -17,6 +17,17 @@ import time
 import numpy as np
 
 
+def trapezoidal_integral(y, x) -> float:
+    """Integrate with the NumPy 1.x/2.x compatible trapezoid API."""
+
+    integrator = getattr(np, "trapezoid", None)
+    if integrator is None:
+        integrator = getattr(np, "trapz", None)
+    if integrator is None:  # pragma: no cover - unsupported NumPy build
+        raise RuntimeError("NumPy provides neither trapezoid nor trapz integration.")
+    return float(integrator(y, x))
+
+
 @dataclass(slots=True)
 class Spectrum:
     """
@@ -155,11 +166,9 @@ class Spectrum:
 
             return 0.0
 
-        return float(
-            np.trapz(
-                self.intensities[mask],
-                self.wavelengths[mask],
-            )
+        return trapezoidal_integral(
+            self.intensities[mask],
+            self.wavelengths[mask],
         )
 
     # ------------------------------------------------------------------

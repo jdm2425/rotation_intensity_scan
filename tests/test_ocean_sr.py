@@ -10,6 +10,7 @@ def main() -> None:
     spectrometer = OceanSR(
         serial=SPECTROMETER.serial,
         integration_time_ms=100.0,
+        backend=SPECTROMETER.backend,
     )
 
     print("Connecting...")

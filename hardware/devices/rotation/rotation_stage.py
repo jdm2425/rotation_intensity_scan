@@ -241,6 +241,12 @@ class RotationStage(BaseRotationStage):
             self._device.is_moving()
         )
 
+    def check_connection(self) -> bool:
+        """Perform one read-only controller query to verify the live handle."""
+
+        _ = self.position
+        return True
+
     # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------

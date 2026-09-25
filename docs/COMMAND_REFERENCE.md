@@ -35,10 +35,15 @@ Install and launch:
 ```
 
 The title and banner must say `HARDWARE` at startup. The operating-mode
-selector offers `Hardware — alignment devices`. Selecting it does not connect;
+selector offers `Hardware`. Selecting it does not connect;
 `Connect alignment devices` accesses the physical shutter, waveplate/sample
-rotation stages, and Ocean SR. Connect-all closes and verifies the shutter
-before either stage connects. Every manual move also closes and verifies the
+rotation stages, PI stage, Ophir meter, and Ocean SR. Connect-all attempts the
+shutter first and then tries every configured device independently. Unavailable
+hardware is logged and remains disconnected; successful connections are kept,
+so a missing translation stage does not prevent the Ocean SR from connecting.
+Connection progress appears immediately in the persistent safety heading and
+repeat connection actions are locked until the pass finishes. Establishing a
+stage handle does not move it. Every manual move closes and verifies the
 shutter before motion. Completion requires live position readback within the
 configured tolerance (default `0.05 deg`). A controller connected without its mount will
 therefore report a verification failure rather than a completed move. Manual
@@ -92,6 +97,16 @@ before every illuminated spectrum, saves every independent replicate
 immediately, and finishes shutter-closed. A failed power attempt is persisted
 before the scan aborts.
 
+`Second rotation stage carries` selects either `Sample mounted on rotation
+stage` or `Polarisation half-waveplate mounted on rotation stage`. The same
+selection appears on Alignment and is remembered between sessions. Both modes
+command the existing second PRM1-Z8 (`sample` stage key); they do not change
+serial numbers or motion limits. Entered values are always physical mount
+angles in degrees. HWP mode does not silently double angles into optical
+polarisation angle. The selection and angle semantics are saved in run config
+and every measurement's `rotation` metadata, and live plots/logs use the
+selected label.
+
 For `Target power (mW)`, enter the physically reviewed monotonic waveplate
 minimum/maximum, direction, tolerance, maximum iterations, and minimum angle
 step. An optional `malus_calibration.json` may supply the first candidate only.
@@ -116,6 +131,26 @@ and the growing CSV, recommends the largest monotonic branch, saves the map and
 copies the recommended settings into Scan Setup. The laser-off Simulation mode
 exercises the same GUI and output products with deterministic power values.
 
+The `Live Run` tab displays replicate-mean spectra with SEM bands and integrated
+signal curves with SEM error bars, separated by target power or waveplate
+angle. It also shows requested/achieved power, population STD, valid/total
+power samples, saturation and power-status warnings, elapsed/estimated
+remaining time, and the active save directory. `Copy run status` copies these
+operator-facing diagnostics to the clipboard.
+
+Scan Setup coordinate definitions can be `Manual list` or `Inclusive range`.
+For example, rotation start `0`, stop `360`, step `5` resolves to 73 positions,
+including both endpoints. Descending ranges are also supported. Intensity
+ranges use the same rule and remain subject to target-power and motion safety
+validation.
+
+Enter the driving wavelength, harmonic orders, and a wavelength half-width to
+auto-fill harmonic windows. Uncheck auto-update or edit the window field to
+override it; syntax is `H5:390:410, H7:275:295`. The live signal selector can
+switch between these raw harmonic integrals and the total spectrum. Pause takes
+effect at the next shutter-closed boundary and can be resumed; Stop safely ends
+the run while retaining completed data.
+
 The `Alignment / Live Spectrum` tab provides continuous synthetic spectra for
 reviewing the intended alignment workflow. Connect simulated hardware, open the
 tab, and select `Start simulated live view`. Integration time and averaging can
@@ -130,9 +165,13 @@ refresh-interval field applies only to Simulation mode.
 The same tab contains alignment motion and power controls. In simulation,
 `Set target power` adjusts the synthetic waveplate/power state and `Measure
 incident power` models closing the shutter, inserting the probe, measuring,
-retracting the probe, and finishing shutter-closed. `Set target power` remains
-simulation-only. Hardware `Measure incident power` uses the guarded Ophir
-workflow described above.
+retracting the probe, and finishing shutter-closed. In Hardware mode, manual
+`Set target power` uses the reviewed branch, direction, tolerance, iteration
+limit, and optional calibration currently entered on Scan Setup. It requires an
+operator confirmation, saves every feedback attempt and raw trace in a
+timestamped `manual_target_power_*` result directory, and finishes with the
+shutter verified closed and probe retracted. Hardware `Measure incident power`
+uses the guarded Ophir workflow described above.
 
 On the Devices tab, serial/identity fields can be edited and each simulated
 device can be connected or disconnected independently. Disconnect a device
@@ -434,6 +473,9 @@ python -m tools.live_spectrometer
 CLI inputs:
 
 - `--serial`: spectrometer serial.
+- `--backend`: `pyseabreeze`, `cseabreeze`, its `seabreeze` alias, or `auto`.
+  The default is `SPECTROMETER.backend` in `hardware/config.py`, currently
+  `pyseabreeze` for SR600415. `auto` tries `pyseabreeze` then `cseabreeze`.
 - `--integration-time-ms`: initial integration time; default `10` ms.
 - `--averages`: default `1`.
 - `--output-directory`: save directory used by the `S` key.

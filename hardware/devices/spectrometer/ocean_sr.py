@@ -3,8 +3,9 @@ ocean_sr.py
 
 Driver for the Ocean Insight SR spectrometer.
 
-Uses the pyseabreeze backend, which has proven to be the reliable
-backend for the SR600415 spectrometer.
+Supports both python-seabreeze implementations. The configured SR600415 keeps
+``pyseabreeze`` as its explicit default; other models may select
+``cseabreeze`` (also accepted as ``seabreeze``) or guarded ``auto`` fallback.
 
 Every acquisition returns a universal Spectrum object.
 """
@@ -12,24 +13,78 @@ Every acquisition returns a universal Spectrum object.
 from __future__ import annotations
 
 import logging
+from importlib import import_module
+import threading
+from typing import Any, Callable
 
 import numpy as np
-import seabreeze
-
-#
-# IMPORTANT:
-# The SR600415 only enumerates correctly using the pure-python backend.
-#
-seabreeze.use("pyseabreeze")
-
-from seabreeze.spectrometers import (
-    Spectrometer,
-    list_devices,
-)
 
 from hardware.devices.spectrometer.spectrum import Spectrum
 
 logger = logging.getLogger(__name__)
+
+_BACKEND_ALIASES = {
+    "pyseabreeze": "pyseabreeze",
+    "cseabreeze": "cseabreeze",
+    "seabreeze": "cseabreeze",
+    "auto": "auto",
+}
+_AUTO_BACKENDS = ("pyseabreeze", "cseabreeze")
+SeaBreezeLoader = Callable[
+    [str],
+    tuple[type[Any], Callable[[], list[Any]], Callable[[], None]],
+]
+
+
+def _normalise_backend(backend: str) -> str:
+    value = str(backend).strip().lower()
+    try:
+        return _BACKEND_ALIASES[value]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_BACKEND_ALIASES))
+        raise ValueError(
+            f"Unsupported SeaBreeze backend {backend!r}; choose one of {choices}."
+        ) from exc
+
+
+def _load_seabreeze_backend(
+    backend: str,
+) -> tuple[type[Any], Callable[[], list[Any]], Callable[[], None]]:
+    """Create bindings isolated from the high-level module's backend cache."""
+
+    try:
+        backend_module = import_module(f"seabreeze.{backend}")
+        spectrometers = import_module("seabreeze.spectrometers")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"SeaBreeze backend {backend!r} is not installed. Install "
+            "requirements-hardware.txt before connecting an Ocean spectrometer."
+        ) from exc
+
+    try:
+        api = backend_module.SeaBreezeAPI()
+    except Exception as exc:
+        raise RuntimeError(
+            f"SeaBreeze backend {backend!r} could not be initialised: {exc}"
+        ) from exc
+
+    class BackendSpectrometer(spectrometers.Spectrometer):
+        _backend = backend_module
+
+    BackendSpectrometer.__name__ = f"{backend.title()}Spectrometer"
+    return BackendSpectrometer, api.list_devices, api.shutdown
+
+
+def _shutdown_seabreeze_backend(
+    shutdown: Callable[[], None] | None,
+    backend: str,
+) -> None:
+    if shutdown is None:
+        return
+    try:
+        shutdown()
+    except Exception:
+        logger.exception("Failed to shut down SeaBreeze backend %s.", backend)
 
 
 class OceanSR:
@@ -44,21 +99,36 @@ class OceanSR:
     integration_time_ms
         Exposure time.
 
+    backend
+        ``pyseabreeze`` for the pure-Python implementation, ``cseabreeze``
+        (or its ``seabreeze`` alias) for the native implementation, or
+        ``auto`` to try both in that order.
+
     """
 
     def __init__(
         self,
         serial: str = "SR600415",
         integration_time_ms: float = 10.0,
+        backend: str = "pyseabreeze",
+        *,
+        seabreeze_loader: SeaBreezeLoader | None = None,
     ):
 
-        self.serial = serial
+        self.serial = str(serial)
+        self.backend = _normalise_backend(backend)
 
         self.integration_time_ms = float(
             integration_time_ms
         )
 
         self._device = None
+        self._active_backend: str | None = None
+        self._list_devices: Callable[[], list[Any]] | None = None
+        self._shutdown_backend: Callable[[], None] | None = None
+        self._seabreeze_loader = seabreeze_loader or _load_seabreeze_backend
+
+    _backend_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Connection
@@ -69,58 +139,98 @@ class OceanSR:
 
         return self._device is not None
 
+    @property
+    def active_backend(self) -> str | None:
+        """Backend that owns the current connection, if connected."""
+
+        return self._active_backend
+
     def connect(self):
 
         if self.connected:
             return
 
-        logger.info(
-            "Searching for Ocean spectrometers..."
+        candidates = (
+            _AUTO_BACKENDS if self.backend == "auto" else (self.backend,)
         )
+        failures: list[str] = []
+        with self._backend_lock:
+            for backend in candidates:
+                shutdown_backend: Callable[[], None] | None = None
+                try:
+                    (
+                        spectrometer_class,
+                        list_devices,
+                        shutdown_backend,
+                    ) = self._seabreeze_loader(backend)
+                    devices = list(list_devices())
+                except Exception as exc:
+                    _shutdown_seabreeze_backend(shutdown_backend, backend)
+                    failures.append(f"{backend}: {exc}")
+                    continue
 
-        devices = list_devices()
+                serials = [
+                    str(device.serial_number)
+                    for device in devices
+                    if getattr(device, "serial_number", None) is not None
+                ]
+                logger.info(
+                    "SeaBreeze backend %s found %d spectrometer(s): %s",
+                    backend,
+                    len(serials),
+                    ", ".join(serials) or "none",
+                )
+                descriptor = next(
+                    (
+                        device
+                        for device in devices
+                        if str(getattr(device, "serial_number", "")) == self.serial
+                    ),
+                    None,
+                )
+                if descriptor is None:
+                    found = ", ".join(serials) or "none"
+                    failures.append(
+                        f"{backend}: serial {self.serial!r} not found (found: {found})"
+                    )
+                    _shutdown_seabreeze_backend(shutdown_backend, backend)
+                    continue
 
-        if not devices:
+                device = None
+                try:
+                    device = spectrometer_class(descriptor)
+                    self._device = device
+                    self._active_backend = backend
+                    self._list_devices = list_devices
+                    self._shutdown_backend = shutdown_backend
+                    self.set_integration_time(self.integration_time_ms)
+                except Exception as exc:
+                    self._device = None
+                    self._active_backend = None
+                    self._list_devices = None
+                    self._shutdown_backend = None
+                    if device is not None:
+                        try:
+                            device.close()
+                        except Exception:
+                            logger.exception(
+                                "Failed to close Ocean spectrometer after a "
+                                "connection error."
+                            )
+                    _shutdown_seabreeze_backend(shutdown_backend, backend)
+                    failures.append(f"{backend}: {exc}")
+                    continue
 
-            raise RuntimeError(
-                "No Ocean spectrometers found."
-            )
+                logger.info(
+                    "Connected to Ocean spectrometer %s using %s.",
+                    self.serial,
+                    backend,
+                )
+                return
 
-        logger.info(
-            "Found %d spectrometer(s).",
-            len(devices),
-        )
-
-        for device in devices:
-
-            spec = Spectrometer(device)
-
-            logger.info(
-                "Detected %s",
-                spec.serial_number,
-            )
-
-            if spec.serial_number == self.serial:
-
-                self._device = spec
-
-                break
-
-            spec.close()
-
-        if self._device is None:
-
-            raise RuntimeError(
-                f"Spectrometer '{self.serial}' not found."
-            )
-
-        self.set_integration_time(
-            self.integration_time_ms
-        )
-
-        logger.info(
-            "Connected to Ocean SR (%s)",
-            self.serial,
+        detail = "; ".join(failures) or "no backend attempts completed"
+        raise RuntimeError(
+            f"Could not connect to Ocean spectrometer {self.serial!r}. {detail}"
         )
 
     def info(self):
@@ -133,6 +243,8 @@ class OceanSR:
             "serial": self.serial,
             "connected": self.connected,
             "integration_time_ms": self.integration_time_ms,
+            "configured_backend": self.backend,
+            "active_backend": self.active_backend,
         }
     def disconnect(self):
 
@@ -143,9 +255,16 @@ class OceanSR:
             "Disconnecting spectrometer..."
         )
 
-        self._device.close()
-
-        self._device = None
+        try:
+            self._device.close()
+        finally:
+            self._device = None
+            self._active_backend = None
+            self._list_devices = None
+            shutdown_backend = self._shutdown_backend
+            self._shutdown_backend = None
+            if shutdown_backend is not None:
+                shutdown_backend()
 
     # ------------------------------------------------------------------
     # Configuration
@@ -258,6 +377,28 @@ class OceanSR:
             self._device.wavelengths()
         )
 
+    def check_connection(self) -> bool:
+        """Verify that the configured spectrometer is still USB-enumerated."""
+
+        if not self.connected:
+            raise RuntimeError("Spectrometer not connected.")
+        if self._active_backend is None or self._list_devices is None:
+            raise RuntimeError("Spectrometer connection has no active backend.")
+
+        with self._backend_lock:
+            detected_serials = {
+                str(device.serial_number)
+                for device in self._list_devices()
+                if getattr(device, "serial_number", None) is not None
+            }
+        if self.serial not in detected_serials:
+            found = ", ".join(sorted(detected_serials)) or "none"
+            raise RuntimeError(
+                f"Ocean spectrometer {self.serial!r} is no longer present "
+                f"on USB (found: {found})."
+            )
+        return True
+
     @property
     def wavelength_range(self):
 
@@ -304,6 +445,7 @@ class OceanSR:
             return (
                 f"<OceanSR "
                 f"{self.serial} "
+                f"{self.active_backend} "
                 f"{self.pixels} px "
                 f"{lo:.1f}-{hi:.1f} nm>"
             )

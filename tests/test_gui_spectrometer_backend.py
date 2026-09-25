@@ -11,7 +11,12 @@ from pathlib import Path
 import numpy as np
 
 from gui.spectrometer_backend import SpectrometerCampaignBackend
-from gui.state import CalibrationRequest, LiveViewRequest, ScanRequest
+from gui.state import (
+    CalibrationRequest,
+    LiveViewRequest,
+    ScanRequest,
+    TargetPowerRequest,
+)
 from data.data_loader import load_experiment
 from hardware.devices.spectrometer.spectrum import Spectrum
 from hardware.devices.power_meter.models import PowerSample, PowerTrace
@@ -263,6 +268,109 @@ def main() -> None:
         raise AssertionError("A false completed move was accepted.")
     stuck_backend.safe_disconnect(snapshots.append)
 
+    class HealthStage(FakeStage):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.healthy = True
+
+        def check_connection(self):
+            if not self.healthy:
+                raise RuntimeError("simulated USB removal")
+            _ = self.position
+            return True
+
+    class HealthSpectrometer(FakeSpectrometer):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.healthy = True
+
+        def check_connection(self):
+            if not self.healthy:
+                raise RuntimeError("simulated spectrometer USB removal")
+            return True
+
+    class HealthPowerMeter(FakePowerMeter):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.healthy = True
+
+        def check_connection(self):
+            if not self.healthy:
+                raise RuntimeError("simulated power-meter USB removal")
+            return True
+
+    health_spectrometers = []
+
+    def health_spectrometer_factory(serial, integration_time_ms):
+        device = HealthSpectrometer(serial, integration_time_ms)
+        health_spectrometers.append(device)
+        return device
+
+    health_backend = SpectrometerCampaignBackend(
+        spectrometer_factory=health_spectrometer_factory,
+        stage_factory=HealthStage,
+        shutter_factory=FakeShutter,
+        pi_stage_factory=FakePIStage,
+        power_meter_factory=HealthPowerMeter,
+    )
+    health_backend.connect_all(snapshots.append)
+    health_backend._stages["sample"].healthy = False
+    health_snapshot, health_losses = health_backend.poll_idle_health()
+    assert any("sample: simulated USB removal" in loss for loss in health_losses)
+    assert not health_snapshot.all_connected
+    assert "sample" not in health_backend._stages
+    assert "move" not in health_backend._stages["waveplate"].calls
+
+    health_spectrometers[0].healthy = False
+    health_snapshot, health_losses = health_backend.poll_idle_health()
+    assert any(
+        "spectrometer: simulated spectrometer USB removal" in loss
+        for loss in health_losses
+    )
+    assert health_backend._spectrometer is None
+    assert next(
+        device for device in health_snapshot.devices if device.key == "spectrometer"
+    ).connection.value == "disconnected"
+
+    assert health_backend._power_meter is not None
+    health_backend._power_meter.healthy = False
+    health_snapshot, health_losses = health_backend.poll_idle_health()
+    assert any(
+        "power_meter: simulated power-meter USB removal" in loss
+        for loss in health_losses
+    )
+    assert health_backend._power_meter is None
+    assert next(
+        device for device in health_snapshot.devices if device.key == "power_meter"
+    ).connection.value == "disconnected"
+    health_backend.safe_disconnect(snapshots.append)
+
+    class MissingPIStage(FakePIStage):
+        def connect(self):
+            raise RuntimeError("simulated translation stage absent")
+
+    partial_backend = SpectrometerCampaignBackend(
+        spectrometer_factory=factory,
+        stage_factory=FakeStage,
+        shutter_factory=FakeShutter,
+        pi_stage_factory=MissingPIStage,
+        power_meter_factory=FakePowerMeter,
+    )
+    partial_report = partial_backend.connect_all(snapshots.append)
+    assert any(
+        key == "power_meter_stage" and "translation stage absent" in message
+        for key, message in partial_report["failures"]
+    )
+    assert partial_backend.snapshot().any_connected
+    assert partial_backend.connected
+    assert not partial_backend.snapshot().all_connected
+    assert "power_meter_stage" not in {
+        device.key
+        for device in partial_backend.snapshot().devices
+        if device.connection.value == "connected"
+    }
+    partial_backend.safe_disconnect(snapshots.append)
+
     scan_backend = SpectrometerCampaignBackend(
         spectrometer_factory=factory,
         stage_factory=FakeStage,
@@ -287,6 +395,7 @@ def main() -> None:
             ScanRequest(
                 sample_angles_deg=(0.0, 10.0),
                 intensity_values=(2.0,),
+                rotation_target="polarization_half_waveplate",
                 intensity_mode="waveplate_angle_deg",
                 spectra_per_point=2,
                 integration_time_ms=3.0,
@@ -308,9 +417,77 @@ def main() -> None:
         assert len(dataset.power_attempts) == 1
         assert len(dataset.power_traces) == 1
         assert all(item.power_mw == 5.0 for item in dataset.measurements)
+        assert dataset.config["rotation_target"] == "polarization_half_waveplate"
+        assert dataset.config["rotation_stage_key"] == "sample"
+        assert all(
+            item.metadata["rotation"]["target"]
+            == "polarization_half_waveplate"
+            for item in dataset.measurements
+        )
+        assert any(
+            "Moving polarisation half-waveplate mount" in message
+            for message in logs
+        )
         assert scan_backend.snapshot().shutter_closed is True
         assert scan_backend.snapshot().probe_out is True
     scan_backend.safe_disconnect(snapshots.append)
+
+    disconnect_backend = SpectrometerCampaignBackend(
+        spectrometer_factory=factory,
+        stage_factory=FakeStage,
+        shutter_factory=FakeShutter,
+        pi_stage_factory=FakePIStage,
+        power_meter_factory=FakePowerMeter,
+    )
+    disconnect_backend.connect_all(snapshots.append)
+    disconnect_backend.set_operator_settings({
+        "rotation_readback_tolerance_deg": 0.05,
+        "saturation_warning_counts": 65_535.0,
+        "probe_in_position_mm": 12.0,
+        "probe_out_position_mm": -12.0,
+        "power_measurement_duration_s": 0.01,
+        "power_settle_time_s": 0.0,
+        "power_poll_interval_s": 0.01,
+    })
+    disconnect_spectrometer = disconnect_backend._spectrometer
+    original_acquire = disconnect_spectrometer.acquire
+
+    def acquire_then_disconnect(*, averages=1):
+        spectrum = original_acquire(averages=averages)
+        disconnect_spectrometer.connected = False
+        return spectrum
+
+    disconnect_spectrometer.acquire = acquire_then_disconnect
+    with tempfile.TemporaryDirectory(prefix="gui_disconnect_scan_fake_") as temporary:
+        output = Path(temporary)
+        published = []
+        try:
+            disconnect_backend.run_scan(
+                ScanRequest(
+                    sample_angles_deg=(0.0,),
+                    intensity_values=(2.0,),
+                    intensity_mode="waveplate_angle_deg",
+                    spectra_per_point=2,
+                    acquire_background=False,
+                    output_directory=output,
+                    experiment_name="fake_disconnect_scan",
+                ),
+                publish_snapshot=snapshots.append,
+                publish_measurement=lambda measurement, done, total: published.append(
+                    (measurement, done, total)
+                ),
+                publish_log=logs.append,
+            )
+        except RuntimeError as error:
+            assert "connection lost during scan" in str(error)
+            assert "spectrometer" in str(error)
+        else:  # pragma: no cover
+            raise AssertionError("A lost spectrometer connection did not abort the scan.")
+        assert len(published) == 1
+        dataset = load_experiment(next(output.glob("fake_disconnect_scan_*")))
+        assert len(dataset.measurements) == 1
+        assert disconnect_backend.snapshot().shutter_closed is True
+    disconnect_backend.safe_disconnect(snapshots.append)
 
     positions = {"Waveplate": 0.0}
 
@@ -354,6 +531,27 @@ def main() -> None:
     })
     with tempfile.TemporaryDirectory(prefix="gui_target_scan_fake_") as temporary:
         output = Path(temporary)
+        manual_power = target_backend.set_power(
+            TargetPowerRequest(
+                target_power_mw=12.0,
+                waveplate_min_deg=0.0,
+                waveplate_max_deg=10.0,
+                monotonic_direction="increasing",
+                target_tolerance_mw=0.01,
+                output_directory=output,
+            ),
+            snapshots.append,
+            publish_log=logs.append,
+        )
+        assert manual_power == 12.0
+        manual_run = next(output.glob("manual_target_power_*"))
+        manual_dataset = load_experiment(manual_run)
+        assert len(manual_dataset.measurements) == 0
+        assert len(manual_dataset.power_attempts) == 3
+        assert len(manual_dataset.power_traces) == 3
+        assert target_backend.snapshot().probe_out is True
+        assert target_backend.snapshot().shutter_closed is True
+
         assert target_backend.run_scan(
             ScanRequest(
                 sample_angles_deg=(0.0,), intensity_values=(13.0,),

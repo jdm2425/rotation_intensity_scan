@@ -6,12 +6,17 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from data.data_loader import load_experiment
 from gui.simulated_backend import SimulatedCampaignBackend
-from gui.state import CalibrationRequest, LiveViewRequest, ScanRequest, parse_number_list
+from gui.state import (
+    CalibrationRequest, LiveViewRequest, ScanRequest, inclusive_range,
+    parse_harmonic_windows, parse_number_list,
+)
+from hardware.devices.spectrometer.spectrum import Spectrum
 
 
 def main() -> None:
@@ -20,6 +25,20 @@ def main() -> None:
         10.0,
         20.0,
     )
+    assert len(inclusive_range(0, 360, 5)) == 73
+    assert inclusive_range(10, 0, 3) == (10.0, 7.0, 4.0, 1.0, 0.0)
+    windows = parse_harmonic_windows("H5:390:410, H7:275:295")
+    assert windows[0].center_nm == 400.0
+    compatibility_spectrum = Spectrum(
+        wavelengths=np.asarray([1.0, 2.0, 3.0]),
+        intensities=np.asarray([2.0, 2.0, 2.0]),
+        integration_time_ms=1.0,
+        serial="COMPATIBILITY",
+    )
+    with patch.object(
+        np, "trapezoid", getattr(np, "trapz", np.trapezoid), create=True
+    ), patch.object(np, "trapz", None, create=True):
+        assert compatibility_spectrum.integrate(1.0, 3.0) == 4.0
 
     with tempfile.TemporaryDirectory(prefix="campaign_gui_") as temporary:
         backend = SimulatedCampaignBackend()
@@ -65,6 +84,7 @@ def main() -> None:
         request = ScanRequest(
             sample_angles_deg=(0.0, 15.0),
             intensity_values=(5.0, 7.0),
+            rotation_target="polarization_half_waveplate",
             spectra_per_point=3,
             integration_time_ms=2.0,
             output_directory=Path(temporary),
@@ -94,12 +114,60 @@ def main() -> None:
         assert dataset.metadata["operator_notes"] == (
             "hardware-free GUI regression"
         )
+        assert dataset.config["rotation_target"] == "polarization_half_waveplate"
+        assert dataset.config["rotation_stage_key"] == "sample"
+        assert dataset.config["rotation_angle_semantics"] == "physical_mount_angle_deg"
         assert all(
             measurement.metadata["replicate"]["count"] == 3
             for measurement in dataset
         )
+        assert all(
+            measurement.metadata["rotation"] == {
+                "target": "polarization_half_waveplate",
+                "target_name": "polarisation half-waveplate",
+                "stage_key": "sample",
+                "angle_name": "polarisation HWP mount angle",
+                "angle_semantics": "physical_mount_angle_deg",
+                "physical_mount_angle_deg": measurement.sample_angle_deg,
+            }
+            for measurement in dataset
+        )
+
+        paused_measurements = []
+        pause_request = ScanRequest(
+            sample_angles_deg=tuple(float(value) for value in range(10)),
+            intensity_values=(5.0,), spectra_per_point=2,
+            acquire_background=False, output_directory=Path(temporary),
+            experiment_name="PauseResumeSimulation",
+        )
+        pause_thread = threading.Thread(
+            target=backend.run_scan,
+            kwargs={
+                "request": pause_request,
+                "publish_snapshot": snapshots.append,
+                "publish_measurement": lambda measurement, index, total: paused_measurements.append(measurement),
+                "publish_log": logs.append,
+            },
+        )
+        pause_thread.start()
+        deadline = time.monotonic() + 2.0
+        while not paused_measurements:
+            if time.monotonic() > deadline:
+                raise AssertionError("Pause test did not begin.")
+            time.sleep(0.01)
+        backend.request_pause(True)
+        time.sleep(0.15)
+        paused_count = len(paused_measurements)
+        time.sleep(0.15)
+        assert len(paused_measurements) == paused_count
+        backend.request_pause(False)
+        pause_thread.join(timeout=3.0)
+        assert not pause_thread.is_alive()
+        assert len(paused_measurements) == pause_request.total_spectra
+        assert any("paused at a safe point" in message for message in logs)
 
         calibration_points = []
+        pre_calibration_waveplate = backend.waveplate_angle_deg
         calibration_result = backend.run_calibration(
             CalibrationRequest(
                 start_deg=0.0,
@@ -114,7 +182,7 @@ def main() -> None:
         assert len(calibration_points) == 3
         assert Path(calibration_result["calibration_path"]).is_file()
         assert calibration_result["direction"] == "increasing"
-        assert backend.waveplate_angle_deg == 4.0
+        assert backend.waveplate_angle_deg == pre_calibration_waveplate
         assert snapshots[-1].shutter_closed is True
         assert snapshots[-1].probe_out is True
 

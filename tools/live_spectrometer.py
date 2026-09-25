@@ -1174,6 +1174,7 @@ class LiveSpectrometer:
 
 def create_spectrometer(
     serial: str,
+    backend: str | None = None,
 ) -> OceanSR:
     """
     Construct OceanSR while supporting the common constructor forms
@@ -1192,9 +1193,14 @@ def create_spectrometer(
     ).parameters
 
     if "serial" in parameters:
-        return OceanSR(
-            serial=serial
-        )
+        arguments = {"serial": serial}
+        config = _find_spectrometer_config()
+        selected_backend = backend
+        if selected_backend is None and config is not None:
+            selected_backend = getattr(config, "backend", None)
+        if "backend" in parameters and selected_backend is not None:
+            arguments["backend"] = str(selected_backend)
+        return OceanSR(**arguments)
 
     if "serial_number" in parameters:
         return OceanSR(
@@ -1340,6 +1346,16 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--backend",
+        choices=("pyseabreeze", "cseabreeze", "seabreeze", "auto"),
+        default=None,
+        help=(
+            "SeaBreeze implementation. Default: hardware.config "
+            "SPECTROMETER.backend (currently pyseabreeze)."
+        ),
+    )
+
+    parser.add_argument(
         "--averages",
         type=int,
         default=DEFAULT_AVERAGES,
@@ -1417,7 +1433,8 @@ def main() -> None:
     arguments = parse_arguments()
 
     spectrometer = create_spectrometer(
-        arguments.serial
+        arguments.serial,
+        backend=arguments.backend,
     )
 
     viewer = LiveSpectrometer(

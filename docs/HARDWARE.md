@@ -16,14 +16,30 @@ Any new hardware discovery should be verified with the real device and then docu
 | Role | Device | Serial number | Current interface |
 |---|---|---:|---|
 | Waveplate rotation | Thorlabs PRM1-Z8 | `27268875` | pylablib / Kinesis |
-| Sample rotation | Thorlabs PRM1-Z8 | `27268870` | pylablib / Kinesis |
+| Sample or polarization-HWP rotation | Thorlabs PRM1-Z8 | `27268870` | pylablib / Kinesis |
 | Beam shutter | Thorlabs MFF002 controller/device | `37008491` | Thorlabs/Kinesis-compatible driver |
-| Spectrometer | Ocean Insight Ocean SR | `SR600415` | seabreeze with `pyseabreeze` |
+| Spectrometer | Ocean Insight Ocean SR | `SR600415` | python-seabreeze; configured `pyseabreeze` |
 | Power-meter insertion | PI V-408.132020 on C-891.120200, axis 1 | `118054611` | PIPython / 64-bit PI GCS2 DLL |
 | Incident-power controller | Ophir Juno | `3144168` | StarLab `OphirLMMeasurement` COM via pywin32 |
 | Incident-power sensor | Ophir 3A-P-V1 thermopile | `3141552` | Juno channel 0 |
 
 The exact class names and configuration object names in `hardware/config.py` remain authoritative.
+
+### Idle connection monitoring
+
+When the campaign GUI is idle, its hardware worker performs read-only live
+health queries once per second. Cached Python handle flags are not sufficient
+to detect a USB cable removal, so the checks query rotation position, shutter
+state, PI identity/axis status, Ocean SR USB access, and Ophir
+controller/sensor identity. Polling is suspended while another operation owns
+the devices, preserving single-threaded driver and COM ownership.
+
+A failed health query marks the affected GUI device disconnected, makes shutter
+or probe state unknown when applicable, and releases the stale handle without
+issuing a motion command. It never reconnects automatically. The operator must
+inspect the apparatus, restore the physical connection, and explicitly request
+reconnection. In particular, loss of the shutter connection means its physical
+state cannot be verified by software.
 
 ### Optical order and retractable power probe
 
@@ -185,11 +201,15 @@ Before moving:
 - Do not assume that a power-safe angle is also mechanically safe.
 - Do not infer absolute beam intensity from waveplate angle without calibration.
 
-## Sample stage
+## Second scan rotation stage
 
 ### Purpose
 
-The sample stage rotates the sample through the angular scan.
+The second PRM1-Z8 can rotate either the sample or a polarization
+half-waveplate through the angular scan. The campaign GUI records which object
+is mounted, but both choices use the same configured controller and stage key
+(`sample`). Entered angles are physical mount angles. The software does not
+infer or command a doubled optical polarization angle.
 
 ### Known configuration
 
@@ -258,8 +278,15 @@ The Ocean SR records the optical spectrum for each scan point.
 ### Known configuration
 
 * Serial number: `SR600415`.
-* Python interface: seabreeze.
-* Working backend: `pyseabreeze`.
+* Python interface: python-seabreeze.
+* Hardware-verified backend for this model: `pyseabreeze`.
+* Driver-supported alternatives: `cseabreeze` (alias `seabreeze`) and `auto`.
+
+Set `SPECTROMETER.backend` in `hardware/config.py` for the installed model.
+`auto` tries `pyseabreeze` first and then `cseabreeze`; explicit selection is
+preferred after a model/backend pairing has been physically verified. Backend
+selection is process-wide in python-seabreeze, so this project assumes one
+owned Ocean spectrometer connection per process.
 
 ### Spectrum output
 
@@ -322,9 +349,13 @@ Do not copy random DLL versions into the repository.
 
 Keep machine-specific driver installation separate from source control.
 
-### Ocean Insight seabreeze
+### Ocean Insight python-seabreeze
 
-The Ocean SR uses seabreeze with the `pyseabreeze` backend.
+The configured Ocean SR uses the `pyseabreeze` backend. The driver lazily loads
+either python-seabreeze implementation only after an explicit connection
+request. Install `seabreeze[pyseabreeze]` so both `cseabreeze` and
+`pyseabreeze` are available. Other spectrometer models may select
+`cseabreeze`, its accepted `seabreeze` alias, or guarded `auto` fallback.
 
 When debugging connection problems, distinguish between:
 

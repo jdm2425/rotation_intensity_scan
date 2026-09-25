@@ -12,6 +12,7 @@ python -m tests.test_gui_simulation
 python -m tests.test_gui_spectrometer_backend
 python -m tests.test_gui_widgets
 python -m tests.test_pi_reference_workflow
+python -m tests.test_ocean_sr_health
 ```
 
 The first test uses synthetic spectra and temporary-directory persistence. The
@@ -21,6 +22,10 @@ uses the offscreen Qt platform and requires `requirements-gui.txt`. No test
 connects hardware. Launching starts in Simulation mode; selecting Hardware is
 also inert, but pressing `Connect alignment devices` attempts physical shutter,
 rotation-stage, and Ocean SR connections.
+
+The Ocean SR test injects fake implementations of the SeaBreeze API and covers
+`pyseabreeze`, `cseabreeze`/`seabreeze`, and `auto` fallback. Importing the
+driver and running this test do not import a vendor backend or enumerate USB.
 
 `tests.test_gui_widgets` also iterates across all tabs at 1920×1080 and calls
 the window's layout audit. It rejects clipped button labels, undersized visible

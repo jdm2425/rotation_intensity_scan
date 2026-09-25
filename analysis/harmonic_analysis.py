@@ -11,7 +11,7 @@ import numpy as np
 
 from data.background_spectrum import BackgroundSpectrum
 from data.experiment_dataset import ExperimentDataset
-from hardware.devices.spectrometer.spectrum import Spectrum
+from hardware.devices.spectrometer.spectrum import Spectrum, trapezoidal_integral
 
 
 ANALYSIS_FORMAT_VERSION = 3
@@ -326,10 +326,10 @@ def analyse_dataset(
                     integration_time_ms=spectrum.integration_time_ms,
                     averages=spectrum.averages,
                     spectrometer_serial=spectrum.serial,
-                    integrated_signal=float(np.trapezoid(y, x)),
-                    raw_integrated_signal=float(np.trapezoid(raw_y, x)),
+                    integrated_signal=trapezoidal_integral(y, x),
+                    raw_integrated_signal=trapezoidal_integral(raw_y, x),
                     background_corrected_integral=float(
-                        np.trapezoid(background_corrected_y, x)
+                        trapezoidal_integral(background_corrected_y, x)
                     ),
                     raw_peak_signal=float(np.max(raw_y)),
                     peak_signal=float(y[peak_index]),

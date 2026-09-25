@@ -5,8 +5,8 @@
 
 ## Campaign GUI boundary
 
-The `gui/` package defaults to simulation and has an explicit,
-capability-limited Ocean SR hardware mode. Qt widgets
+The `gui/` package defaults to an inert Hardware mode and also provides an
+explicit Simulation mode. Qt widgets
 run on the main thread; one `HardwareWorker` is moved to a dedicated `QThread`,
 where it exclusively owns the backend. Immutable `GuiSnapshot` objects and
 completed canonical `Measurement` objects are emitted to the GUI. Cancellation
@@ -21,11 +21,14 @@ persistence without creating a second data path.
 `SpectrometerCampaignBackend` currently owns the Ocean SR, two rotation stages,
 beam shutter, PI probe stage, and Ophir Juno. It lazily imports drivers after an explicit
 operator connection action, so startup and mode selection do not touch
-hardware. Connect-all establishes and verifies shutter-closed before connecting
-either stage. Angle-controlled scans use `Acquisition`, canonical `Measurement`
+hardware. Connect-all attempts the shutter first, then independently attempts
+all remaining configured devices and retains successful handles. Creating a
+stage handle performs no motion; motion remains separately shutter-closed
+interlocked. Angle-controlled scans use `Acquisition`, canonical `Measurement`
 objects, and `DataWriter` directly from that same worker-owned device stack.
-Bounded target-power scans reuse `TargetPowerController`; calibration execution
-remains disabled. The worker refuses mode changes
+Bounded target-power scans and manual Alignment targeting reuse
+`TargetPowerController`; calibration execution is available through the guarded
+worker workflow. The worker refuses mode changes
 while connected or busy.
 
 The continuous alignment stream also runs on the worker thread. Since that loop
@@ -53,11 +56,37 @@ session retracts before sample acquisition. An optional compatible Malus-law
 file affects only the first candidate; fresh endpoints and measured feedback
 remain authoritative.
 
+Manual Alignment targeting receives the same validated branch fields in a
+`TargetPowerRequest`, requires GUI confirmation, and creates its own format-5
+result directory containing every power attempt and raw trace even though it
+does not acquire spectra.
+
 GUI calibration reuses the pure `scan_angles`, monotonic-branch selection,
 Malus fitting, CSV, and plotting functions from `tools.waveplate_power_control`.
 The backend owns only the worker-thread hardware sequence and incremental trace
 persistence; the GUI receives numeric point updates and the final recommended
 branch rather than device objects.
+
+The backend publishes the active `DataWriter.experiment_directory` as soon as
+the run directory exists. Live Run keeps only an in-memory presentation cache
+of emitted canonical measurements: it groups by intensity coordinate and
+sample angle to calculate replicate means and sample-SEM display values. This
+does not alter or replace incrementally persisted raw measurements.
+
+`ScanRequest` carries a validated `rotation_target` (`sample` or
+`polarization_half_waveplate`), explicit driving wavelength, and canonical
+`HarmonicWindow` definitions alongside resolved coordinate tuples. Both target
+modes route to the existing second PRM1-Z8 through the legacy `sample` stage
+key and preserve `sample_angle_deg` for format compatibility. Run config and
+measurement metadata record the mounted object and state that the value is a
+physical mount angle; no implicit HWP 2x conversion occurs. GUI range
+builders are converted to inclusive tuples before the worker receives the
+request, so experiment sequencing has only one coordinate representation.
+Live harmonic integrals are presentation-only raw-spectrum quick looks.
+
+Pause and stop use independent thread-safe events because the blocking scan
+owns the worker event loop. Backends inspect them only at shutter-closed safe
+boundaries. A stop clears pause so a paused run cannot prevent safe termination.
 
 GUI connection state is represented per device. The aggregate health indicator
 is derived from immutable snapshots rather than button state: green means every
@@ -66,6 +95,16 @@ connection has been attempted, and red means a formerly complete connection
 was lost or a connection operation failed. Editable serial/identity choices and
 window geometry are stored with Qt `QSettings`; connection state itself is not
 restored and the application never auto-connects.
+
+Connect-all is a best-effort enumeration pass, ordered with the shutter first.
+Each device failure is captured independently and the pass continues, retaining
+every successful handle. Connecting a rotation-stage handle performs no motion;
+the separate motion interlock still refuses movement without a connected,
+verified-closed shutter. The worker returns a connection report containing
+successes, existing handles, failures, and any PI-reference requirement. While
+the pass runs, the GUI owns an immediate `connection_in_progress` state, shows
+connected/required progress in the persistent header, and refuses duplicate or
+queued manual actions until the final report arrives.
 
 Operator-adjustable validation/display preferences are also held in
 `QSettings` and passed to the active backend through the worker thread. They do
@@ -455,6 +494,51 @@ Live plots should:
 * Avoid changing acquisition data.
 * Distinguish raw and corrected data clearly.
 * Avoid being the only place where a correction is recorded.
+
+Wheel input over a Matplotlib canvas inside a GUI scroll area belongs to the
+page scroll area. Plot canvases must not create a wheel-input dead zone unless
+an explicit plot-navigation mode is added in the future.
+
+The GUI separates measurement receipt from dashboard rendering. Measurement
+signals update the in-memory groups and progress immediately, but expensive
+Matplotlib redraws are coalesced to a four-hertz maximum and the newest pending
+state is rendered at scan completion. This display policy must not discard or
+delay persistence of measurements. Device status badges and table rows remain
+live during a scan. The table updates only changed item text/colour and enabled
+states, retaining its existing editors and buttons instead of reconstructing
+the widget tree.
+
+The hardware scan checks required-device connectivity at operation boundaries.
+Connection loss raises through the scan worker after incremental persistence,
+then cleanup closes/verifies the shutter when possible and attempts to stop
+connected motion devices. The GUI also turns a loss visible in a worker
+snapshot into an immediate thread-safe cancellation request. Hardware APIs may
+only reveal a cable/device failure on the next driver call; the software must
+never claim a verified safe state when the shutter connection itself is lost.
+
+When the backend is idle, a `QTimer` owned by the hardware worker thread runs a
+one-second health poll. The poll uses read-only live driver queries and is never
+run concurrently with a busy operation. Only changed immutable snapshots cross
+to the GUI thread. A failed probe clears the stale backend handle without stage
+motion or automatic reconnection; the operator log records the failure and the
+normal connection-loss presentation handles the resulting snapshot.
+Ocean SR presence is checked by USB re-enumeration without acquiring a frame;
+Ophir Juno presence is checked with `ScanUSB` before querying the live identity.
+Every `snapshot_changed` emission also updates the worker's comparison cache;
+otherwise a newly disconnected snapshot could be incorrectly suppressed when
+it happened to equal an older pre-connection state.
+
+The Ocean driver imports python-seabreeze only inside an explicit connection
+request. `SpectrometerConfig.backend` selects `pyseabreeze`, `cseabreeze`, or
+`auto`; the `seabreeze` spelling is normalized to `cseabreeze`. Automatic mode
+tries the pure-Python implementation first and the native implementation
+second, recording backend-specific errors. The selected backend is retained
+for read-only USB health checks and reported by `OceanSR.info()`.
+
+Scan launch sets the GUI-owned active flag and visible activity state before
+emitting work to the hardware thread. This both provides immediate operator
+feedback during slow preparation and makes duplicate-start refusal independent
+of delayed worker snapshots or button painting.
 
 Standalone utilities may use their own lightweight plot loop, but reusable plotting logic should remain separable.
 

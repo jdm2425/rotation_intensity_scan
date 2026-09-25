@@ -77,9 +77,10 @@ class PIStageConfig:
     software safety envelope.  Every move also queries the controller's live
     ``TMN?`` and ``TMX?`` values and uses the intersection of both ranges.
 
-    ``configured_velocity_mm_s is the exact controller velocity applied and
-    verified whenever the stage connects. When it is None, the existing
-    controller velocity is preserved.
+    ``configured_velocity_mm_s`` is a maximum controller velocity enforced
+    whenever the stage connects. Faster values are reduced and verified;
+    already slower values are preserved. When it is ``None``, the existing
+    controller velocity is left unchanged.
     """
 
     serial: str = DEFAULT_CONTROLLER_SERIAL
@@ -411,9 +412,7 @@ class PILinearStage(HardwareDevice):
         self._set_connected(True)
 
         try:
-            applied_velocity = (
-                self.apply_configured_velocity()
-            )
+            applied_velocity = self.apply_configured_velocity()
 
         except Exception:
             try:
@@ -426,13 +425,21 @@ class PILinearStage(HardwareDevice):
 
             raise
 
-        logger.info(
-            "%s connected: %s (axis %s), velocity %.6g mm/s.",
-            self.name,
-            identity,
-            self.axis,
-            applied_velocity,
-        )
+        if applied_velocity is None:
+            logger.info(
+                "%s connected: %s (axis %s), velocity unavailable and unchanged.",
+                self.name,
+                identity,
+                self.axis,
+            )
+        else:
+            logger.info(
+                "%s connected: %s (axis %s), velocity %.6g mm/s.",
+                self.name,
+                identity,
+                self.axis,
+                applied_velocity,
+            )
 
     def disconnect(self) -> None:
         """Close the connection idempotently without changing axis state."""
@@ -476,6 +483,12 @@ class PILinearStage(HardwareDevice):
         )
         self._snapshot = snapshot
         return snapshot
+
+    def check_connection(self) -> bool:
+        """Verify identity and axis status using read-only GCS queries."""
+
+        self.refresh_snapshot()
+        return True
 
     def prepare_for_closed_loop(self) -> PIClosedLoopState:
         """Explicitly enable motor/servo, but only on a referenced axis.
@@ -571,13 +584,15 @@ class PILinearStage(HardwareDevice):
             raise PIStageStateError("PI reference workflow ended without FRF? = true.")
         return snapshot
 
-    def apply_configured_velocity(self) -> float:
+    def apply_configured_velocity(self) -> float | None:
         """
         Apply and verify the configured controller velocity.
 
-        When configured_velocity_mm_s is None, the controller's existing
-        velocity is left unchanged. Otherwise, the configured value is
-        written to the controller and verified by reading it back.
+        When ``configured_velocity_mm_s`` is ``None``, the controller's
+        existing velocity is left unchanged and an unavailable optional
+        ``qVEL`` result is tolerated. Otherwise, the configured value is a
+        maximum: a faster live value is reduced and verified, while an already
+        slower value is retained.
         """
 
         self.require_connection()
@@ -585,14 +600,14 @@ class PILinearStage(HardwareDevice):
         configured = self.config.configured_velocity_mm_s
 
         if configured is None:
-            current = self._required_float_query("qVEL")
-
+            current = self._snapshot.velocity_mm_s if self._snapshot else None
+            if current is None:
+                return None
             if current <= 0.0:
                 raise PIStageStateError(
                     f"PI axis {self.axis!r} reported a non-positive "
                     f"velocity ({current} mm/s)."
                 )
-
             return current
 
         target = _finite_float(
@@ -604,6 +619,20 @@ class PILinearStage(HardwareDevice):
             raise PIStageStateError(
                 "Configured PI velocity must be positive."
             )
+
+        current = self._required_float_query("qVEL")
+        if current <= 0.0:
+            raise PIStageStateError(
+                f"PI axis {self.axis!r} reported a non-positive "
+                f"velocity ({current} mm/s)."
+            )
+        if current < target or math.isclose(
+            current,
+            target,
+            rel_tol=1e-6,
+            abs_tol=1e-9,
+        ):
+            return current
 
         try:
             self._command(

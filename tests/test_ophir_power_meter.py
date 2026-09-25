@@ -225,6 +225,12 @@ def test_named_configuration_identity_and_idempotent_close() -> None:
     ]
     assert set(com.call_thread_ids) == {owner_thread}
 
+    assert meter.check_connection() is True
+    com.scan_serials = []
+    error = assert_raises(OphirConnectionError, meter.check_connection)
+    assert "no longer present on USB" in str(error)
+    com.scan_serials = [DEFAULT_CONTROLLER_SERIAL]
+
     meter.close()
     meter.close()
     assert not meter.connected

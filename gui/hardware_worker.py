@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from gui.simulated_backend import SimulatedCampaignBackend
 from gui.spectrometer_backend import PIReferenceRequired, SpectrometerCampaignBackend
-from gui.state import CalibrationRequest, LiveViewRequest, ScanRequest
+from gui.state import CalibrationRequest, LiveViewRequest, ScanRequest, TargetPowerRequest
 
 
 class HardwareWorker(QObject):
@@ -23,6 +23,9 @@ class HardwareWorker(QObject):
     pi_reference_required = Signal(str)
     calibration_point = Signal(float, float, int, int)
     calibration_finished = Signal(object)
+    run_directory_changed = Signal(str)
+    connection_attempt_finished = Signal(object)
+    IDLE_HEALTH_POLL_INTERVAL_MS = 1000
 
     def __init__(self) -> None:
         super().__init__()
@@ -39,10 +42,50 @@ class HardwareWorker(QObject):
             "power_settle_time_s": 3.0,
             "power_poll_interval_s": 0.1,
         }
+        self._health_timer: QTimer | None = None
+        self._last_health_snapshot = None
+        # Every backend path emits through this signal. Keep the comparison
+        # cache synchronized with event-driven snapshots as well as timer polls.
+        self.snapshot_changed.connect(self._remember_snapshot)
+
+    @Slot(object)
+    def _remember_snapshot(self, snapshot) -> None:
+        self._last_health_snapshot = snapshot
 
     @Slot()
     def publish_initial_state(self) -> None:
-        self.snapshot_changed.emit(self.backend.snapshot())
+        snapshot = self.backend.snapshot()
+        self._last_health_snapshot = snapshot
+        self.snapshot_changed.emit(snapshot)
+        if self._health_timer is None:
+            self._health_timer = QTimer(self)
+            self._health_timer.setInterval(self.IDLE_HEALTH_POLL_INTERVAL_MS)
+            self._health_timer.timeout.connect(self.poll_idle_health)
+            self._health_timer.start()
+
+    @Slot()
+    def poll_idle_health(self) -> None:
+        """Publish changed live state while the backend is otherwise idle."""
+
+        if self.backend.busy:
+            return
+        try:
+            poll = getattr(self.backend, "poll_idle_health", None)
+            if callable(poll):
+                snapshot, losses = poll()
+            else:
+                snapshot, losses = self.backend.snapshot(), ()
+        except Exception as error:
+            self.log_message.emit(f"IDLE HEALTH CHECK FAILED: {error}")
+            return
+        for loss in losses:
+            self.log_message.emit(
+                "HARDWARE CONNECTION LOST: "
+                f"{loss}. No motion command was issued; verify the apparatus safely."
+            )
+        if snapshot != self._last_health_snapshot:
+            self._last_health_snapshot = snapshot
+            self.snapshot_changed.emit(snapshot)
 
     @Slot(str)
     def set_mode(self, mode: str) -> None:
@@ -65,6 +108,7 @@ class HardwareWorker(QObject):
         )
         self.mode = mode
         self.backend.set_operator_settings(self.operator_settings)
+        self._last_health_snapshot = None
         self.mode_changed.emit(mode)
         self.snapshot_changed.emit(self.backend.snapshot())
         self.log_message.emit(
@@ -82,20 +126,51 @@ class HardwareWorker(QObject):
 
     @Slot()
     def connect_all(self) -> None:
-        self._execute(
-            "Connect configured devices",
-            lambda: self.backend.connect_all(self.snapshot_changed.emit),
-        )
+        self._connect_all_best_effort()
 
     @Slot(object)
     def connect_all_with_serials(self, serials: dict[str, str]) -> None:
-        self._execute(
-            "Connect configured devices",
-            lambda: self.backend.connect_all(
+        self._connect_all_best_effort(serials)
+
+    def _connect_all_best_effort(self, serials: dict[str, str] | None = None) -> None:
+        try:
+            report = self.backend.connect_all(
                 self.snapshot_changed.emit,
                 serials=serials,
-            ),
+            )
+        except Exception as error:
+            report = {
+                "connected": (),
+                "already_connected": (),
+                "failures": (("connection_pass", str(error)),),
+                "pi_reference_required": None,
+            }
+            self.operation_failed.emit(f"Connect configured devices failed: {error}")
+            try:
+                self.snapshot_changed.emit(self.backend.snapshot())
+            except Exception:
+                pass
+        self._publish_connection_report(report)
+
+    def _publish_connection_report(self, report: dict) -> None:
+        failures = tuple(report.get("failures", ()))
+        for key, message in failures:
+            self.log_message.emit(f"CONNECTION FAILED [{key}]: {message}")
+        snapshot = report.get("snapshot") or self.backend.snapshot()
+        connected_count = sum(
+            device.connection.value == "connected" and device.required
+            for device in snapshot.devices
         )
+        required_count = sum(device.required for device in snapshot.devices)
+        self.log_message.emit(
+            f"Connection pass finished: {connected_count}/{required_count} "
+            "required devices connected. Successful connections were retained."
+        )
+        self.connection_attempt_finished.emit(report)
+        reference_message = report.get("pi_reference_required")
+        if reference_message:
+            self.log_message.emit(f"PI REFERENCE REQUIRED: {reference_message}")
+            self.pi_reference_required.emit(str(reference_message))
 
     @Slot()
     def disconnect_all(self) -> None:
@@ -106,6 +181,12 @@ class HardwareWorker(QObject):
 
     @Slot(str, str)
     def connect_device(self, key: str, serial: str) -> None:
+        report = {
+            "connected": (),
+            "already_connected": (),
+            "failures": (),
+            "pi_reference_required": None,
+        }
         try:
             self.backend.connect_device(
                 key,
@@ -113,12 +194,26 @@ class HardwareWorker(QObject):
                 self.snapshot_changed.emit,
             )
         except PIReferenceRequired as error:
-            self.log_message.emit(f"PI REFERENCE REQUIRED: {error}")
-            self.pi_reference_required.emit(str(error))
+            report["failures"] = ((key, str(error)),)
+            report["pi_reference_required"] = str(error)
         except Exception as error:
+            report["failures"] = ((key, str(error)),)
             self.operation_failed.emit(f"Connect {key} failed: {error}")
         else:
+            report["connected"] = (key,)
             self.log_message.emit(f"Connect {key}: complete.")
+        finally:
+            try:
+                snapshot = self.backend.snapshot()
+                report["snapshot"] = snapshot
+                self.snapshot_changed.emit(snapshot)
+            except Exception:
+                pass
+            self.connection_attempt_finished.emit(report)
+        reference_message = report.get("pi_reference_required")
+        if reference_message:
+            self.log_message.emit(f"PI REFERENCE REQUIRED: {reference_message}")
+            self.pi_reference_required.emit(str(reference_message))
 
     @Slot(str)
     def disconnect_device(self, key: str) -> None:
@@ -172,17 +267,23 @@ class HardwareWorker(QObject):
 
     @Slot()
     def reference_pi_stage(self) -> None:
-        self._execute(
-            "Reference PI stage",
-            self._reference_pi_and_resume_connection,
-        )
+        try:
+            report = self._reference_pi_and_resume_connection()
+        except Exception as error:
+            self.operation_failed.emit(f"Reference PI stage failed: {error}")
+            self.connection_attempt_finished.emit(
+                {"connected": (), "failures": (("power_meter_stage", str(error)),)}
+            )
+        else:
+            self.log_message.emit("Reference PI stage: complete.")
+            self._publish_connection_report(report)
 
-    def _reference_pi_and_resume_connection(self) -> None:
+    def _reference_pi_and_resume_connection(self) -> dict:
         self.backend.reference_pi_stage(self.snapshot_changed.emit)
         self.log_message.emit(
             "PI FRF reference verified; resuming configured-device connection."
         )
-        self.backend.connect_all(self.snapshot_changed.emit)
+        return self.backend.connect_all(self.snapshot_changed.emit)
 
     @Slot(str, float)
     def move_stage(self, stage: str, position: float) -> None:
@@ -205,13 +306,14 @@ class HardwareWorker(QObject):
             ),
         )
 
-    @Slot(float)
-    def set_power(self, target_power_mw: float) -> None:
+    @Slot(object)
+    def set_power(self, request: float | TargetPowerRequest) -> None:
         self._execute(
-            "Set simulated power",
+            "Set target power",
             lambda: self.backend.set_power(
-                target_power_mw,
+                request,
                 self.snapshot_changed.emit,
+                publish_log=self.log_message.emit,
             ),
         )
 
@@ -234,6 +336,7 @@ class HardwareWorker(QObject):
                 publish_snapshot=self.snapshot_changed.emit,
                 publish_measurement=self.measurement_acquired.emit,
                 publish_log=self.log_message.emit,
+                publish_run_directory=self.run_directory_changed.emit,
             )
         except Exception as error:
             self.operation_failed.emit(f"Scan failed: {error}")
@@ -245,6 +348,11 @@ class HardwareWorker(QObject):
         """Thread-safe immediate flag; callable while the worker loop is busy."""
 
         self.backend.request_cancel()
+
+    def request_pause(self, paused: bool) -> None:
+        """Thread-safe pause flag checked only at backend safe points."""
+
+        self.backend.request_pause(bool(paused))
 
     @Slot(object)
     def run_calibration(self, request: CalibrationRequest) -> None:

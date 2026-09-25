@@ -365,10 +365,12 @@ class PIStagePreparationTests(unittest.TestCase):
         fake.velocity_mm_s = 200.0
         fake.ignore_velocity_command = True
         config = PIStageConfig(configured_velocity_mm_s=1.0)
-        stage, _ = connected_stage(fake, config=config)
+        stage = PILinearStage(config=config, gcs_device=fake)
 
         with self.assertRaises(PIStageStateError):
-            stage.apply_configured_velocity()
+            stage.connect()
+        self.assertFalse(stage.connected)
+        self.assertEqual(fake.close_count, 1)
 
     def test_missing_configured_velocity_leaves_controller_unchanged(self) -> None:
         fake = FakeGCSDevice()

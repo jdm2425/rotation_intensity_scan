@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import QEvent, QSettings, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QKeySequence
+from PySide6.QtCore import QEvent, QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -52,6 +54,9 @@ from gui.state import (
     GuiSnapshot,
     LiveViewRequest,
     ScanRequest,
+    TargetPowerRequest,
+    inclusive_range,
+    parse_harmonic_windows,
     parse_number_list,
 )
 from hardware.config import POWER_METER_STAGE
@@ -71,7 +76,7 @@ class CampaignMainWindow(QMainWindow):
     reference_pi_requested = Signal()
     move_stage_requested = Signal(str, float)
     probe_requested = Signal(bool)
-    set_power_requested = Signal(float)
+    set_power_requested = Signal(object)
     measure_power_requested = Signal()
     scan_requested = Signal(object)
     live_requested = Signal(object)
@@ -91,19 +96,54 @@ class CampaignMainWindow(QMainWindow):
             "ROTATION_GUI_DISABLE_SETTINGS", ""
         ).strip() not in {"1", "true", "TRUE"}
         self._mode = "hardware"
+        self._theme = self._load_theme()
         self._operator_settings = self._load_operator_settings()
-        self.setFont(QFont("Segoe UI", 9))
+        remembered_rotation_target = (
+            str(self.settings.value("scan/rotation_target", "sample"))
+            if self._settings_enabled
+            else "sample"
+        )
+        self._rotation_target_mode = (
+            remembered_rotation_target
+            if remembered_rotation_target
+            in {"sample", "polarization_half_waveplate"}
+            else "sample"
+        )
+        interface_font = QApplication.font()
+        interface_font.setPointSize(10)
+        self.setFont(interface_font)
         self.setWindowTitle("Rotation + Intensity Campaign — SIMULATION")
         self.resize(1380, 900)
         self._latest_snapshot: GuiSnapshot | None = None
         self._scan_running = False
+        self._scan_paused = False
         self._live_running = False
         self._calibration_running = False
         self._latest_live_spectrum = None
         self._ever_fully_connected = False
         self._connection_fault = False
+        self._connection_in_progress = False
+        self._connection_activity_text = ""
+        self._scan_started_monotonic: float | None = None
+        self._active_run_directory = ""
+        self._run_groups: dict[tuple[float, float], list[object]] = {}
+        self._active_scan_request: ScanRequest | None = None
+        self._last_run_measurement = None
+        self._last_run_completed = 0
+        self._last_run_total = 0
+        self._dashboard_render_pending = False
+        self._dashboard_last_render_monotonic = 0.0
+        self._dashboard_refresh_interval_s = 0.25
+        self._dashboard_render_count = 0
+        self._device_table_keys: tuple[str, ...] = ()
+        self._device_table_snapshots: dict[str, object] = {}
+        self._device_connect_buttons: dict[str, QPushButton] = {}
+        self._device_disconnect_buttons: dict[str, QPushButton] = {}
+        self._scan_connection_loss_reported = False
+        self._scan_failed_message = ""
         self.serial_fields: dict[str, QLineEdit] = {}
         self._build_ui()
+        self._apply_rotation_target_labels()
         self._install_wheel_guards()
         self._start_worker()
         self._apply_style()
@@ -112,16 +152,16 @@ class CampaignMainWindow(QMainWindow):
             self._restore_window_state()
 
     def _install_wheel_guards(self) -> None:
-        """Prevent accidental wheel edits while preserving page scrolling."""
+        """Preserve page scrolling over controls and embedded plots."""
 
         for widget_type in (QAbstractSpinBox, QComboBox, QLineEdit):
             for widget in self.findChildren(widget_type):
                 widget.installEventFilter(self)
+        for canvas in self.findChildren(FigureCanvasQTAgg):
+            canvas.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:
-        if event.type() == QEvent.Type.Wheel and isinstance(
-            watched, (QAbstractSpinBox, QComboBox, QLineEdit)
-        ):
+        if event.type() == QEvent.Type.Wheel:
             parent = watched.parentWidget()
             while parent is not None and not isinstance(parent, QScrollArea):
                 parent = parent.parentWidget()
@@ -135,7 +175,9 @@ class CampaignMainWindow(QMainWindow):
                     steps = angle_delta / 120.0
                     distance = int(steps * scrollbar.singleStep() * 3)
                 scrollbar.setValue(scrollbar.value() - distance)
-            return True
+                return True
+            if isinstance(watched, (QAbstractSpinBox, QComboBox, QLineEdit)):
+                return True
         return super().eventFilter(watched, event)
 
     def _build_ui(self) -> None:
@@ -146,12 +188,15 @@ class CampaignMainWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
         layout.addWidget(self._build_banner())
         layout.addWidget(self._build_safety_header())
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.addTab(self._build_devices_tab(), "1  Devices")
         self.alignment_page = self._build_alignment_tab()
         self.tabs.addTab(self.alignment_page, "2  Alignment / Live Spectrum")
@@ -172,54 +217,97 @@ class CampaignMainWindow(QMainWindow):
 
     def _build_banner(self) -> QWidget:
         container = QWidget()
+        container.setObjectName("topBar")
         layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
         self.mode_banner = QLabel()
         self.mode_banner.setObjectName("modeBanner")
         self.mode_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mode_banner.setMinimumHeight(38)
         self.mode_banner.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         layout.addWidget(self.mode_banner, 1)
         layout.addWidget(QLabel("Operating mode"))
         self.mode_selector = QComboBox()
+        self.mode_selector.setMinimumWidth(130)
         self.mode_selector.addItem("Simulation", "simulation")
-        self.mode_selector.addItem("Hardware — alignment devices", "hardware")
+        self.mode_selector.addItem("Hardware", "hardware")
         initial_index = self.mode_selector.findData(self._mode)
         if initial_index >= 0:
             self.mode_selector.setCurrentIndex(initial_index)
         self.mode_selector.currentIndexChanged.connect(self._request_mode_change)
         layout.addWidget(self.mode_selector)
+        layout.addWidget(QLabel("Appearance"))
+        self.theme_selector = QComboBox()
+        self.theme_selector.setMinimumWidth(110)
+        self.theme_selector.addItem("Light", "light")
+        self.theme_selector.addItem("Dark", "dark")
+        theme_index = self.theme_selector.findData(self._theme)
+        if theme_index >= 0:
+            self.theme_selector.setCurrentIndex(theme_index)
+        self.theme_selector.currentIndexChanged.connect(
+            lambda: self._set_theme(str(self.theme_selector.currentData()))
+        )
+        layout.addWidget(self.theme_selector)
         self._update_mode_visuals()
         return container
 
     def _build_safety_header(self) -> QWidget:
         group = QGroupBox("Persistent safety status")
-        layout = QHBoxLayout(group)
+        group.setObjectName("safetyHeader")
+        self.safety_status_group = group
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+        status_layout = QGridLayout()
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setHorizontalSpacing(8)
         self.connection_badge = QLabel("HARDWARE  DISCONNECTED")
         self.shutter_badge = QLabel("SHUTTER  UNKNOWN")
         self.probe_badge = QLabel("PROBE  UNKNOWN")
         self.power_badge = QLabel("POWER  --")
+        self.scan_activity_badge = QLabel("SCAN  IDLE")
         for badge in (
             self.connection_badge,
             self.shutter_badge,
             self.probe_badge,
             self.power_badge,
+            self.scan_activity_badge,
         ):
             badge.setObjectName("statusBadge")
-            badge.setMinimumWidth(170)
+            badge.setMinimumSize(156, 36)
+            badge.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(badge)
-        layout.addStretch()
+        for column, badge in enumerate(
+            (
+                self.connection_badge,
+                self.shutter_badge,
+                self.probe_badge,
+                self.power_badge,
+                self.scan_activity_badge,
+            )
+        ):
+            status_layout.addWidget(badge, 0, column)
+            status_layout.setColumnStretch(column, 1)
+        layout.addLayout(status_layout)
+        self._set_scan_activity("idle")
+
+        action_layout = QHBoxLayout()
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(10)
+        action_layout.addStretch(1)
         self.close_shutter_button = QPushButton("Close shutter")
         self.close_shutter_button.clicked.connect(lambda: self._request_shutter(False))
-        layout.addWidget(self.close_shutter_button)
+        action_layout.addWidget(self.close_shutter_button)
         self.safe_button = QPushButton("STOP / SAFE STATE")
         self.safe_button.setObjectName("safeButton")
         self.safe_button.clicked.connect(self._request_safe_state)
-        layout.addWidget(self.safe_button)
-        connection_health = QWidget()
-        health_layout = QHBoxLayout(connection_health)
+        action_layout.addWidget(self.safe_button)
+        self.connection_health_panel = QWidget()
+        health_layout = QHBoxLayout(self.connection_health_panel)
         health_layout.setContentsMargins(8, 0, 0, 0)
         self.connection_light = QLabel()
         self.connection_light.setFixedSize(20, 20)
@@ -228,7 +316,8 @@ class CampaignMainWindow(QMainWindow):
         self.connection_health_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         health_layout.addWidget(self.connection_light)
         health_layout.addWidget(self.connection_health_text)
-        layout.addWidget(connection_health)
+        action_layout.addWidget(self.connection_health_panel)
+        layout.addLayout(action_layout)
         self._set_connection_health("unknown", "NOT CONNECTED")
         return group
 
@@ -276,7 +365,9 @@ class CampaignMainWindow(QMainWindow):
         self.device_table.setAlternatingRowColors(True)
         self.device_table.setWordWrap(False)
         self.device_table.verticalHeader().setVisible(False)
+        self.device_table.verticalHeader().setDefaultSectionSize(42)
         header = self.device_table.horizontalHeader()
+        header.setMinimumHeight(38)
         for column in range(5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
@@ -297,9 +388,11 @@ class CampaignMainWindow(QMainWindow):
             )
         )
         grid.addWidget(waveplate_move, 0, 2)
-        grid.addWidget(QLabel("Sample target (deg)"), 1, 0)
+        self.devices_sample_target_label = QLabel("Sample target (deg)")
+        grid.addWidget(self.devices_sample_target_label, 1, 0)
         grid.addWidget(self.sample_position, 1, 1)
         sample_move = QPushButton("Move sample")
+        self.devices_sample_move = sample_move
         sample_move.clicked.connect(
             lambda: self.move_stage_requested.emit(
                 "sample", self.sample_position.value()
@@ -462,6 +555,13 @@ class CampaignMainWindow(QMainWindow):
         self.alignment_hardware_group = alignment_hardware
         hardware_form = QFormLayout(alignment_hardware)
         self._configure_form(hardware_form)
+        self.alignment_rotation_target = self._rotation_target_combo()
+        self.alignment_rotation_target.currentIndexChanged.connect(
+            lambda: self._set_rotation_target(
+                str(self.alignment_rotation_target.currentData())
+            )
+        )
+        hardware_form.addRow("Second rotation stage carries", self.alignment_rotation_target)
         self.alignment_waveplate_target = self._angle_box()
         self.alignment_sample_target = self._angle_box()
         self.alignment_power_target = QDoubleSpinBox()
@@ -476,6 +576,7 @@ class CampaignMainWindow(QMainWindow):
             )
         )
         sample_button = QPushButton("Move sample")
+        self.alignment_sample_move = sample_button
         sample_button.clicked.connect(
             lambda: self._alignment_move(
                 "sample", self.alignment_sample_target.value()
@@ -537,12 +638,12 @@ class CampaignMainWindow(QMainWindow):
         )
         self.alignment_hardware_status.setWordWrap(True)
         hardware_form.addRow("Current state", self.alignment_hardware_status)
-        interlock_note = QLabel(
+        self.alignment_power_interlock_note = QLabel(
             "Power operations simulate shutter closure, probe insertion, "
             "measurement/feedback, retraction, and final shutter closure."
         )
-        interlock_note.setWordWrap(True)
-        hardware_form.addRow(interlock_note)
+        self.alignment_power_interlock_note.setWordWrap(True)
+        hardware_form.addRow(self.alignment_power_interlock_note)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -678,18 +779,60 @@ class CampaignMainWindow(QMainWindow):
         )
         content = QWidget()
         self.scan_scroll_content = content
-        content.setMinimumSize(1240, 820)
+        content.setMinimumSize(1240, 1450)
         outer = QHBoxLayout(content)
         outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         form_group = QGroupBox("Campaign scan definition")
         form_group.setMinimumWidth(720)
         form = QFormLayout(form_group)
+        self.scan_form = form
         self._configure_form(form)
         self.sample_angles = QLineEdit("0 10 20")
+        self.rotation_target = self._rotation_target_combo()
+        self.sample_definition = QComboBox()
+        self.sample_definition.addItem("Manual list", "list")
+        self.sample_definition.addItem("Inclusive range", "range")
+        self.sample_range_start = self._angle_box()
+        self.sample_range_stop = self._angle_box()
+        self.sample_range_stop.setValue(360.0)
+        self.sample_range_step = QDoubleSpinBox()
+        self.sample_range_step.setRange(0.001, 360.0)
+        self.sample_range_step.setValue(5.0)
+        self.sample_range_step.setSuffix(" deg")
         self.intensity_mode = QComboBox()
         self.intensity_mode.addItem("Target power (mW)", "target_power_mw")
         self.intensity_mode.addItem("Waveplate angle (deg)", "waveplate_angle_deg")
         self.intensity_values = QLineEdit("5 7.5 10")
+        self.intensity_definition = QComboBox()
+        self.intensity_definition.addItem("Manual list", "list")
+        self.intensity_definition.addItem("Inclusive range", "range")
+        self.intensity_range_start = QDoubleSpinBox()
+        self.intensity_range_stop = QDoubleSpinBox()
+        self.intensity_range_step = QDoubleSpinBox()
+        for box in (
+            self.intensity_range_start,
+            self.intensity_range_stop,
+            self.intensity_range_step,
+        ):
+            box.setRange(-360.0, 360.0)
+            box.setDecimals(4)
+        self.intensity_range_start.setValue(5.0)
+        self.intensity_range_stop.setValue(10.0)
+        self.intensity_range_step.setValue(1.0)
+        self.driving_wavelength = QDoubleSpinBox()
+        self.driving_wavelength.setRange(1.0, 100_000.0)
+        self.driving_wavelength.setDecimals(3)
+        self.driving_wavelength.setValue(2000.0)
+        self.driving_wavelength.setSuffix(" nm")
+        self.harmonic_orders = QLineEdit("5 7")
+        self.harmonic_half_width = QDoubleSpinBox()
+        self.harmonic_half_width.setRange(0.01, 1000.0)
+        self.harmonic_half_width.setValue(10.0)
+        self.harmonic_half_width.setSuffix(" nm")
+        self.auto_harmonic_windows = QCheckBox("Auto-update from driving wavelength")
+        self.auto_harmonic_windows.setChecked(True)
+        self.harmonic_windows = QLineEdit()
+        self.harmonic_windows.setPlaceholderText("H5:390:410, H7:275.7:295.7")
         self.target_branch_min = self._angle_box()
         self.target_branch_min.setValue(0.0)
         self.target_branch_max = self._angle_box()
@@ -736,9 +879,23 @@ class CampaignMainWindow(QMainWindow):
         output_layout.addWidget(browse)
         self.notes = QTextEdit()
         self.notes.setMaximumHeight(80)
+        form.addRow("Second rotation stage carries", self.rotation_target)
+        form.addRow("Sample-angle definition", self.sample_definition)
         form.addRow("Sample angles (deg)", self.sample_angles)
+        form.addRow("Sample range start", self.sample_range_start)
+        form.addRow("Sample range stop", self.sample_range_stop)
+        form.addRow("Sample range step", self.sample_range_step)
         form.addRow("Intensity coordinate", self.intensity_mode)
+        form.addRow("Intensity definition", self.intensity_definition)
         form.addRow("Intensity values", self.intensity_values)
+        form.addRow("Intensity range start", self.intensity_range_start)
+        form.addRow("Intensity range stop", self.intensity_range_stop)
+        form.addRow("Intensity range step", self.intensity_range_step)
+        form.addRow("Driving wavelength", self.driving_wavelength)
+        form.addRow("Harmonic orders", self.harmonic_orders)
+        form.addRow("Harmonic half-width", self.harmonic_half_width)
+        form.addRow("Harmonic auto-fill", self.auto_harmonic_windows)
+        form.addRow("Harmonic windows", self.harmonic_windows)
         form.addRow("Target branch minimum", self.target_branch_min)
         form.addRow("Target branch maximum", self.target_branch_max)
         form.addRow("Branch direction", self.target_direction)
@@ -772,9 +929,32 @@ class CampaignMainWindow(QMainWindow):
         self.run_button.clicked.connect(self._start_scan)
         preflight_layout.addWidget(self.run_button)
         outer.addWidget(preflight, 2)
+        self.rotation_target.currentIndexChanged.connect(
+            lambda: self._set_rotation_target(str(self.rotation_target.currentData()))
+        )
         self.sample_angles.textChanged.connect(self._update_preflight)
+        self.sample_definition.currentIndexChanged.connect(
+            self._update_scan_definition_visibility
+        )
+        for box in (
+            self.sample_range_start, self.sample_range_stop, self.sample_range_step,
+            self.intensity_range_start, self.intensity_range_stop,
+            self.intensity_range_step,
+        ):
+            box.valueChanged.connect(self._update_preflight)
         self.intensity_mode.currentIndexChanged.connect(self._update_preflight)
+        self.intensity_definition.currentIndexChanged.connect(
+            self._update_scan_definition_visibility
+        )
         self.intensity_values.textChanged.connect(self._update_preflight)
+        self.driving_wavelength.valueChanged.connect(self._auto_fill_harmonics)
+        self.harmonic_orders.textChanged.connect(self._auto_fill_harmonics)
+        self.harmonic_half_width.valueChanged.connect(self._auto_fill_harmonics)
+        self.auto_harmonic_windows.toggled.connect(self._auto_fill_harmonics)
+        self.harmonic_windows.textEdited.connect(
+            lambda: self.auto_harmonic_windows.setChecked(False)
+        )
+        self.harmonic_windows.textChanged.connect(self._update_preflight)
         self.target_branch_min.valueChanged.connect(self._update_preflight)
         self.target_branch_max.valueChanged.connect(self._update_preflight)
         self.target_direction.currentIndexChanged.connect(self._update_preflight)
@@ -788,6 +968,8 @@ class CampaignMainWindow(QMainWindow):
         self.background.toggled.connect(self._update_preflight)
         self.experiment_name.textChanged.connect(self._update_preflight)
         self.output_directory.textChanged.connect(self._update_preflight)
+        self._update_scan_definition_visibility()
+        self._auto_fill_harmonics()
         self._update_preflight()
         self._update_calibration_summary()
         self.scan_scroll.setWidget(content)
@@ -796,22 +978,68 @@ class CampaignMainWindow(QMainWindow):
 
     def _build_live_tab(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_run_scroll = QScrollArea()
+        self.live_run_scroll.setWidgetResizable(True)
+        self.live_run_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.live_run_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        content = QWidget()
+        self.live_run_scroll_content = content
+        content.setMinimumSize(1280, 1040)
+        layout = QVBoxLayout(content)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         top = QHBoxLayout()
         self.run_status = QLabel("No scan running")
         self.run_status.setFont(self._section_font())
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.cancel_button = QPushButton("Cancel after current safe point")
+        self.cancel_button.setText("Stop after current safe point")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel_scan)
+        self.pause_scan_button = QPushButton("Pause after current safe point")
+        self.pause_scan_button.setEnabled(False)
+        self.pause_scan_button.clicked.connect(self._toggle_scan_pause)
         top.addWidget(self.run_status)
         top.addWidget(self.progress, 1)
+        top.addWidget(self.pause_scan_button)
         top.addWidget(self.cancel_button)
         layout.addLayout(top)
 
+        details = QHBoxLayout()
+        self.run_timing = QLabel("Elapsed --:-- | Remaining --:--")
+        self.run_power_status = QLabel("Power: no measurement")
+        self.live_harmonic_selector = QComboBox()
+        self.live_harmonic_selector.addItem("Total integrated spectrum", None)
+        self.live_harmonic_selector.currentIndexChanged.connect(
+            self._redraw_selected_harmonic
+        )
+        self.copy_run_status_button = QPushButton("Copy run status")
+        self.copy_run_status_button.clicked.connect(self._copy_run_status)
+        details.addWidget(self.run_timing)
+        details.addWidget(self.run_power_status, 1)
+        details.addWidget(QLabel("Quick-look signal"))
+        details.addWidget(self.live_harmonic_selector)
+        details.addWidget(self.copy_run_status_button)
+        layout.addLayout(details)
+        self.run_directory_label = QLineEdit()
+        self.run_directory_label.setReadOnly(True)
+        self.run_directory_label.setPlaceholderText(
+            "The active experiment directory will appear when saving begins."
+        )
+        layout.addWidget(self.run_directory_label)
+        self.run_warning = QLabel("No active warnings")
+        self.run_warning.setWordWrap(True)
+        self.run_warning.setObjectName("notice")
+        layout.addWidget(self.run_warning)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.figure = Figure(figsize=(8, 5), tight_layout=True)
+        self.figure = Figure(figsize=(10, 8), constrained_layout=True)
         self.spectrum_axes = self.figure.add_subplot(211)
         self.scan_axes = self.figure.add_subplot(212)
         self.spectrum_axes.set_title("Latest spectrum")
@@ -821,15 +1049,25 @@ class CampaignMainWindow(QMainWindow):
         self.scan_axes.set_xlabel("Sample angle (deg)")
         self.scan_axes.set_ylabel("Integrated counts")
         self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumSize(880, 820)
+        self.canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         splitter.addWidget(self.canvas)
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
         self.event_log.setMaximumBlockCount(2000)
+        self.event_log.setMinimumWidth(320)
         splitter.addWidget(self.event_log)
         splitter.setSizes([900, 350])
-        layout.addWidget(splitter, 1)
+        splitter.setMinimumHeight(840)
+        layout.addWidget(splitter)
+        layout.addSpacing(20)
         self._quick_x: list[float] = []
         self._quick_y: list[float] = []
+        self.live_run_scroll.setWidget(content)
+        page_layout.addWidget(self.live_run_scroll)
         return page
 
     def _build_data_tab(self) -> QWidget:
@@ -974,8 +1212,32 @@ class CampaignMainWindow(QMainWindow):
         if not 0.0 <= loaded["power_settle_time_s"] <= 120.0:
             loaded["power_settle_time_s"] = defaults["power_settle_time_s"]
         if not 0.01 <= loaded["power_poll_interval_s"] <= 10.0:
-            loaded["power_poll_interval_s"] = defaults["power_poll_interval_s"]
+                loaded["power_poll_interval_s"] = defaults["power_poll_interval_s"]
         return loaded
+
+    def _load_theme(self) -> str:
+        if not self._settings_enabled:
+            return "light"
+        theme = str(self.settings.value("appearance/theme", "light")).strip().lower()
+        return theme if theme in {"light", "dark"} else "light"
+
+    def _set_theme(self, theme: str) -> None:
+        theme = str(theme).strip().lower()
+        if theme not in {"light", "dark"}:
+            theme = "light"
+        if theme == self._theme and getattr(self, "theme_selector", None) is not None:
+            return
+        self._theme = theme
+        if self._settings_enabled:
+            self.settings.setValue("appearance/theme", theme)
+        if hasattr(self, "theme_selector"):
+            self.theme_selector.blockSignals(True)
+            index = self.theme_selector.findData(theme)
+            if index >= 0:
+                self.theme_selector.setCurrentIndex(index)
+            self.theme_selector.blockSignals(False)
+        self._apply_style()
+        self.statusBar().showMessage(f"{theme.title()} appearance applied.", 3000)
 
     def _apply_operator_settings(self) -> None:
         if np.isclose(
@@ -1069,6 +1331,10 @@ class CampaignMainWindow(QMainWindow):
         self.worker.pi_reference_required.connect(self._offer_pi_reference)
         self.worker.calibration_point.connect(self._show_calibration_point)
         self.worker.calibration_finished.connect(self._calibration_finished)
+        self.worker.run_directory_changed.connect(self._set_run_directory)
+        self.worker.connection_attempt_finished.connect(
+            self._connection_attempt_finished
+        )
         self.worker_thread.started.connect(self.worker.publish_initial_state)
         self.worker_thread.start()
         self.settings_requested.emit(dict(self._operator_settings))
@@ -1103,7 +1369,8 @@ class CampaignMainWindow(QMainWindow):
         self.mode_selector.blockSignals(False)
         snapshot = self._latest_snapshot
         self.mode_selector.setEnabled(
-            snapshot is None or (not snapshot.busy and not snapshot.any_connected)
+            not self._connection_in_progress
+            and (snapshot is None or (not snapshot.busy and not snapshot.any_connected))
         )
 
     def _update_mode_visuals(self) -> None:
@@ -1111,8 +1378,7 @@ class CampaignMainWindow(QMainWindow):
         if hardware:
             self.setWindowTitle("Rotation + Intensity Campaign — HARDWARE: ALIGNMENT")
             self.mode_banner.setText(
-                "HARDWARE MODE — Ocean SR, rotation stages, and shutter-close are enabled; "
-                "PI/Ophir, guarded calibration, angle scans, and bounded target-power scans are enabled"
+                "HARDWARE MODE: physical devices enabled; guarded interlocks active"
             )
             self.mode_banner.setStyleSheet(
                 "background: #8a1717; color: white; padding: 9px; "
@@ -1124,8 +1390,8 @@ class CampaignMainWindow(QMainWindow):
         else:
             self.setWindowTitle("Rotation + Intensity Campaign — SIMULATION")
             self.mode_banner.setText(
-                "SIMULATION MODE — synthetic devices and spectra only; "
-                "physical hardware is not imported or connected"
+                "SIMULATION MODE: synthetic devices and spectra; "
+                "no physical hardware connected"
             )
             self.mode_banner.setStyleSheet(
                 "background: #17324d; color: white; padding: 9px; "
@@ -1142,8 +1408,8 @@ class CampaignMainWindow(QMainWindow):
                 if hardware
                 else "Delay between synthetic spectra."
             )
-            # Calibration remains simulation-only. Angle-controlled Scan Setup
-            # and Live Run are available in hardware mode.
+            # Calibration, Scan Setup, and Live Run all provide guarded
+            # hardware workflows as well as deterministic simulation paths.
             self.tabs.setTabEnabled(2, True)
             self.tabs.setTabEnabled(3, True)
             self.tabs.setTabEnabled(4, True)
@@ -1169,20 +1435,135 @@ class CampaignMainWindow(QMainWindow):
                     button.setEnabled(True)
                 for button in self.manual_probe_buttons + self.alignment_power_buttons:
                     button.setEnabled(False)
-                self.alignment_power_target.setEnabled(False)
-            else:
-                self.alignment_power_target.setEnabled(True)
+            self.alignment_power_target.setEnabled(True)
+            self.alignment_set_power_button.setToolTip(
+                "Uses the reviewed target-power branch, tolerance, iteration limit, "
+                "and optional calibration from Scan Setup."
+                if hardware
+                else "Sets the synthetic beam power."
+            )
+            self.alignment_power_interlock_note.setText(
+                "Hardware power operations close and verify the shutter before "
+                "probe or waveplate motion, open it only for power acquisition, "
+                "save raw traces, retract the probe, and finish shutter-closed."
+                if hardware
+                else "Power operations simulate shutter closure, probe insertion, "
+                "measurement/feedback, retraction, and final shutter closure."
+            )
             self.safe_button.setEnabled(True)
             self._ensure_button_text_visible()
 
+    def _rotation_target_combo(self) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("Sample mounted on rotation stage", "sample")
+        combo.addItem(
+            "Polarisation half-waveplate mounted on rotation stage",
+            "polarization_half_waveplate",
+        )
+        index = combo.findData(self._rotation_target_mode)
+        combo.setCurrentIndex(max(0, index))
+        combo.setToolTip(
+            "Select what is physically mounted on the second PRM1-Z8. "
+            "All entered angles remain physical mount angles in degrees."
+        )
+        return combo
+
+    def _set_rotation_target(self, target: str) -> None:
+        if target not in {"sample", "polarization_half_waveplate"}:
+            return
+        self._rotation_target_mode = target
+        for combo_name in ("rotation_target", "alignment_rotation_target"):
+            combo = getattr(self, combo_name, None)
+            if combo is None:
+                continue
+            index = combo.findData(target)
+            if index >= 0 and combo.currentIndex() != index:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+        if self._settings_enabled:
+            self.settings.setValue("scan/rotation_target", target)
+        self._apply_rotation_target_labels()
+        if hasattr(self, "preflight_text"):
+            self._update_preflight()
+
+    def _apply_rotation_target_labels(self) -> None:
+        hwp = self._rotation_target_mode == "polarization_half_waveplate"
+        short_name = "Polarisation HWP" if hwp else "Sample"
+        angle_name = "HWP mount angle" if hwp else "Sample angle"
+        if hasattr(self, "devices_sample_target_label"):
+            self.devices_sample_target_label.setText(f"{angle_name} target (deg)")
+            self.devices_sample_move.setText(f"Move {short_name}")
+            self.devices_home_sample.setText(f"Home {short_name}")
+        if hasattr(self, "alignment_sample_move"):
+            self.alignment_sample_move.setText(f"Move {short_name}")
+            self.alignment_home_sample.setText(f"Home {short_name}")
+        if hasattr(self, "scan_form"):
+            labels = {
+                self.sample_definition: f"{angle_name} definition",
+                self.sample_angles: f"{angle_name}s (deg)",
+                self.sample_range_start: f"{angle_name} range start",
+                self.sample_range_stop: f"{angle_name} range stop",
+                self.sample_range_step: f"{angle_name} range step",
+            }
+            for field, text in labels.items():
+                label = self.scan_form.labelForField(field)
+                if isinstance(label, QLabel):
+                    label.setText(text)
+        if hasattr(self, "_device_table_snapshots"):
+            self._device_table_snapshots.pop("sample", None)
+            if self._latest_snapshot is not None:
+                self._update_device_table(self._latest_snapshot)
+                self._update_alignment_hardware_status(self._latest_snapshot)
+        self._ensure_button_text_visible()
+
+    def _update_alignment_hardware_status(self, snapshot: GuiSnapshot) -> None:
+        waveplate_value = next(
+            (device.value for device in snapshot.devices if device.key == "waveplate"),
+            "--",
+        )
+        rotation_value = next(
+            (device.value for device in snapshot.devices if device.key == "sample"),
+            "--",
+        )
+        power_value = (
+            "--"
+            if snapshot.beam_power_mw is None
+            else f"{snapshot.beam_power_mw:.3f} mW"
+        )
+        rotation_name = (
+            "Polarisation HWP"
+            if self._rotation_target_mode == "polarization_half_waveplate"
+            else "Sample"
+        )
+        self.alignment_hardware_status.setText(
+            f"Power waveplate {waveplate_value}  |  {rotation_name} "
+            f"{rotation_value}  |  Measured power {power_value}"
+        )
+
     def _request_from_form(self) -> ScanRequest:
+        sample_angles = (
+            inclusive_range(
+                self.sample_range_start.value(),
+                self.sample_range_stop.value(),
+                self.sample_range_step.value(),
+            )
+            if self.sample_definition.currentData() == "range"
+            else parse_number_list(self.sample_angles.text(), field_name="Sample angles")
+        )
+        intensity_values = (
+            inclusive_range(
+                self.intensity_range_start.value(),
+                self.intensity_range_stop.value(),
+                self.intensity_range_step.value(),
+            )
+            if self.intensity_definition.currentData() == "range"
+            else parse_number_list(self.intensity_values.text(), field_name="Intensity values")
+        )
         return ScanRequest(
-            sample_angles_deg=parse_number_list(
-                self.sample_angles.text(), field_name="Sample angles"
-            ),
-            intensity_values=parse_number_list(
-                self.intensity_values.text(), field_name="Intensity values"
-            ),
+            sample_angles_deg=sample_angles,
+            intensity_values=intensity_values,
+            rotation_target=self._rotation_target_mode,
             intensity_mode=str(self.intensity_mode.currentData()),
             spectra_per_point=self.spectra_per_point.value(),
             integration_time_ms=self.integration_time.value(),
@@ -1202,7 +1583,51 @@ class CampaignMainWindow(QMainWindow):
                 if self.power_calibration.text().strip()
                 else None
             ),
+            driving_wavelength_nm=self.driving_wavelength.value(),
+            harmonic_windows=parse_harmonic_windows(self.harmonic_windows.text()),
         )
+
+    def _update_scan_definition_visibility(self) -> None:
+        sample_range = self.sample_definition.currentData() == "range"
+        self.scan_form.setRowVisible(self.sample_angles, not sample_range)
+        for widget in (
+            self.sample_range_start, self.sample_range_stop, self.sample_range_step
+        ):
+            self.scan_form.setRowVisible(widget, sample_range)
+        intensity_range = self.intensity_definition.currentData() == "range"
+        self.scan_form.setRowVisible(self.intensity_values, not intensity_range)
+        for widget in (
+            self.intensity_range_start,
+            self.intensity_range_stop,
+            self.intensity_range_step,
+        ):
+            self.scan_form.setRowVisible(widget, intensity_range)
+        self._update_preflight()
+
+    def _auto_fill_harmonics(self) -> None:
+        if not self.auto_harmonic_windows.isChecked():
+            self._update_preflight()
+            return
+        try:
+            orders = tuple(
+                int(value) for value in self.harmonic_orders.text().replace(",", " ").split()
+            )
+            if not orders or any(order < 1 for order in orders):
+                raise ValueError
+        except ValueError:
+            self.harmonic_windows.clear()
+            self._update_preflight()
+            return
+        driving = self.driving_wavelength.value()
+        half_width = self.harmonic_half_width.value()
+        definitions = []
+        for order in orders:
+            center = driving / order
+            definitions.append(
+                f"H{order}:{center - half_width:.6g}:{center + half_width:.6g}"
+            )
+        self.harmonic_windows.setText(", ".join(definitions))
+        self._update_preflight()
 
     def _calibration_request(self) -> CalibrationRequest:
         return CalibrationRequest(
@@ -1240,7 +1665,10 @@ class CampaignMainWindow(QMainWindow):
         )
         idle = bool(self._latest_snapshot and not self._latest_snapshot.busy)
         self.calibration_run_button.setEnabled(
-            connected and idle and not self._calibration_running
+            connected
+            and idle
+            and not self._calibration_running
+            and not self._connection_in_progress
         )
 
     def _start_calibration(self) -> None:
@@ -1267,6 +1695,7 @@ class CampaignMainWindow(QMainWindow):
         self._calibration_angles.clear()
         self._calibration_powers.clear()
         self.calibration_axes.clear()
+        self._style_axes(self.calibration_axes)
         self.calibration_run_button.setEnabled(False)
         self.calibration_requested.emit(request)
 
@@ -1282,6 +1711,7 @@ class CampaignMainWindow(QMainWindow):
         self.calibration_axes.set_xlabel("Waveplate angle (deg)")
         self.calibration_axes.set_ylabel("Power (mW)")
         self.calibration_axes.set_title(f"Calibration point {completed} of {total}")
+        self._style_axes(self.calibration_axes)
         self.calibration_canvas.draw_idle()
 
     def _calibration_finished(self, result) -> None:
@@ -1314,10 +1744,14 @@ class CampaignMainWindow(QMainWindow):
         hardware = self._mode == "hardware"
         unsupported_target = False
         safety_text = (
-            "Hardware scan will measure power once per waveplate block, save every "
-            "raw trace and spectrum immediately, and end with the shutter closed."
+            f"Hardware scan will move the second rotation stage carrying the "
+            f"{request.rotation_target_name}, measure power once per waveplate block, "
+            "save every raw trace and spectrum immediately, and end with the shutter "
+            "closed. Entered rotation angles are physical mount angles."
             if hardware
-            else "Simulation will end with the shutter closed and probe out."
+            else f"Simulation will model rotation of the {request.rotation_target_name} "
+            "and end with the shutter closed and probe out. Entered rotation angles "
+            "are physical mount angles."
         )
         if hardware and request.intensity_mode == "target_power_mw":
             safety_text += (
@@ -1346,11 +1780,23 @@ class CampaignMainWindow(QMainWindow):
             identities = "\nDevices: " + ", ".join(
                 f"{device.key}={device.identity}" for device in self._latest_snapshot.devices
             )
+        harmonic_summary = (
+            ", ".join(
+                f"{window.name} {window.wavelength_min_nm:g}-{window.wavelength_max_nm:g} nm"
+                for window in request.harmonic_windows
+            )
+            if request.harmonic_windows
+            else "none (total integrated spectrum quick-look)"
+        )
         self.preflight_text.setPlainText(
-            f"{len(request.sample_angles_deg)} sample angles\n"
+            f"Rotation target: {request.rotation_target_name}\n"
+            f"Physical stage: second PRM1-Z8 ('sample' stage key)\n"
+            f"{len(request.sample_angles_deg)} {request.rotation_angle_name}s\n"
             f"{len(request.intensity_values)} {coordinate}\n"
             f"{request.spectra_per_point} independent spectra per point\n"
             f"{request.total_spectra} spectra total\n\n"
+            f"Driving wavelength: {request.driving_wavelength_nm:g} nm\n"
+            f"Live harmonic windows: {harmonic_summary}\n\n"
             f"Estimated acquisition/settling time: at least "
             f"{(power_seconds + detector_seconds) / 60.0:.1f} min plus motion "
             f"({power_traces} maximum power traces).\n"
@@ -1363,7 +1809,11 @@ class CampaignMainWindow(QMainWindow):
         connected = bool(self._latest_snapshot and self._latest_snapshot.all_connected)
         idle = bool(self._latest_snapshot and not self._latest_snapshot.busy)
         self.run_button.setEnabled(
-            connected and idle and not self._scan_running and not unsupported_target
+            connected
+            and idle
+            and not self._scan_running
+            and not self._connection_in_progress
+            and not unsupported_target
         )
         if not connected:
             self.run_button.setToolTip("Connect all configured scan devices first.")
@@ -1374,6 +1824,10 @@ class CampaignMainWindow(QMainWindow):
         return not unsupported_target
 
     def _start_scan(self) -> None:
+        if self._scan_running:
+            self._log("Ignored duplicate scan-start request: a scan is already active.")
+            self.tabs.setCurrentWidget(self.live_run_page)
+            return
         if not self._update_preflight():
             return
         request = self._request_from_form()
@@ -1384,9 +1838,12 @@ class CampaignMainWindow(QMainWindow):
             answer = QMessageBox.warning(
                 self,
                 "Start hardware scan",
-                "This scan will move both rotation stages, insert and retract the PI "
+                f"This scan will move the power-control waveplate and the second "
+                f"rotation stage carrying the {request.rotation_target_name}. It will "
+                "insert and retract the PI "
                 "power probe, open the laser shutter for power and spectrum acquisition, "
-                "and save data incrementally. Confirm the requested angles are safe, the "
+                "and save data incrementally. Entered rotation values are physical mount "
+                "angles. Confirm the requested angles are safe, the "
                 "optical path is clear, and an operator is present.\n\nThe shutter will "
                 "begin and end closed. Start the scan?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -1395,22 +1852,77 @@ class CampaignMainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self._scan_running = True
+        self.rotation_target.setEnabled(False)
+        self.alignment_rotation_target.setEnabled(False)
+        self._scan_paused = False
+        self._active_scan_request = request
+        self._run_groups.clear()
+        self._last_run_measurement = None
+        self._dashboard_render_pending = False
+        self._dashboard_last_render_monotonic = 0.0
+        self._dashboard_render_count = 0
+        self._scan_connection_loss_reported = False
+        self._scan_failed_message = ""
+        self.live_harmonic_selector.clear()
+        self.live_harmonic_selector.addItem("Total integrated spectrum", None)
+        for window in request.harmonic_windows:
+            self.live_harmonic_selector.addItem(
+                f"{window.name} ({window.wavelength_min_nm:g}-{window.wavelength_max_nm:g} nm)",
+                window,
+            )
+        if request.harmonic_windows:
+            self.live_harmonic_selector.setCurrentIndex(1)
+        self._scan_started_monotonic = time.monotonic()
+        self._active_run_directory = ""
+        self.run_directory_label.clear()
+        self.run_warning.setText("No active warnings")
+        self.run_power_status.setText("Power: awaiting first measurement")
         self._quick_x.clear()
         self._quick_y.clear()
         self.progress.setRange(0, request.total_spectra)
         self.progress.setValue(0)
         self.run_status.setText(
-            "Hardware scan running" if self._mode == "hardware" else "Simulated scan running"
+            "SCAN ACTIVE - preparing hardware and moving the power probe"
+            if self._mode == "hardware"
+            else "SCAN ACTIVE - preparing simulation"
         )
+        self._set_scan_activity("starting")
         self.cancel_button.setEnabled(True)
+        self.pause_scan_button.setEnabled(True)
+        self.pause_scan_button.setText("Pause after current safe point")
         self.run_button.setEnabled(False)
+        self.run_button.setText("SCAN IN PROGRESS - START DISABLED")
+        self.run_button.setToolTip(
+            "A scan is already active. Use Pause or Stop on the Live Run tab."
+        )
         self.tabs.setCurrentWidget(self.live_run_page)
+        self.statusBar().showMessage(
+            "SCAN ACTIVE - hardware preparation may take time; do not press Start again."
+            if self._mode == "hardware"
+            else "SCAN ACTIVE - simulated acquisition is starting."
+        )
         self.scan_requested.emit(request)
 
     def _cancel_scan(self) -> None:
         self.worker.request_cancel()
         self.cancel_button.setEnabled(False)
-        self._log("Cancellation requested; waiting for the next safe point.")
+        self.pause_scan_button.setEnabled(False)
+        self._set_scan_activity("stopping")
+        self.run_status.setText("SCAN STOP REQUESTED - waiting for a safe point")
+        self._log("Stop requested; waiting for the next safe point.")
+
+    def _toggle_scan_pause(self) -> None:
+        self._scan_paused = not self._scan_paused
+        self.worker.request_pause(self._scan_paused)
+        self.pause_scan_button.setText(
+            "Resume scan" if self._scan_paused else "Pause after current safe point"
+        )
+        self.run_status.setText(
+            "Pause requested; waiting for safe point"
+            if self._scan_paused else "Scan resumed"
+        )
+        self._set_scan_activity("paused" if self._scan_paused else "running")
+        self._log("Scan pause requested." if self._scan_paused else "Scan resumed.")
 
     def _request_safe_state(self) -> None:
         self.worker.request_cancel()
@@ -1484,7 +1996,10 @@ class CampaignMainWindow(QMainWindow):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self._log("Operator approved PI FRF reference-switch workflow.")
-            self.reference_pi_requested.emit()
+            if self._begin_connection_attempt(
+                "Referencing PI stage, then resuming the connection pass"
+            ):
+                self.reference_pi_requested.emit()
         else:
             self._log("PI referencing was required/offered but not approved.")
 
@@ -1520,9 +2035,70 @@ class CampaignMainWindow(QMainWindow):
             self.move_stage_requested.emit(stage, position)
 
     def _alignment_set_power(self) -> None:
+        target = self.alignment_power_target.value()
+        if self._mode == "hardware":
+            if self._live_running:
+                self._show_error(
+                    "Stop live spectrum acquisition before setting hardware power."
+                )
+                return
+            connected = {
+                device.key
+                for device in (self._latest_snapshot.devices if self._latest_snapshot else ())
+                if device.connection is ConnectionState.CONNECTED
+            }
+            required = {"shutter", "power_meter_stage", "power_meter", "waveplate"}
+            missing = sorted(required - connected)
+            if missing:
+                self._show_error(
+                    "Manual target power requires connected: " + ", ".join(missing) + "."
+                )
+                return
+            try:
+                request = TargetPowerRequest(
+                    target_power_mw=target,
+                    waveplate_min_deg=self.target_branch_min.value(),
+                    waveplate_max_deg=self.target_branch_max.value(),
+                    monotonic_direction=str(self.target_direction.currentData()),
+                    target_tolerance_mw=self.target_tolerance.value(),
+                    target_maximum_iterations=self.target_iterations.value(),
+                    target_minimum_angle_step_deg=self.target_minimum_step.value(),
+                    power_calibration_path=(
+                        Path(self.power_calibration.text()).expanduser()
+                        if self.power_calibration.text().strip()
+                        else None
+                    ),
+                    output_directory=Path(self.output_directory.text()).expanduser(),
+                )
+            except ValueError as error:
+                self._show_error(f"Invalid target-power settings: {error}")
+                return
+            answer = QMessageBox.warning(
+                self,
+                "Set hardware target power",
+                f"This will run bounded waveplate feedback to reach {target:g} mW.\n\n"
+                f"Reviewed branch: {request.waveplate_min_deg:g} to "
+                f"{request.waveplate_max_deg:g} deg ({request.monotonic_direction}).\n"
+                f"Tolerance: +/-{request.target_tolerance_mw:g} mW.\n\n"
+                "The shutter will be closed for probe and waveplate motion, opened "
+                "only for each power trace, then closed with the probe retracted. "
+                "All feedback traces will be saved.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._log("Manual target-power operation cancelled by operator.")
+                return
+            self._log(
+                f"Operator approved manual {target:g} mW target on "
+                f"[{request.waveplate_min_deg:g}, {request.waveplate_max_deg:g}] deg branch."
+            )
+            self.alignment_set_power_button.setEnabled(False)
+            self.set_power_requested.emit(request)
+            return
+
         if not self._require_alignment_connection():
             return
-        target = self.alignment_power_target.value()
         if self._live_running:
             self.worker.queue_live_set_power(target)
         else:
@@ -1539,7 +2115,9 @@ class CampaignMainWindow(QMainWindow):
     def _require_alignment_connection(self) -> bool:
         if self._latest_snapshot and self._latest_snapshot.all_connected:
             return True
-        self._show_error("Connect the simulated hardware before alignment control.")
+        self._show_error(
+            "Connect the configured devices before using alignment control."
+        )
         return False
 
     def _start_live_view(self) -> None:
@@ -1641,61 +2219,100 @@ class CampaignMainWindow(QMainWindow):
         if not self.live_autoscale.isChecked() and y_limits is not None:
             self.alignment_axes.set_ylim(*y_limits)
         self.alignment_axes.grid(True, alpha=0.25)
+        self._style_axes(self.alignment_axes)
         self.alignment_canvas.draw_idle()
 
     def _show_snapshot(self, snapshot: GuiSnapshot) -> None:
         self._latest_snapshot = snapshot
         hardware = self._mode == "hardware"
+        if (
+            self._scan_running
+            and snapshot.busy
+            and not self._scan_paused
+            and not self._scan_connection_loss_reported
+        ):
+            self._set_scan_activity("running")
+        if (
+            self._scan_running
+            and not snapshot.all_connected
+            and not self._scan_connection_loss_reported
+        ):
+            lost = [
+                device.name
+                for device in snapshot.devices
+                if device.required
+                and device.connection is not ConnectionState.CONNECTED
+            ]
+            self._scan_connection_loss_reported = True
+            self._connection_fault = True
+            self.worker.request_cancel()
+            message = (
+                "Required device connection lost during scan: "
+                + (", ".join(lost) if lost else "unknown device")
+                + ". Stop requested; completed measurements remain saved. "
+                "Verify the shutter and apparatus are safe before reconnecting."
+            )
+            self._scan_failed_message = message
+            self.run_status.setText("CONNECTION LOST - stopping scan")
+            self.run_warning.setText(message)
+            self._set_scan_activity("fault")
+            self._log(f"ERROR: {message}")
         if snapshot.all_connected:
             self._ever_fully_connected = True
             self._connection_fault = False
         self.connection_badge.setText(
-            ("ALIGNMENT  CONNECTED" if hardware else "HARDWARE  CONNECTED")
+            ("HARDWARE  CONNECTED" if hardware else "SIMULATION  CONNECTED")
             if snapshot.all_connected
-            else ("ALIGNMENT  PARTIAL" if hardware else "HARDWARE  PARTIAL")
+            else ("HARDWARE  PARTIAL" if hardware else "SIMULATION  PARTIAL")
             if snapshot.any_connected
-            else ("ALIGNMENT  DISCONNECTED" if hardware else "HARDWARE  DISCONNECTED")
+            else ("HARDWARE  DISCONNECTED" if hardware else "SIMULATION  DISCONNECTED")
         )
-        self.shutter_badge.setText("SHUTTER  NOT ENABLED" if hardware else (
-            "SHUTTER  CLOSED"
+        device_states = {device.key: device for device in snapshot.devices}
+        shutter_device = device_states.get("shutter")
+        probe_device = device_states.get("power_meter_stage")
+        meter_device = device_states.get("power_meter")
+        shutter_connected = bool(
+            shutter_device
+            and shutter_device.connection is ConnectionState.CONNECTED
+        )
+        probe_connected = bool(
+            probe_device and probe_device.connection is ConnectionState.CONNECTED
+        )
+        meter_connected = bool(
+            meter_device and meter_device.connection is ConnectionState.CONNECTED
+        )
+        self.shutter_badge.setText(
+            "SHUTTER  NOT ENABLED"
+            if shutter_device is not None and not shutter_device.available
+            else "SHUTTER  DISCONNECTED"
+            if not shutter_connected
+            else "SHUTTER  CLOSED"
             if snapshot.shutter_closed is True
             else "SHUTTER  OPEN"
             if snapshot.shutter_closed is False
             else "SHUTTER  UNKNOWN"
-        ))
-        self.probe_badge.setText("PROBE  NOT ENABLED" if hardware else (
-            "PROBE  OUT"
+        )
+        self.probe_badge.setText(
+            "PROBE  NOT ENABLED"
+            if probe_device is not None and not probe_device.available
+            else "PROBE  DISCONNECTED"
+            if not probe_connected
+            else "PROBE  OUT"
             if snapshot.probe_out is True
             else "PROBE  NOT OUT"
             if snapshot.probe_out is False
             else "PROBE  UNKNOWN"
-        ))
-        self.power_badge.setText("POWER  NOT ENABLED" if hardware else (
-            "POWER  --"
+        )
+        self.power_badge.setText(
+            "POWER  NOT ENABLED"
+            if meter_device is not None and not meter_device.available
+            else "POWER  DISCONNECTED"
+            if not meter_connected
+            else "POWER  NOT MEASURED"
             if snapshot.beam_power_mw is None
             else f"POWER  {snapshot.beam_power_mw:.3f} mW"
-        ))
-        waveplate_value = next(
-            (
-                device.value
-                for device in snapshot.devices
-                if device.key == "waveplate"
-            ),
-            "--",
         )
-        sample_value = next(
-            (device.value for device in snapshot.devices if device.key == "sample"),
-            "--",
-        )
-        power_value = (
-            "--"
-            if snapshot.beam_power_mw is None
-            else f"{snapshot.beam_power_mw:.3f} mW"
-        )
-        self.alignment_hardware_status.setText(
-            f"Waveplate {waveplate_value}  |  Sample {sample_value}  |  "
-            f"Measured power {power_value}"
-        )
+        self._update_alignment_hardware_status(snapshot)
         connection_colour = (
             "safe"
             if snapshot.all_connected
@@ -1714,91 +2331,53 @@ class CampaignMainWindow(QMainWindow):
             self._set_connection_health("warning", "PARTIAL")
         else:
             self._set_connection_health("unknown", "NOT CONNECTED")
+        if self._connection_in_progress:
+            required = tuple(device for device in snapshot.devices if device.required)
+            connected_count = sum(
+                device.connection is ConnectionState.CONNECTED for device in required
+            )
+            total = len(required)
+            self.safety_status_group.setTitle(
+                "Persistent safety status - CONNECTION IN PROGRESS "
+                f"({connected_count}/{total})"
+            )
+            self.connection_badge.setText(f"CONNECTING  {connected_count}/{total}")
+            self._colour_badge(self.connection_badge, "warning")
+            self._set_connection_health("warning", "CONNECTING")
         self._colour_badge(
             self.shutter_badge,
-            "safe" if snapshot.shutter_closed is True else "danger",
+            "safe"
+            if shutter_connected and snapshot.shutter_closed is True
+            else "danger"
+            if shutter_connected and snapshot.shutter_closed is False
+            else "unknown",
         )
         self._colour_badge(
-            self.probe_badge, "safe" if snapshot.probe_out is True else "warning"
+            self.probe_badge,
+            "safe"
+            if probe_connected and snapshot.probe_out is True
+            else "warning"
+            if probe_connected
+            else "unknown",
         )
-        self.device_table.setRowCount(len(snapshot.devices))
-        for row, device in enumerate(snapshot.devices):
-            connection_text = (
-                device.connection.value.upper() if device.available else "DISABLED"
-            )
-            values = (
-                device.name,
-                connection_text,
-                device.value,
-                device.detail,
-            )
-            for column, value in enumerate(values):
-                actual_column = column if column < 2 else column + 1
-                item = QTableWidgetItem(value)
-                item.setToolTip(value)
-                if actual_column == 1:
-                    item.setForeground(
-                        QColor("#1b7f3a")
-                        if device.connection is ConnectionState.CONNECTED
-                        else QColor("#666666")
-                    )
-                self.device_table.setItem(row, actual_column, item)
-            serial_field = self.serial_fields.get(device.key)
-            if serial_field is None:
-                remembered = (
-                    str(
-                        self.settings.value(
-                            self._serial_setting_key(device.key),
-                            device.identity,
-                        )
-                    )
-                    if self._settings_enabled
-                    else device.identity
-                )
-                serial_field = QLineEdit(remembered)
-                serial_field.setMinimumWidth(150)
-                serial_field.setToolTip(
-                    "Device identity. Disconnect before changing the identity "
-                    "of a connected device."
-                )
-                serial_field.editingFinished.connect(
-                    lambda key=device.key, field=serial_field: self._remember_serial(
-                        key, field.text()
-                    )
-                )
-                self.serial_fields[device.key] = serial_field
-            self.device_table.setCellWidget(row, 2, serial_field)
-            serial_field.setEnabled(
-                device.available
-                and device.connection is not ConnectionState.CONNECTED
-                and not snapshot.busy
-            )
-            connect = QPushButton("Connect")
-            connect.setEnabled(
-                device.connection is not ConnectionState.CONNECTED
-                and device.available
-                and not snapshot.busy
-            )
-            connect.clicked.connect(
-                lambda checked=False, key=device.key: self._connect_one(key)
-            )
-            disconnect = QPushButton("Disconnect")
-            disconnect.setEnabled(
-                device.connection is ConnectionState.CONNECTED
-                and not snapshot.busy
-            )
-            disconnect.clicked.connect(
-                lambda checked=False, key=device.key: self._disconnect_one(key)
-            )
-            self.device_table.setCellWidget(row, 5, connect)
-            self.device_table.setCellWidget(row, 6, disconnect)
-            self.device_table.setRowHeight(row, 42)
-        self.connect_button.setEnabled(not snapshot.all_connected and not snapshot.busy)
-        self.disconnect_button.setEnabled(snapshot.any_connected and not snapshot.busy)
-        shutter_connected = any(
-            device.key == "shutter"
-            and device.connection is ConnectionState.CONNECTED
-            for device in snapshot.devices
+        self._colour_badge(
+            self.power_badge,
+            "safe"
+            if meter_connected and snapshot.beam_power_mw is not None
+            else "warning"
+            if meter_connected
+            else "unknown",
+        )
+        self._update_device_table(snapshot)
+        self.connect_button.setEnabled(
+            not snapshot.all_connected
+            and not snapshot.busy
+            and not self._connection_in_progress
+        )
+        self.disconnect_button.setEnabled(
+            snapshot.any_connected
+            and not snapshot.busy
+            and not self._connection_in_progress
         )
         self.close_shutter_button.setEnabled(shutter_connected)
         can_request_open = bool(shutter_connected and not snapshot.busy)
@@ -1813,11 +2392,7 @@ class CampaignMainWindow(QMainWindow):
             device.key for device in snapshot.devices
             if device.connection is ConnectionState.CONNECTED
         }
-        pi_connected = "power_meter_stage" in {
-            device.key
-            for device in snapshot.devices
-            if device.connection is ConnectionState.CONNECTED
-        }
+        pi_connected = "power_meter_stage" in connected_keys
         for button in (self.devices_pi_move, self.alignment_pi_move):
             button.setEnabled(pi_connected and not snapshot.busy)
         power_meter_connected = "power_meter" in connected_keys
@@ -1831,8 +2406,20 @@ class CampaignMainWindow(QMainWindow):
                 and not self._live_running
             )
         )
-        if hardware:
-            self.alignment_set_power_button.setEnabled(False)
+        self.alignment_set_power_button.setEnabled(
+            (not hardware and snapshot.all_connected)
+            or (
+                hardware
+                and {
+                    "shutter",
+                    "power_meter_stage",
+                    "power_meter",
+                    "waveplate",
+                }.issubset(connected_keys)
+                and not snapshot.busy
+                and not self._live_running
+            )
+        )
         for button in (self.devices_reference_pi, self.alignment_reference_pi):
             button.setEnabled(pi_connected and not snapshot.busy)
         for button in (self.devices_home_waveplate, self.alignment_home_waveplate):
@@ -1842,12 +2429,6 @@ class CampaignMainWindow(QMainWindow):
         if hardware:
             for button in self.manual_probe_buttons:
                 button.setEnabled(pi_connected and not snapshot.busy)
-        if hardware:
-            connected_keys = {
-                device.key
-                for device in snapshot.devices
-                if device.connection is ConnectionState.CONNECTED
-            }
             for button in (self.manual_stage_buttons[0], self.alignment_stage_buttons[0]):
                 button.setEnabled("waveplate" in connected_keys and not snapshot.busy)
             for button in (self.manual_stage_buttons[1], self.alignment_stage_buttons[1]):
@@ -1865,36 +2446,218 @@ class CampaignMainWindow(QMainWindow):
             )
         else:
             self.live_start_button.setToolTip("")
-        self._ensure_button_text_visible()
+        if self._connection_in_progress:
+            for button in self._connection_exclusive_buttons():
+                button.setEnabled(False)
         self._reset_mode_selector()
         self._update_preflight()
         self._update_calibration_summary()
 
+    def _update_device_table(self, snapshot: GuiSnapshot) -> None:
+        """Update changed table cells without replacing persistent widgets."""
+
+        keys = tuple(device.key for device in snapshot.devices)
+        if keys != self._device_table_keys:
+            self.device_table.clearContents()
+            self.device_table.setRowCount(len(snapshot.devices))
+            self._device_table_keys = keys
+            self._device_table_snapshots.clear()
+            self._device_connect_buttons.clear()
+            self._device_disconnect_buttons.clear()
+            self.serial_fields.clear()
+        for row, device in enumerate(snapshot.devices):
+            changed = self._device_table_snapshots.get(device.key) != device
+            connection_text = (
+                device.connection.value.upper() if device.available else "DISABLED"
+            )
+            display_name = (
+                "Polarisation HWP rotation stage"
+                if device.key == "sample"
+                and self._rotation_target_mode == "polarization_half_waveplate"
+                else device.name
+            )
+            values = (
+                display_name,
+                connection_text,
+                device.value,
+                device.detail,
+            )
+            if changed:
+                for column, value in enumerate(values):
+                    actual_column = column if column < 2 else column + 1
+                    item = self.device_table.item(row, actual_column)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        self.device_table.setItem(row, actual_column, item)
+                    item.setText(value)
+                    item.setToolTip(value)
+                    if actual_column == 1:
+                        connected_colour = (
+                            "#72d69a" if self._theme == "dark" else "#176c36"
+                        )
+                        item.setForeground(
+                            QColor(connected_colour)
+                            if device.connection is ConnectionState.CONNECTED
+                            else QColor(self._theme_colours()["muted"])
+                        )
+                self._device_table_snapshots[device.key] = device
+            serial_field = self.serial_fields.get(device.key)
+            if serial_field is None:
+                remembered = (
+                    str(
+                        self.settings.value(
+                            self._serial_setting_key(device.key),
+                            device.identity,
+                        )
+                    )
+                    if self._settings_enabled
+                    else device.identity
+                )
+                serial_field = QLineEdit(remembered)
+                serial_field.setMinimumWidth(150)
+                serial_field.setMinimumHeight(36)
+                serial_field.setToolTip(
+                    "Device identity. Disconnect before changing the identity "
+                    "of a connected device."
+                )
+                serial_field.editingFinished.connect(
+                    lambda key=device.key, field=serial_field: self._remember_serial(
+                        key, field.text()
+                    )
+                )
+                self.serial_fields[device.key] = serial_field
+                self.device_table.setCellWidget(row, 2, serial_field)
+            serial_field.setEnabled(
+                device.available
+                and device.connection is not ConnectionState.CONNECTED
+                and not snapshot.busy
+                and not self._connection_in_progress
+            )
+            connect = self._device_connect_buttons.get(device.key)
+            if connect is None:
+                connect = QPushButton("Connect")
+                connect.setMinimumSize(92, 36)
+                connect.clicked.connect(
+                    lambda checked=False, key=device.key: self._connect_one(key)
+                )
+                self._device_connect_buttons[device.key] = connect
+                self.device_table.setCellWidget(row, 5, connect)
+            connect.setEnabled(
+                device.connection is not ConnectionState.CONNECTED
+                and device.available
+                and not snapshot.busy
+                and not self._connection_in_progress
+            )
+            disconnect = self._device_disconnect_buttons.get(device.key)
+            if disconnect is None:
+                disconnect = QPushButton("Disconnect")
+                disconnect.setMinimumSize(104, 36)
+                disconnect.clicked.connect(
+                    lambda checked=False, key=device.key: self._disconnect_one(key)
+                )
+                self._device_disconnect_buttons[device.key] = disconnect
+                self.device_table.setCellWidget(row, 6, disconnect)
+            disconnect.setEnabled(
+                device.connection is ConnectionState.CONNECTED
+                and not snapshot.busy
+                and not self._connection_in_progress
+            )
+            self.device_table.setRowHeight(row, 42)
+
     def _connect_one(self, key: str) -> None:
+        if not self._begin_connection_attempt(f"Connecting {key}"):
+            return
         serial = self.serial_fields[key].text().strip()
         self._remember_serial(key, serial)
         self._log(f"Requesting connection to {key} using identity {serial!r}.")
         self.connect_device_requested.emit(key, serial)
 
     def _connect_all_from_fields(self) -> None:
+        if self._connection_in_progress:
+            self._log("Ignored duplicate connection request: a connection pass is active.")
+            return
         serials = {
             key: field.text().strip()
             for key, field in self.serial_fields.items()
         }
         empty = sorted(key for key, value in serials.items() if not value)
         if empty:
-            self._show_error(
-                "Serial/identity fields must not be empty: " + ", ".join(empty)
+            self._log(
+                "Connection pass will skip empty serial/identity fields and continue: "
+                + ", ".join(empty)
             )
-            return
         for key, serial in serials.items():
             self._remember_serial(key, serial)
+        if not self._begin_connection_attempt("Connecting configured devices"):
+            return
         self._log(
-            "Requesting connection to the Ocean SR."
+            "Requesting best-effort connection to every configured hardware device."
             if self._mode == "hardware"
             else "Requesting connection to all configured simulated devices."
         )
         self.connect_configuration_requested.emit(serials)
+
+    def _begin_connection_attempt(self, description: str) -> bool:
+        if self._connection_in_progress:
+            self._log("Ignored duplicate connection request: a connection pass is active.")
+            return False
+        self._connection_in_progress = True
+        self._connection_activity_text = str(description)
+        self.safety_status_group.setTitle(
+            "Persistent safety status - CONNECTION IN PROGRESS"
+        )
+        self.connection_badge.setText("CONNECTING...")
+        self._colour_badge(self.connection_badge, "warning")
+        self._set_connection_health("warning", "CONNECTING")
+        self.connect_button.setEnabled(False)
+        self.disconnect_button.setEnabled(False)
+        for button in self._device_connect_buttons.values():
+            button.setEnabled(False)
+        for button in self._device_disconnect_buttons.values():
+            button.setEnabled(False)
+        for button in self._connection_exclusive_buttons():
+            button.setEnabled(False)
+        self.mode_selector.setEnabled(False)
+        self.statusBar().showMessage(
+            f"{description} - successful devices will remain connected."
+        )
+        return True
+
+    def _connection_exclusive_buttons(self) -> tuple[QPushButton, ...]:
+        """Actions that must not queue behind an active connection pass."""
+
+        return (
+            *self.manual_hardware_buttons,
+            *self.alignment_hardware_buttons,
+            self.devices_open_shutter,
+            self.alignment_open_shutter,
+            self.devices_pi_move,
+            self.alignment_pi_move,
+            self.devices_reference_pi,
+            self.alignment_reference_pi,
+            self.devices_home_waveplate,
+            self.alignment_home_waveplate,
+            self.devices_home_sample,
+            self.alignment_home_sample,
+            self.live_start_button,
+            self.calibration_run_button,
+            self.run_button,
+        )
+
+    def _connection_attempt_finished(self, report: object) -> None:
+        self._connection_in_progress = False
+        self._connection_activity_text = ""
+        self.safety_status_group.setTitle("Persistent safety status")
+        if self._latest_snapshot is not None:
+            self._show_snapshot(self._latest_snapshot)
+        failures = tuple(report.get("failures", ())) if isinstance(report, dict) else ()
+        if failures:
+            self.statusBar().showMessage(
+                "Connection pass finished with unavailable devices; successful "
+                "connections were retained. See the Devices log."
+            )
+        else:
+            self.statusBar().showMessage("Connection pass completed.", 5000)
 
     def _disconnect_one(self, key: str) -> None:
         self._log(f"Requesting safe disconnect of {key}.")
@@ -1917,38 +2680,294 @@ class CampaignMainWindow(QMainWindow):
     def _serial_setting_key(self, key: str) -> str:
         return f"devices/{self._mode}/{key}/serial"
 
-    def _show_measurement(self, measurement, completed: int, total: int) -> None:
+    def _show_measurement(
+        self, measurement, completed: int, total: int, *, record: bool = True
+    ) -> None:
         spectrum = measurement.spectrum
+        series_value = (
+            float(measurement.target_power_mw)
+            if measurement.target_power_mw is not None
+            else float(measurement.waveplate_angle_deg)
+        )
+        group_key = (series_value, float(measurement.sample_angle_deg))
+        group = self._run_groups.setdefault(group_key, [])
+        if record:
+            group.append(measurement)
+            self._last_run_measurement = measurement
+            self._last_run_completed = completed
+            self._last_run_total = total
+            self.progress.setValue(completed)
+            self.run_status.setText(f"Spectrum {completed} of {total}")
+            self._schedule_dashboard_render()
+            return
+        replicate_intensities = np.asarray(
+            [item.spectrum.intensities for item in group], dtype=float
+        )
+        mean_spectrum = np.mean(replicate_intensities, axis=0)
+        spectrum_sem = (
+            np.std(replicate_intensities, axis=0, ddof=1) / math.sqrt(len(group))
+            if len(group) > 1
+            else np.zeros_like(mean_spectrum)
+        )
         self.spectrum_axes.clear()
-        self.spectrum_axes.plot(spectrum.wavelengths, spectrum.intensities, lw=1.2)
+        self.spectrum_axes.plot(
+            spectrum.wavelengths, mean_spectrum, lw=1.4,
+            label=f"Mean of {len(group)} replicate(s)",
+        )
+        if len(group) > 1:
+            self.spectrum_axes.fill_between(
+                spectrum.wavelengths,
+                mean_spectrum - spectrum_sem,
+                mean_spectrum + spectrum_sem,
+                alpha=0.22,
+                label="SEM",
+            )
         self.spectrum_axes.set_title(
-            f"Latest: sample {measurement.sample_angle_deg:.2f} deg, "
-            f"power {measurement.power_mw:.3f} mW"
+            f"{(self._active_scan_request.rotation_angle_label if self._active_scan_request else 'Sample angle')} "
+            f"{measurement.sample_angle_deg:.2f} deg; "
+            + (
+                f"target {measurement.target_power_mw:.3f} mW, "
+                if measurement.target_power_mw is not None else ""
+            )
+            + (
+                f"achieved {measurement.power_mw:.3f} mW"
+                if measurement.power_mw is not None else "power unavailable"
+            )
         )
         self.spectrum_axes.set_xlabel("Wavelength (nm)")
         self.spectrum_axes.set_ylabel("Counts")
-        self._quick_x.append(measurement.sample_angle_deg)
-        self._quick_y.append(float(measurement.integrated_counts or 0.0))
+        self.spectrum_axes.legend(loc="best")
+        self._style_axes(self.spectrum_axes)
         self.scan_axes.clear()
-        self.scan_axes.scatter(self._quick_x, self._quick_y, s=18)
-        self.scan_axes.set_title("Completed scan points (quick look)")
-        self.scan_axes.set_xlabel("Sample angle (deg)")
-        self.scan_axes.set_ylabel("Integrated counts")
+        series_values = sorted({key[0] for key in self._run_groups})
+        request = self._active_scan_request
+        rotation_scan = bool(request and len(request.sample_angles_deg) > 1)
+        if rotation_scan:
+            for value in series_values:
+                points = sorted(
+                    (key, items)
+                    for key, items in self._run_groups.items()
+                    if key[0] == value
+                )
+                self._plot_quick_series(
+                    points,
+                    x_from=lambda key, items: key[1],
+                    label=(
+                        f"Target {value:g} mW"
+                        if measurement.target_power_mw is not None
+                        else f"Waveplate {value:g} deg"
+                    ),
+                )
+            self.scan_axes.set_title(
+                f"Live {request.rotation_target_name} rotation scan: "
+                "mean signal +/- SEM"
+            )
+            self.scan_axes.set_xlabel(
+                f"{request.rotation_angle_label} (deg)"
+            )
+        elif request and len(request.intensity_values) > 1:
+            points = sorted(self._run_groups.items())
+            self._plot_quick_series(
+                points,
+                x_from=lambda key, items: (
+                    float(np.mean([item.power_mw for item in items if item.power_mw is not None]))
+                    if request.intensity_mode == "target_power_mw"
+                    and any(item.power_mw is not None for item in items)
+                    else key[0]
+                ),
+                label=self.live_harmonic_selector.currentText(),
+            )
+            self.scan_axes.set_title("Live excitation scan: mean signal +/- SEM")
+            self.scan_axes.set_xlabel(
+                "Achieved power (mW)"
+                if request.intensity_mode == "target_power_mw"
+                else "Waveplate angle (deg)"
+            )
+        else:
+            items = next(iter(self._run_groups.values()))
+            running = [self._quick_signal(item) for item in items]
+            self.scan_axes.plot(range(1, len(running) + 1), running, marker="o")
+            self.scan_axes.set_title("Replicate signal convergence")
+            self.scan_axes.set_xlabel("Replicate number")
+        self.scan_axes.set_ylabel(self._quick_signal_label())
+        if series_values and request and (
+            len(request.sample_angles_deg) > 1 or len(request.intensity_values) > 1
+        ):
+            self.scan_axes.legend(loc="best")
+        self._style_axes(self.scan_axes)
         self.canvas.draw_idle()
         self.progress.setValue(completed)
-        self.run_status.setText(f"Spectrum {completed} of {total}")
+        if self._scan_running:
+            self.run_status.setText(f"Spectrum {completed} of {total}")
+        elapsed = max(0.0, time.monotonic() - (self._scan_started_monotonic or time.monotonic()))
+        remaining = elapsed / completed * (total - completed) if completed else 0.0
+        self.run_timing.setText(
+            f"Elapsed {self._format_duration(elapsed)} | "
+            f"Estimated remaining {self._format_duration(remaining)}"
+        )
+        power_text = "Power unavailable"
+        if measurement.power_mw is not None:
+            power_text = f"Achieved {measurement.power_mw:.4g} mW"
+            if measurement.target_power_mw is not None:
+                power_text = f"Target {measurement.target_power_mw:.4g} mW | " + power_text
+            if measurement.power_std_mw is not None:
+                power_text += f" | population STD {measurement.power_std_mw:.3g} mW"
+            power_text += (
+                f" | samples {measurement.power_valid_sample_count}/"
+                f"{measurement.power_total_sample_count}"
+            )
+        self.run_power_status.setText(power_text)
+        warnings = []
+        if measurement.saturated:
+            warnings.append("DETECTOR SATURATION")
+        if measurement.power_measurement_status not in {None, "measured"}:
+            warnings.append(
+                f"Power status: {measurement.power_measurement_status}"
+            )
+        if measurement.power_measurement_error:
+            warnings.append(str(measurement.power_measurement_error))
+        self.run_warning.setText(" | ".join(warnings) if warnings else "No active warnings")
+
+    def _redraw_selected_harmonic(self) -> None:
+        if self._last_run_measurement is not None and self._run_groups:
+            self._dashboard_render_pending = False
+            self._dashboard_last_render_monotonic = time.monotonic()
+            self._show_measurement(
+                self._last_run_measurement,
+                self._last_run_completed,
+                self._last_run_total,
+                record=False,
+            )
+
+    def _schedule_dashboard_render(self) -> None:
+        """Coalesce fast acquisitions into a responsive plot refresh."""
+
+        if self._dashboard_render_pending:
+            return
+        elapsed = time.monotonic() - self._dashboard_last_render_monotonic
+        delay_ms = max(
+            0,
+            int(round((self._dashboard_refresh_interval_s - elapsed) * 1000.0)),
+        )
+        self._dashboard_render_pending = True
+        QTimer.singleShot(delay_ms, self._render_pending_dashboard)
+
+    def _render_pending_dashboard(self) -> None:
+        self._dashboard_render_pending = False
+        if self._last_run_measurement is None or not self._run_groups:
+            return
+        self._dashboard_last_render_monotonic = time.monotonic()
+        self._dashboard_render_count += 1
+        self._show_measurement(
+            self._last_run_measurement,
+            self._last_run_completed,
+            self._last_run_total,
+            record=False,
+        )
+
+    def _plot_quick_series(self, points, *, x_from, label: str) -> None:
+        x_values, means, errors = [], [], []
+        for key, items in points:
+            values = np.asarray([self._quick_signal(item) for item in items], dtype=float)
+            x_values.append(float(x_from(key, items)))
+            means.append(float(np.mean(values)))
+            errors.append(
+                float(np.std(values, ddof=1) / math.sqrt(values.size))
+                if values.size > 1 else 0.0
+            )
+        self.scan_axes.errorbar(
+            x_values, means, yerr=errors, marker="o", capsize=3, label=label
+        )
+
+    def _quick_signal(self, measurement) -> float:
+        window = self.live_harmonic_selector.currentData()
+        if window is None:
+            return float(measurement.integrated_counts or 0.0)
+        wavelengths = np.asarray(measurement.spectrum.wavelengths, dtype=float)
+        intensities = np.asarray(measurement.spectrum.intensities, dtype=float)
+        mask = (
+            (wavelengths >= window.wavelength_min_nm)
+            & (wavelengths <= window.wavelength_max_nm)
+        )
+        if np.count_nonzero(mask) < 2:
+            return float("nan")
+        return measurement.spectrum.integrate(
+            window.wavelength_min_nm,
+            window.wavelength_max_nm,
+        )
+
+    def _quick_signal_label(self) -> str:
+        window = self.live_harmonic_selector.currentData()
+        return (
+            "Integrated counts"
+            if window is None
+            else f"{window.name} raw integral (counts nm)"
+        )
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _set_run_directory(self, path: str) -> None:
+        self._active_run_directory = str(path)
+        self.run_directory_label.setText(self._active_run_directory)
+
+    def _copy_run_status(self) -> None:
+        QApplication.clipboard().setText(
+            "\n".join(
+                (
+                    self.run_status.text(),
+                    self.run_timing.text(),
+                    self.run_power_status.text(),
+                    self.run_warning.text(),
+                    f"Directory: {self._active_run_directory or 'not created'}",
+                )
+            )
+        )
+        self.statusBar().showMessage("Run status copied to clipboard.", 3000)
 
     def _scan_finished(self, completed: bool) -> None:
+        self._render_pending_dashboard()
         self._scan_running = False
+        self.rotation_target.setEnabled(True)
+        self.alignment_rotation_target.setEnabled(True)
+        self._scan_paused = False
         self.cancel_button.setEnabled(False)
-        self.run_status.setText(
-            ("Hardware scan complete" if self._mode == "hardware" else "Simulation complete")
-            if completed
-            else "Scan cancelled safely"
+        self.pause_scan_button.setEnabled(False)
+        if completed:
+            self.run_status.setText(
+                "Hardware scan complete"
+                if self._mode == "hardware"
+                else "Simulation complete"
+            )
+            self._set_scan_activity("complete")
+        elif self._scan_failed_message:
+            self.run_status.setText("SCAN STOPPED AFTER ERROR - VERIFY SAFE STATE")
+            self.run_warning.setText(self._scan_failed_message)
+            self._set_scan_activity("fault")
+        else:
+            self.run_status.setText("Scan cancelled safely")
+            self._set_scan_activity("stopped")
+        self.run_button.setText(
+            "Run guarded hardware scan"
+            if self._mode == "hardware"
+            else "Run simulated scan"
         )
+        if self._latest_snapshot is not None:
+            self._show_snapshot(self._latest_snapshot)
         self._update_preflight()
 
     def _show_error(self, message: str) -> None:
+        if self._scan_running and str(message).lower().startswith("scan failed:"):
+            self._scan_failed_message = str(message)
+            self._set_scan_activity("fault")
+            self.run_warning.setText(
+                f"{message} Completed measurements remain saved. Verify the "
+                "shutter and apparatus are safe before continuing."
+            )
         if any(
             word in message.lower()
             for word in ("connect", "hardware", "move verification")
@@ -1999,10 +3018,14 @@ class CampaignMainWindow(QMainWindow):
         lines = [f"{key}: {value}" for key, value in summary.items()]
         if dataset.measurements:
             latest = dataset.measurements[-1]
+            rotation = latest.metadata.get("rotation", {})
+            angle_name = str(rotation.get("angle_name", "sample angle"))
+            target_name = str(rotation.get("target_name", "sample"))
             lines.extend(
                 [
                     "",
-                    f"Last sample angle: {latest.sample_angle_deg:g} deg",
+                    f"Rotation target: {target_name}",
+                    f"Last {angle_name}: {latest.sample_angle_deg:g} deg",
                     f"Last waveplate angle: {latest.waveplate_angle_deg:g} deg",
                     f"Last achieved power: {latest.power_mw}",
                 ]
@@ -2033,6 +3056,12 @@ class CampaignMainWindow(QMainWindow):
     def _configure_form(form: QFormLayout) -> None:
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(8)
 
     @staticmethod
     def _optional_limits(
@@ -2054,25 +3083,80 @@ class CampaignMainWindow(QMainWindow):
     @staticmethod
     def _section_font() -> QFont:
         font = QApplication.font()
-        font.setPointSize(font.pointSize() + 3)
-        font.setBold(True)
+        font.setPointSize(12)
+        font.setWeight(QFont.Weight.DemiBold)
         return font
 
-    @staticmethod
-    def _colour_badge(label: QLabel, state: str) -> None:
-        colours = {
-            "safe": ("#d9f3df", "#155b2b"),
-            "warning": ("#fff0c2", "#755400"),
-            "danger": ("#ffd9d9", "#8a1717"),
-            "unknown": ("#e8e8e8", "#555555"),
+    def _theme_colours(self) -> dict[str, str]:
+        if self._theme == "dark":
+            return {
+                "window": "#202428",
+                "panel": "#292e34",
+                "panel_alt": "#343a42",
+                "input": "#181c20",
+                "border": "#535c66",
+                "text": "#f2f4f6",
+                "muted": "#bdc5cd",
+                "disabled": "#9099a2",
+                "disabled_bg": "#2d3238",
+                "selection": "#2f81f7",
+                "button": "#383f47",
+                "button_hover": "#454d56",
+                "button_pressed": "#30363d",
+                "notice_bg": "#4a3a11",
+                "notice_text": "#ffe9a6",
+                "plot": "#11161c",
+                "plot_grid": "#65717d",
+            }
+        return {
+            "window": "#f3f5f7",
+            "panel": "#ffffff",
+            "panel_alt": "#eef1f4",
+            "input": "#ffffff",
+            "border": "#c8d0d8",
+            "text": "#17202a",
+            "muted": "#52606d",
+            "disabled": "#828d98",
+            "disabled_bg": "#edf0f2",
+            "selection": "#0b66c3",
+            "button": "#f6f8fa",
+            "button_hover": "#e9eef3",
+            "button_pressed": "#dde4ea",
+            "notice_bg": "#fff0c2",
+            "notice_text": "#5e4700",
+            "plot": "#ffffff",
+            "plot_grid": "#9aa5b1",
         }
-        background, foreground = colours[state]
+
+    def _badge_colours(self, state: str) -> tuple[str, str]:
+        if self._theme == "dark":
+            colours = {
+                "safe": ("#173d27", "#a7e8b8"),
+                "warning": ("#49380e", "#ffe08a"),
+                "danger": ("#4a2020", "#ffb3b3"),
+                "unknown": ("#343a42", "#d5dbe1"),
+            }
+        else:
+            colours = {
+                "safe": ("#d9f3df", "#155b2b"),
+                "warning": ("#fff0c2", "#755400"),
+                "danger": ("#ffd9d9", "#8a1717"),
+                "unknown": ("#e8e8e8", "#555555"),
+            }
+        return colours[state]
+
+    def _colour_badge(self, label: QLabel, state: str) -> None:
+        background, foreground = self._badge_colours(state)
+        label.setProperty("badgeState", state)
+        border = self._theme_colours()["border"]
         label.setStyleSheet(
             f"background: {background}; color: {foreground}; padding: 8px; "
+            f"border: 1px solid {border}; "
             "border-radius: 4px; font-weight: 700;"
         )
 
     def _set_connection_health(self, state: str, text: str) -> None:
+        self._connection_health_state = state
         colours = {
             "safe": "#1f9d55",
             "warning": "#e0a100",
@@ -2080,8 +3164,9 @@ class CampaignMainWindow(QMainWindow):
             "unknown": "#8a929a",
         }
         colour = colours[state]
+        ring = self._theme_colours()["panel"]
         self.connection_light.setStyleSheet(
-            f"background: {colour}; border: 2px solid #ffffff; "
+            f"background: {colour}; border: 2px solid {ring}; "
             "border-radius: 10px;"
         )
         self.connection_health_text.setText(text)
@@ -2089,24 +3174,375 @@ class CampaignMainWindow(QMainWindow):
             f"color: {colour}; font-weight: 800;"
         )
 
-    def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #f4f6f8; }
-            QGroupBox { font-weight: 600; border: 1px solid #c7ccd1;
-                        border-radius: 6px; margin-top: 10px; padding-top: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
-            QPushButton { padding: 7px 12px; }
-            #safeButton { background: #b42318; color: white; font-weight: 700; }
-            #runButton { background: #1769aa; color: white; font-weight: 700;
-                         padding: 12px; }
-            #notice { background: #fff0c2; color: #5e4700; padding: 12px;
-                      border-radius: 4px; }
-            """
+    def _set_scan_activity(self, state: str) -> None:
+        self._scan_activity_state = state
+        presentations = {
+            "idle": ("SCAN  IDLE", "unknown"),
+            "starting": ("SCAN  STARTING", "warning"),
+            "running": ("SCAN  ACTIVE", "active"),
+            "paused": ("SCAN  PAUSED", "warning"),
+            "stopping": ("SCAN  STOPPING", "warning"),
+            "complete": ("SCAN  COMPLETE", "safe"),
+            "stopped": ("SCAN  STOPPED", "unknown"),
+            "fault": ("SCAN  ERROR", "danger"),
+        }
+        text, presentation = presentations[state]
+        if presentation == "active":
+            background, foreground = self._theme_colours()["selection"], "#ffffff"
+        else:
+            background, foreground = self._badge_colours(presentation)
+        border = self._theme_colours()["border"]
+        self.scan_activity_badge.setText(text)
+        self.scan_activity_badge.setStyleSheet(
+            f"background: {background}; color: {foreground}; padding: 8px; "
+            f"border: 1px solid {border}; "
+            "border-radius: 4px; font-weight: 800;"
         )
 
+    def _apply_style(self) -> None:
+        colours = self._theme_colours()
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(colours["window"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(colours["text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(colours["input"]))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(colours["panel_alt"]))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(colours["panel"]))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(colours["text"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(colours["text"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(colours["button"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(colours["text"]))
+        palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(colours["selection"]))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.Link, QColor(colours["selection"]))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(colours["disabled"]))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            QColor(colours["disabled"]),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText,
+            QColor(colours["disabled"]),
+        )
+        application = QApplication.instance()
+        if application is not None:
+            application.setStyle("Fusion")
+            application.setFont(self.font())
+            application.setPalette(palette)
+        self.setPalette(palette)
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                background: {colours["window"]};
+                color: {colours["text"]};
+            }}
+            QMainWindow {{
+                background: {colours["window"]};
+            }}
+            QLabel, QCheckBox {{
+                background: transparent;
+            }}
+            QWidget#topBar {{
+                background: {colours["panel"]};
+                border: 1px solid {colours["border"]};
+                border-radius: 6px;
+            }}
+            QGroupBox {{
+                background: {colours["panel"]};
+                color: {colours["text"]};
+                font-weight: 600;
+                border: 1px solid {colours["border"]};
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 5px;
+                background: {colours["panel"]};
+                color: {colours["text"]};
+                font-weight: 700;
+            }}
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+                background: {colours["input"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+                padding: 6px 9px;
+                selection-background-color: {colours["selection"]};
+                selection-color: #ffffff;
+            }}
+            QTextEdit, QPlainTextEdit {{
+                background: {colours["input"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+                padding: 8px;
+                selection-background-color: {colours["selection"]};
+                selection-color: #ffffff;
+            }}
+            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+            QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+                border: 2px solid {colours["selection"]};
+            }}
+            QComboBox {{
+                padding-right: 30px;
+            }}
+            QSpinBox, QDoubleSpinBox {{
+                padding-right: 24px;
+            }}
+            QComboBox::drop-down {{
+                width: 26px;
+                border: 0;
+                border-left: 1px solid {colours["border"]};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {colours["input"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                selection-background-color: {colours["selection"]};
+                selection-color: #ffffff;
+                padding: 4px;
+            }}
+            QCheckBox {{
+                spacing: 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+            }}
+            QTableWidget {{
+                background: {colours["input"]};
+                alternate-background-color: {colours["panel_alt"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+                gridline-color: {colours["border"]};
+                selection-background-color: {colours["selection"]};
+                selection-color: #ffffff;
+            }}
+            QTableWidget::item {{
+                padding: 6px;
+            }}
+            QHeaderView::section {{
+                background: {colours["panel_alt"]};
+                color: {colours["text"]};
+                border: 0;
+                border-right: 1px solid {colours["border"]};
+                border-bottom: 1px solid {colours["border"]};
+                padding: 7px 8px;
+                font-weight: 700;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {colours["border"]};
+                background: {colours["window"]};
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background: {colours["panel_alt"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                border-bottom: 2px solid {colours["border"]};
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 2px;
+                min-height: 22px;
+                padding: 8px 12px;
+            }}
+            QTabBar::tab:hover {{
+                background: {colours["button_hover"]};
+            }}
+            QTabBar::tab:selected {{
+                background: {colours["panel"]};
+                border-bottom-color: {colours["selection"]};
+                font-weight: 700;
+            }}
+            QPushButton {{
+                background: {colours["button"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+                padding: 7px 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: {colours["button_hover"]};
+                border-color: {colours["selection"]};
+            }}
+            QPushButton:pressed {{
+                background: {colours["button_pressed"]};
+            }}
+            QPushButton:focus {{
+                border: 2px solid {colours["selection"]};
+            }}
+            QPushButton:disabled, QLineEdit:disabled, QComboBox:disabled,
+            QSpinBox:disabled, QDoubleSpinBox:disabled,
+            QTextEdit:disabled, QPlainTextEdit:disabled {{
+                color: {colours["disabled"]};
+                background: {colours["disabled_bg"]};
+                border-color: {colours["border"]};
+            }}
+            QScrollArea {{
+                border: 0;
+                background: {colours["window"]};
+            }}
+            QSplitter, QProgressBar {{
+                background: {colours["window"]};
+                color: {colours["text"]};
+            }}
+            QSplitter::handle {{
+                background: {colours["panel_alt"]};
+            }}
+            QProgressBar {{
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+                text-align: center;
+                min-height: 24px;
+            }}
+            QProgressBar::chunk {{
+                background: {colours["selection"]};
+            }}
+            QStatusBar {{
+                background: {colours["panel_alt"]};
+                color: {colours["text"]};
+                border-top: 1px solid {colours["border"]};
+            }}
+            QStatusBar::item {{
+                border: 0;
+            }}
+            QMenuBar, QMenu {{
+                background: {colours["panel"]};
+                color: {colours["text"]};
+            }}
+            QMenuBar::item:selected, QMenu::item:selected {{
+                background: {colours["selection"]};
+                color: #ffffff;
+            }}
+            QToolTip {{
+                background: {colours["panel"]};
+                color: {colours["text"]};
+                border: 1px solid {colours["border"]};
+                padding: 6px;
+            }}
+            QScrollBar:vertical {{
+                background: {colours["panel_alt"]};
+                width: 14px;
+                margin: 0;
+            }}
+            QScrollBar:horizontal {{
+                background: {colours["panel_alt"]};
+                height: 14px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+                background: {colours["border"]};
+                border-radius: 6px;
+                min-height: 28px;
+                min-width: 28px;
+            }}
+            QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+                background: {colours["muted"]};
+            }}
+            QScrollBar::add-line, QScrollBar::sub-line {{
+                width: 0;
+                height: 0;
+            }}
+            QScrollBar::add-page, QScrollBar::sub-page {{
+                background: transparent;
+            }}
+            #safeButton {{
+                background: #b42318;
+                color: white;
+                font-weight: 700;
+                border-color: #8f1c13;
+            }}
+            #safeButton:hover {{
+                background: #c92d22;
+            }}
+            #safeButton:pressed {{
+                background: #8f1c13;
+            }}
+            #runButton {{
+                background: {colours["selection"]};
+                color: white;
+                font-weight: 700;
+                padding: 12px;
+                border-color: {colours["selection"]};
+            }}
+            #runButton:hover {{
+                background: #1473d2;
+            }}
+            #notice {{
+                background: {colours["notice_bg"]};
+                color: {colours["notice_text"]};
+                padding: 12px;
+                border: 1px solid {colours["border"]};
+                border-radius: 4px;
+            }}
+            """
+        )
+        for badge_name in (
+            "connection_badge",
+            "shutter_badge",
+            "probe_badge",
+            "power_badge",
+        ):
+            badge = getattr(self, badge_name, None)
+            state = badge.property("badgeState") if badge is not None else None
+            if state:
+                self._colour_badge(badge, str(state))
+        if hasattr(self, "device_table"):
+            for row in range(self.device_table.rowCount()):
+                item = self.device_table.item(row, 1)
+                if item is None:
+                    continue
+                if item.text() == "CONNECTED":
+                    colour = "#72d69a" if self._theme == "dark" else "#176c36"
+                else:
+                    colour = colours["muted"]
+                item.setForeground(QColor(colour))
+        if hasattr(self, "_connection_health_state"):
+            self._set_connection_health(
+                self._connection_health_state,
+                self.connection_health_text.text(),
+            )
+        if hasattr(self, "_scan_activity_state"):
+            self._set_scan_activity(self._scan_activity_state)
+        self._apply_plot_theme()
+
+    def _apply_plot_theme(self) -> None:
+        for figure_name in ("alignment_figure", "calibration_figure", "figure"):
+            figure = getattr(self, figure_name, None)
+            if figure is None:
+                continue
+            figure.set_facecolor(self._theme_colours()["panel"])
+            for axes in figure.axes:
+                self._style_axes(axes)
+            canvas = getattr(self, figure_name.replace("figure", "canvas"), None)
+            if canvas is not None:
+                canvas.draw_idle()
+
+    def _style_axes(self, axes) -> None:
+        colours = self._theme_colours()
+        axes.set_facecolor(colours["plot"])
+        axes.title.set_color(colours["text"])
+        axes.xaxis.label.set_color(colours["text"])
+        axes.yaxis.label.set_color(colours["text"])
+        axes.tick_params(colors=colours["muted"])
+        for spine in axes.spines.values():
+            spine.set_color(colours["border"])
+        legend = axes.get_legend()
+        if legend is not None:
+            legend.get_frame().set_facecolor(colours["panel"])
+            legend.get_frame().set_edgecolor(colours["border"])
+            for text in legend.get_texts():
+                text.set_color(colours["text"])
+
     def _ensure_button_text_visible(self) -> None:
-        """Reserve the full label width under Windows display scaling."""
+        """Reserve readable control dimensions under Windows display scaling."""
 
         for button in self.findChildren(QPushButton):
             button.setSizePolicy(
@@ -2114,20 +3550,41 @@ class CampaignMainWindow(QMainWindow):
                 QSizePolicy.Policy.Fixed,
             )
             button.setMinimumWidth(max(button.minimumWidth(), button.sizeHint().width() + 18))
-            button.setMinimumHeight(max(button.minimumHeight(), 34))
+            button.setMinimumHeight(max(button.minimumHeight(), 36))
         for field in self.findChildren(QLineEdit):
-            field.setMinimumHeight(max(field.minimumHeight(), field.sizeHint().height()))
+            field.setMinimumHeight(max(field.minimumHeight(), 36))
         for box in self.findChildren(QSpinBox):
-            box.setMinimumHeight(max(box.minimumHeight(), box.sizeHint().height()))
+            box.setMinimumSize(max(box.minimumWidth(), 120), 36)
         for box in self.findChildren(QDoubleSpinBox):
-            box.setMinimumHeight(max(box.minimumHeight(), box.sizeHint().height()))
+            box.setMinimumSize(max(box.minimumWidth(), 120), 36)
         for combo in self.findChildren(QComboBox):
-            combo.setMinimumHeight(max(combo.minimumHeight(), combo.sizeHint().height()))
+            combo.setMinimumHeight(max(combo.minimumHeight(), 36))
 
     def audit_visible_layout(self) -> list[str]:
         """Return actionable geometry problems for the currently visible tab."""
 
         issues: list[str] = []
+        safety_widgets = (
+            self.connection_badge,
+            self.shutter_badge,
+            self.probe_badge,
+            self.power_badge,
+            self.scan_activity_badge,
+            self.close_shutter_button,
+            self.safe_button,
+            self.connection_health_panel,
+        )
+        for index, first in enumerate(safety_widgets):
+            if not first.isVisible():
+                continue
+            first_rectangle = first.geometry()
+            for second in safety_widgets[index + 1:]:
+                if second.isVisible() and first_rectangle.intersects(second.geometry()):
+                    issues.append(
+                        "Persistent safety controls overlap: "
+                        f"{first.objectName() or first.__class__.__name__} and "
+                        f"{second.objectName() or second.__class__.__name__}."
+                    )
         for button in self.findChildren(QPushButton):
             if button.isVisible() and button.width() < button.sizeHint().width():
                 issues.append(f"Button text clipped: {button.text()!r}")

@@ -101,6 +101,8 @@ class SpectrometerConfig:
 
     integration_time_ms: float = 10.0
 
+    backend: str = "pyseabreeze"
+
     name: str = "Ocean SR"
 
 
@@ -140,6 +142,7 @@ SHUTTER_TIMING = ShutterTimingConfig()
 SPECTROMETER = SpectrometerConfig(
     serial="SR600415",
     integration_time_ms=10.0,
+    backend="pyseabreeze",
 )
 
 #

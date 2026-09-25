@@ -9,13 +9,25 @@ A campaign GUI is implemented under `gui/` and launched by `run_gui.py`. It
 starts in Hardware mode but performs no automatic connection. Hardware mode owns the Ocean SR, waveplate
 and sample stages, and shutter; drivers are imported lazily on an
 operator-requested connection. Selecting Hardware mode alone connects nothing.
-Connect-all establishes and verifies shutter-closed before connecting stages.
+Connect-all attempts the shutter first, then independently attempts every other
+configured device. Missing hardware no longer rolls back successful handles or
+prevents later devices from being tried. Establishing a stage handle does not
+move it; every later motion still requires a connected, verified-closed shutter.
+The persistent header immediately displays connection progress and the device
+log records each failure plus the retained connected-device count.
 Manual absolute stage moves close and verify the shutter before motion and are
 routed through the worker alongside shutter-close. A move is reported complete
 only when finite live readback is within the operator-configured tolerance
 (default 0.05 degrees); otherwise
 the GUI reports requested versus observed position and marks an operation error.
 The interface includes a persistent safety/status header and device dashboard.
+Its shutter, probe, and power badges derive from each live device connection
+and state: `NOT ENABLED` means omitted from configuration, while connected open
+hardware is explicitly shown as `SHUTTER OPEN`.
+The header uses a two-row responsive layout: connection, shutter, probe, power,
+and scan-activity badges share an equal-width status row, while shutter-close,
+safe-state, and aggregate connection-health controls occupy a separate action
+row. The fullscreen widget audit checks these controls for geometric overlap.
 Open/close shutter controls are duplicated on Devices and Alignment. Open is
 normally probe-out interlocked; when stopped, the operator can explicitly
 override an unknown/not-out state through a laser-risk confirmation. Overrides
@@ -52,8 +64,8 @@ acquires every requested sample-angle replicate through the live probe-out
 guard. Backgrounds and completed measurements are saved incrementally in one
 format-5 experiment directory. Cancellation is checked before intensity blocks
 and spectra; cleanup leaves the shutter closed. Closed-loop target-power scans
-remain blocked until the GUI exposes reviewed monotonic-branch and feedback
-settings. Hardware-free fake-device coverage verifies endpoint bracketing,
+and manual Alignment targeting use the reviewed monotonic-branch and feedback
+settings exposed on Scan Setup. Hardware-free fake-device coverage verifies endpoint bracketing,
 convergence, persistent insertion, final retraction, format-5 trace/attempt
 links, and target/achieved power reload.
 
@@ -67,7 +79,9 @@ real laser-on calibration has yet been run.
 The complete Calibration workspace is inside a minimum-size-aware vertical
 scroll area. Its live plot retains a 420-pixel minimum height, and the scroll
 range includes the full canvas and bottom margin under fullscreen/high-DPI
-layouts.
+layouts. Mouse-wheel and trackpad scrolling over embedded Calibration and Live
+Run Matplotlib canvases is forwarded to the enclosing page, matching the
+existing guarded behaviour over numeric and single-line input fields.
 
 Scan Setup now uses a minimum-size-aware outer scroll area for both form and
 preflight columns. Long labels and the output-path row retain usable widths,
@@ -75,6 +89,68 @@ the preflight report is independently scrollable, and the run action remains
 reachable at the bottom under fullscreen/high-DPI layouts. Wheel events over
 single-line inputs continue to scroll the containing page without changing
 field values.
+
+Live Run now aggregates emitted independent replicates without changing the
+saved raw measurements. It displays mean spectra with SEM bands and per-series
+integrated-count means with SEM error bars, plus requested/achieved power,
+population STD, valid/total sample counts, saturation and power-quality
+warnings, elapsed/remaining-time estimates, the active experiment directory,
+and a copyable run-status summary. Simulation GUI coverage exercises a complete
+two-replicate dashboard run and verifies the reported save path.
+The complete Live Run dashboard now sits inside a minimum-size-aware scroll
+area. Its two-panel Matplotlib canvas retains at least 880 by 820 pixels and
+uses constrained layout, while the event log retains a usable width. This keeps
+both plots readable without sacrificing access to status controls under
+fullscreen, reduced-height, or high-DPI layouts.
+
+During a scan, dashboard redraws are coalesced to at most four per second so a
+fast acquisition cannot flood the Qt event queue with Matplotlib layout work.
+Every emitted measurement is still retained, grouped, and saved; only the
+visual refresh is throttled, and a final refresh is forced when the scan ends.
+The safety header and Devices table continue to follow worker snapshots during
+a scan. The table retains its existing editors and buttons, changing only rows
+whose displayed device state changed instead of reconstructing every widget.
+
+Hardware scans explicitly verify every required connection at safe operation
+boundaries. A lost connection aborts the scan, preserves already-flushed
+measurements, closes and verifies the shutter when that connection remains
+available, and makes best-effort stop/halt requests after an error. If the
+shutter itself is unavailable, the GUI reports that its physical state cannot
+be verified and requires the operator to verify the apparatus before
+reconnecting. A connection-loss snapshot also requests cancellation directly
+and turns the run status into a prominent fault rather than describing the
+result as an ordinary safe cancellation.
+
+Scan Setup now supports inclusive range entry for sample and intensity
+coordinates, driving wavelength, auto-generated/editable harmonic windows, and
+preflight reporting of those definitions. Resolved coordinates and harmonic
+windows are persisted in run configuration.
+
+Scan Setup and Alignment now share a remembered second-stage payload selection:
+sample or polarisation half-waveplate. It changes manual controls, preflight,
+hardware confirmation, Devices-table role, logs, and live plot labels. Motion
+still uses the configured second PRM1-Z8 and entered values remain physical
+mount angles; the software does not apply an implicit 2x HWP conversion. The
+selection, physical stage key, and angle semantics are saved in run config and
+per-measurement metadata while retaining `sample_angle_deg` compatibility.
+
+The Live Run quick-look dynamically selects rotation, excitation, or replicate
+convergence presentation based on which coordinates vary. A selectable
+harmonic window replaces total-spectrum integration when requested, while raw
+spectra remain unchanged. Pause/resume and Stop are thread-safe and are honored
+only at shutter-closed safe points; hardware target feedback pauses with the
+probe inserted but the shutter verified closed.
+
+Accepting a scan immediately selects Live Run, sets a persistent coloured scan
+activity badge, changes and disables the Scan Setup start button, and posts a
+starting/preparation message before the worker begins probe motion. Duplicate
+start calls are refused independently of button state. The badge distinguishes
+starting, active, paused, stopping, completed/stopped, and error states.
+
+Trapezoidal spectral integration is compatible with both NumPy 1.x (`trapz`)
+and NumPy 2.x (`trapezoid`). The shared helper is used by `Spectrum`, offline
+harmonic analysis, and GUI harmonic quick looks, preventing GUI callback
+failures on the campaign virtual environment.
 
 The Alignment / Live Spectrum tab continuously streams a deterministic
 synthetic Ocean SR spectrum. It supports integration time, internal averages,
@@ -105,8 +181,25 @@ selected tab, and per-device simulated serial/identity text are remembered.
 The Devices tab now has an aggregate connection-health lamp, per-device serial
 fields and connect/disconnect buttons, connect-all and safe-disconnect actions,
 and a dedicated connection/error log. A loss after complete connection turns
-the lamp red; reconnecting every device restores green. These controls remain
-simulation-only and do not alter `hardware/config.py`.
+the lamp red; reconnecting every device restores green. The controls are
+available in Simulation and Hardware modes; remembered GUI identities do not
+alter `hardware/config.py`.
+
+While idle, the hardware-owning worker performs a one-second read-only health
+poll. Rotation position, shutter state, PI identity/status, Ocean SR USB access,
+and Ophir controller/sensor identity are queried rather than trusting cached
+handle flags. Specifically, Ocean presence uses USB re-enumeration and Ophir
+presence uses `ScanUSB`, since cached wavelength and identity reads can survive
+a physical unplug. Polling is suspended while any operation owns the backend. A
+failed query releases only the stale software handle without motion, publishes
+the changed snapshot, turns aggregate health red, and logs the device-specific
+failure once. The health comparison cache follows every event-driven snapshot,
+so a return to a previously seen disconnected state is still published. Both
+the persistent connection display and each affected Devices-table row update.
+Reconnection remains an explicit operator action. Manual Alignment target-power
+control reuses the reviewed Scan Setup branch and feedback settings, requires an
+operator confirmation, persists every attempt/raw trace, and ends shutter-closed
+with the probe retracted.
 
 The complete Devices tab is contained in one vertical scroll area. The device
 table retains its independent row scrolling, while the outer scroll area keeps
@@ -124,6 +217,10 @@ The backend and persistence path are covered by
 `python -m tests.test_gui_simulation`; fake-backed Ocean SR ownership is covered
 by `python -m tests.test_gui_spectrometer_backend`. PySide6 is isolated in
 `requirements-gui.txt`. Ocean SR live view has been operator-reported working;
+backend selection and fallback are covered without hardware by
+`python -m tests.test_ocean_sr_health`. Both installed SeaBreeze backend modules
+were import-initialized successfully on the current Windows/Python 3.12 host;
+no USB enumeration or spectrometer acquisition was performed for that check.
 the newly added stage/shutter GUI paths have not been hardware-validated. The
 The Ophir one-shot workflow has been operator-reported working. Hardware GUI
 angle scans are fake-tested but have not yet been physically commissioned;
@@ -139,7 +236,7 @@ error bars (sample standard deviation divided by the square root of the number
 of spectra). This path has been verified only with hardware-free tests; no live
 spectrometer or scan was run for this change.
 
-Last reviewed: 27 August 2026
+Last reviewed: 25 September 2026
 
 Update this file whenever a feature is verified, abandoned, or materially redesigned.
 
@@ -166,7 +263,9 @@ Update this file whenever a feature is verified, abandoned, or materially redesi
 
 - Ocean Insight Ocean SR acquisition works.
 - Spectrometer serial: `SR600415`.
-- seabreeze with the `pyseabreeze` backend is used.
+- `pyseabreeze` remains the configured and hardware-verified backend for
+  SR600415. The driver also supports explicit `cseabreeze`/`seabreeze` and an
+  `auto` fallback for models requiring the native implementation.
 - The spectrometer driver returns a `Spectrum`.
 
 ### Hardware manager

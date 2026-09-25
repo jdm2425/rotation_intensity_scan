@@ -19,7 +19,13 @@ from data.data_writer import DataWriter
 from data.power_measurement import PowerMeasurementAttempt
 from experiments.power_targeting import TargetPowerController
 from experiments.waveplate_calibration import MalusLawCalibration
-from gui.state import ConnectionState, DeviceSnapshot, GuiSnapshot, LiveViewRequest
+from gui.state import (
+    ConnectionState,
+    DeviceSnapshot,
+    GuiSnapshot,
+    LiveViewRequest,
+    TargetPowerRequest,
+)
 from hardware.config import POWER_METER, POWER_METER_STAGE, SAMPLE_STAGE, SHUTTER, SPECTROMETER, WAVEPLATE
 from hardware.devices.spectrometer.spectrum import Spectrum
 
@@ -38,6 +44,7 @@ class SpectrometerProtocol(Protocol):
     def set_integration_time(self, integration_time_ms: float) -> None: ...
 
     def acquire(self, *, averages: int = 1) -> Spectrum: ...
+    def check_connection(self) -> bool: ...
 
 
 class RotationStageProtocol(Protocol):
@@ -48,6 +55,7 @@ class RotationStageProtocol(Protocol):
     def disconnect(self) -> None: ...
     def move_to(self, angle_deg: float) -> None: ...
     def stop(self) -> None: ...
+    def check_connection(self) -> bool: ...
 
 
 class ShutterProtocol(Protocol):
@@ -58,6 +66,7 @@ class ShutterProtocol(Protocol):
     def disconnect(self) -> None: ...
     def close(self) -> None: ...
     def open(self) -> None: ...
+    def check_connection(self) -> bool: ...
 
 
 class PIStageProtocol(Protocol):
@@ -71,6 +80,7 @@ class PIStageProtocol(Protocol):
     def halt(self) -> None: ...
     def refresh_snapshot(self): ...
     def reference_to_switch(self, **kwargs): ...
+    def check_connection(self) -> bool: ...
 
 
 class PowerMeterProtocol(Protocol):
@@ -79,6 +89,7 @@ class PowerMeterProtocol(Protocol):
     def disconnect(self) -> None: ...
     def acquire_trace(self, duration_s: float, *, poll_interval_s: float): ...
     def info(self) -> dict: ...
+    def check_connection(self) -> bool: ...
 
 
 class PIReferenceRequired(RuntimeError):
@@ -148,6 +159,7 @@ class SpectrometerCampaignBackend:
         self._background: Spectrum | None = None
         self._background_enabled = False
         self._motion_cancel = threading.Event()
+        self._scan_pause = threading.Event()
 
     @staticmethod
     def _make_ocean_sr(serial: str, integration_time_ms: float):
@@ -158,6 +170,7 @@ class SpectrometerCampaignBackend:
         return OceanSR(
             serial=serial,
             integration_time_ms=integration_time_ms,
+            backend=SPECTROMETER.backend,
         )
 
     @staticmethod
@@ -269,26 +282,118 @@ class SpectrometerCampaignBackend:
             simulation=False,
         )
 
-    def connect_all(self, publish, serials: dict[str, str] | None = None) -> None:
+    def poll_idle_health(self) -> tuple[GuiSnapshot, tuple[str, ...]]:
+        """Read-only live checks for connected devices while no operation owns them."""
+
+        if self.busy:
+            return self.snapshot(), ()
+        losses = []
+        for key in (
+            "shutter",
+            "power_meter_stage",
+            "waveplate",
+            "sample",
+            "power_meter",
+            "spectrometer",
+        ):
+            device = self._device_handle(key)
+            if device is None:
+                continue
+            try:
+                if not bool(device.connected):
+                    raise RuntimeError("driver reports disconnected")
+                checker = getattr(device, "check_connection", None)
+                if callable(checker):
+                    if checker() is not True:
+                        raise RuntimeError("read-only health query did not return success")
+                elif key in self._stages:
+                    _ = float(device.position)
+                elif key == "shutter":
+                    _ = bool(device.is_closed)
+                elif key == "power_meter_stage":
+                    device.refresh_snapshot()
+                elif key == "spectrometer":
+                    _ = float(device.integration_time_ms)
+                elif key == "power_meter":
+                    device.info()
+            except Exception as error:
+                losses.append(f"{key}: {error}")
+                self._release_lost_device(key)
+        return self.snapshot(), tuple(losses)
+
+    def _device_handle(self, key: str):
+        if key == "spectrometer":
+            return self._spectrometer
+        if key == "shutter":
+            return self._shutter
+        if key == "power_meter_stage":
+            return self._pi_stage
+        if key == "power_meter":
+            return self._power_meter
+        return self._stages.get(key)
+
+    def _release_lost_device(self, key: str) -> None:
+        """Release a stale handle without issuing any motion command."""
+
+        device = self._device_handle(key)
+        if device is not None:
+            try:
+                device.disconnect()
+            except Exception:
+                pass
+        if key == "spectrometer":
+            self._spectrometer = None
+        elif key == "shutter":
+            self._shutter = None
+        elif key == "power_meter_stage":
+            self._pi_stage = None
+        elif key == "power_meter":
+            self._power_meter = None
+            self._beam_power_mw = None
+        else:
+            self._stages.pop(key, None)
+
+    def connect_all(self, publish, serials: dict[str, str] | None = None) -> dict:
+        """Attempt every configured device and retain every successful connection."""
+
         requested = serials or {}
-        connected_here = []
-        try:
-            for key in ("shutter", "power_meter_stage", "power_meter", "waveplate", "sample", "spectrometer"):
-                if not self._device_connected(key):
-                    self.connect_device(key, requested.get(key, self.serials[key]), publish)
-                    connected_here.append(key)
-        except PIReferenceRequired:
-            # Keep the PI controller and already established shutter interlock
-            # connected so the approved recovery workflow can proceed safely.
-            raise
-        except Exception:
-            for key in reversed(connected_here):
-                try:
-                    self._disconnect_device(key)
-                except Exception:
-                    pass
-            publish(self.snapshot())
-            raise
+        connected = []
+        already_connected = []
+        failures = []
+        pi_reference_message = None
+        for key in (
+            "shutter",
+            "power_meter_stage",
+            "power_meter",
+            "waveplate",
+            "sample",
+            "spectrometer",
+        ):
+            if self._device_connected(key):
+                already_connected.append(key)
+                continue
+            try:
+                self.connect_device(
+                    key,
+                    requested.get(key, self.serials[key]),
+                    publish,
+                )
+            except PIReferenceRequired as error:
+                pi_reference_message = str(error)
+                failures.append((key, str(error)))
+            except Exception as error:
+                failures.append((key, str(error)))
+            else:
+                connected.append(key)
+        snapshot = self.snapshot()
+        publish(snapshot)
+        return {
+            "connected": tuple(connected),
+            "already_connected": tuple(already_connected),
+            "failures": tuple(failures),
+            "pi_reference_required": pi_reference_message,
+            "snapshot": snapshot,
+        }
 
     def connect_device(self, key: str, serial: str, publish) -> None:
         if key not in self.serials:
@@ -451,6 +556,7 @@ class SpectrometerCampaignBackend:
             raise RuntimeError("PI stage is not connected.")
         self.close_shutter(lambda snapshot: None)
         self._motion_cancel.clear()
+        self._scan_pause.clear()
         self._pi_stage.reference_to_switch(
             cancel_requested=self._motion_cancel.is_set
         )
@@ -470,8 +576,101 @@ class SpectrometerCampaignBackend:
         self._pi_stage.move_absolute_mm(float(position_mm))
         publish(self.snapshot())
 
-    def set_power(self, target_power_mw: float, publish) -> None:
-        raise RuntimeError("Power control is disabled in alignment hardware mode.")
+    def set_power(
+        self,
+        request: TargetPowerRequest,
+        publish,
+        *,
+        publish_log=None,
+    ) -> float:
+        """Run one persisted, bounded manual target-power feedback operation."""
+
+        if not isinstance(request, TargetPowerRequest):
+            raise TypeError(
+                "Hardware target power requires reviewed branch and feedback settings."
+            )
+        required = ("shutter", "power_meter_stage", "power_meter", "waveplate")
+        missing = [key for key in required if not self._device_connected(key)]
+        if missing:
+            raise RuntimeError(
+                "Manual target power requires connected: " + ", ".join(missing) + "."
+            )
+        if self.busy:
+            raise RuntimeError("Another hardware operation is active.")
+
+        log = publish_log or (lambda message: None)
+        self.busy = True
+        self._motion_cancel.clear()
+        publish(self.snapshot())
+        primary_error = None
+        try:
+            run_name = "manual_target_power_" + datetime.now().strftime("%H%M%S_%f")
+            with DataWriter(
+                output_directory=request.output_directory,
+                experiment_name=run_name,
+            ) as writer:
+                writer.save_metadata(
+                    config={
+                        "operation": "manual_target_power",
+                        "target_power_mw": request.target_power_mw,
+                        "waveplate_min_deg": request.waveplate_min_deg,
+                        "waveplate_max_deg": request.waveplate_max_deg,
+                        "monotonic_direction": request.monotonic_direction,
+                        "target_tolerance_mw": request.target_tolerance_mw,
+                        "target_maximum_iterations": request.target_maximum_iterations,
+                        "target_minimum_angle_step_deg": request.target_minimum_angle_step_deg,
+                        "power_calibration_path": request.power_calibration_path,
+                    },
+                    hardware_info={
+                        device.key: {
+                            "identity": device.identity,
+                            "connected": device.connection is ConnectionState.CONNECTED,
+                        }
+                        for device in self.snapshot().devices
+                    },
+                    extra_metadata={"source": "campaign_gui_alignment"},
+                )
+                log(f"Saving manual target-power traces to {writer.experiment_directory}")
+                waveplate_angle, _, trace = self._target_power_block(
+                    request=request,
+                    target_power_mw=request.target_power_mw,
+                    writer=writer,
+                    publish_snapshot=publish,
+                    publish_log=log,
+                )
+                achieved = trace.statistics.arithmetic_mean_power_mw
+                if achieved is None:
+                    raise RuntimeError("Final feedback trace has no accepted mean power.")
+                self._beam_power_mw = float(achieved)
+                log(
+                    f"Manual target power complete: requested {request.target_power_mw:g} "
+                    f"mW, achieved {achieved:.6g} mW at {waveplate_angle:g} deg."
+                )
+                return self._beam_power_mw
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            cleanup_error = None
+            try:
+                if self._shutter and self._shutter.connected:
+                    self._shutter.close()
+                    if not self._shutter.is_closed:
+                        raise RuntimeError("final shutter closure was not verified")
+                else:
+                    raise RuntimeError(
+                        "shutter connection is unavailable; physical state is unknown"
+                    )
+            except Exception as error:
+                cleanup_error = error
+            finally:
+                self.busy = False
+                publish(self.snapshot())
+            if cleanup_error is not None:
+                warning = f"MANUAL POWER SAFETY WARNING: {cleanup_error}."
+                log(warning)
+                if primary_error is None:
+                    raise RuntimeError(warning) from cleanup_error
 
     def measure_power(self, publish) -> float:
         if not self._shutter or not self._shutter.connected:
@@ -533,6 +732,7 @@ class SpectrometerCampaignBackend:
         publish_snapshot,
         publish_measurement,
         publish_log,
+        publish_run_directory=None,
     ) -> bool:
         """Run one guarded, angle-controlled scan using the connected devices."""
 
@@ -551,6 +751,7 @@ class SpectrometerCampaignBackend:
         assert self._shutter is not None
         self.busy = True
         self._motion_cancel.clear()
+        self._scan_pause.clear()
         completed = 0
         publish_snapshot(self.snapshot())
         acquisition = Acquisition(
@@ -558,16 +759,24 @@ class SpectrometerCampaignBackend:
             shutter=self._shutter,
             before_open=self._require_probe_out_for_acquisition,
         )
+        scan_failed = False
         try:
+            self._require_scan_connections("before scan configuration")
             spectrometer.set_integration_time(float(request.integration_time_ms))
             with DataWriter(
                 output_directory=request.output_directory,
                 experiment_name=request.experiment_name,
             ) as writer:
+                if publish_run_directory is not None:
+                    publish_run_directory(str(writer.experiment_directory.resolve()))
                 writer.save_metadata(
                     config={
                         "simulation": False,
                         "sample_angles_deg": list(request.sample_angles_deg),
+                        "rotation_target": request.rotation_target,
+                        "rotation_target_name": request.rotation_target_name,
+                        "rotation_stage_key": "sample",
+                        "rotation_angle_semantics": "physical_mount_angle_deg",
                         "waveplate_angles_deg": list(request.intensity_values),
                         "intensity_mode": request.intensity_mode,
                         "spectra_per_point": request.spectra_per_point,
@@ -585,6 +794,15 @@ class SpectrometerCampaignBackend:
                         "target_maximum_iterations": request.target_maximum_iterations,
                         "target_minimum_angle_step_deg": request.target_minimum_angle_step_deg,
                         "power_calibration_path": request.power_calibration_path,
+                        "driving_wavelength_nm": request.driving_wavelength_nm,
+                        "harmonic_windows": [
+                            {
+                                "name": window.name,
+                                "wavelength_min_nm": window.wavelength_min_nm,
+                                "wavelength_max_nm": window.wavelength_max_nm,
+                            }
+                            for window in request.harmonic_windows
+                        ],
                     },
                     hardware_info={
                         device.key: {
@@ -602,6 +820,7 @@ class SpectrometerCampaignBackend:
                 )
                 publish_log(f"Saving hardware scan to {writer.experiment_directory}")
                 if request.acquire_background:
+                    self._require_scan_connections("before the pre-scan background")
                     background = acquisition.acquire_dark(averages=request.averages)
                     self._validate_spectrum(background)
                     writer.save_background(
@@ -612,9 +831,11 @@ class SpectrometerCampaignBackend:
                     publish_log("Shutter-closed pre-scan background saved.")
 
                 for intensity_value in request.intensity_values:
+                    self._require_scan_connections("before the next intensity block")
                     if self._motion_cancel.is_set():
                         publish_log("Cancellation accepted before the next intensity block.")
                         return False
+                    self._wait_for_scan_resume(publish_log)
                     target_power_mw = None
                     if request.intensity_mode == "target_power_mw":
                         target_power_mw = float(intensity_value)
@@ -641,8 +862,16 @@ class SpectrometerCampaignBackend:
                     publish_snapshot(self.snapshot())
 
                     for sample_angle in request.sample_angles_deg:
+                        self._require_scan_connections("before sample-stage motion")
+                        publish_log(
+                            f"Moving {request.rotation_target_name} mount to "
+                            f"{sample_angle:g} deg on the second PRM1-Z8."
+                        )
                         self.move_stage("sample", sample_angle, publish_snapshot)
                         for replicate_index in range(1, request.spectra_per_point + 1):
+                            self._require_scan_connections("before spectrum acquisition")
+                            self.close_shutter(lambda snapshot: None)
+                            self._wait_for_scan_resume(publish_log)
                             if self._motion_cancel.is_set():
                                 publish_log(
                                     "Cancellation accepted before the next spectrum; "
@@ -668,6 +897,14 @@ class SpectrometerCampaignBackend:
                                 power_trace=trace,
                                 spectrum=spectrum,
                                 metadata={
+                                    "rotation": {
+                                        "target": request.rotation_target,
+                                        "target_name": request.rotation_target_name,
+                                        "stage_key": "sample",
+                                        "angle_name": request.rotation_angle_name,
+                                        "angle_semantics": "physical_mount_angle_deg",
+                                        "physical_mount_angle_deg": float(sample_angle),
+                                    },
                                     "replicate": {
                                         "index": replicate_index,
                                         "count": request.spectra_per_point,
@@ -680,13 +917,43 @@ class SpectrometerCampaignBackend:
                             completed += 1
                             publish_measurement(measurement, completed, request.total_spectra)
                             publish_snapshot(self.snapshot())
-            publish_log("Hardware waveplate-angle scan completed successfully.")
+            publish_log("Hardware scan completed successfully.")
             return True
+        except Exception:
+            scan_failed = True
+            raise
         finally:
+            cleanup_warnings = []
             if self._shutter and self._shutter.connected:
-                self._shutter.close()
+                try:
+                    self._shutter.close()
+                    if not self._shutter.is_closed:
+                        cleanup_warnings.append("shutter closure could not be verified")
+                except Exception as error:
+                    cleanup_warnings.append(f"shutter close failed: {error}")
+            else:
+                cleanup_warnings.append(
+                    "shutter connection is unavailable, so its physical state cannot be verified"
+                )
+            if scan_failed:
+                for name, stage in self._stages.items():
+                    if stage.connected:
+                        try:
+                            stage.stop()
+                        except Exception as error:
+                            cleanup_warnings.append(f"{name} stop failed: {error}")
+                if self._pi_stage and self._pi_stage.connected:
+                    try:
+                        self._pi_stage.halt()
+                    except Exception as error:
+                        cleanup_warnings.append(f"PI stage halt failed: {error}")
             self.busy = False
             publish_snapshot(self.snapshot())
+            if cleanup_warnings:
+                warning = "SCAN SAFETY WARNING: " + "; ".join(cleanup_warnings) + "."
+                publish_log(warning)
+                if not scan_failed:
+                    raise RuntimeError(warning)
 
     def _persist_scan_power_attempt(
         self,
@@ -763,6 +1030,7 @@ class SpectrometerCampaignBackend:
                 if self._motion_cancel.is_set():
                     raise RuntimeError("Target-power scan cancelled during feedback.")
                 session.prepare_for_motion()
+                self._wait_for_scan_resume(publish_log)
                 self.move_stage("waveplate", angle, publish_snapshot)
                 attempt, trace = self._persist_scan_power_attempt(
                     waveplate_angle=angle,
@@ -865,6 +1133,23 @@ class SpectrometerCampaignBackend:
 
     def request_cancel(self) -> None:
         self._motion_cancel.set()
+        self._scan_pause.clear()
+
+    def request_pause(self, paused: bool) -> None:
+        if paused:
+            self._scan_pause.set()
+        else:
+            self._scan_pause.clear()
+
+    def _wait_for_scan_resume(self, publish_log) -> None:
+        announced = False
+        while self._scan_pause.is_set() and not self._motion_cancel.is_set():
+            if not announced:
+                publish_log("Scan paused at a safe point; shutter remains closed.")
+                announced = True
+            time.sleep(0.05)
+        if announced and not self._motion_cancel.is_set():
+            publish_log("Scan resumed from safe point.")
 
     def run_calibration(
         self,
@@ -1234,6 +1519,19 @@ class SpectrometerCampaignBackend:
         if key == "power_meter":
             return bool(self._power_meter and self._power_meter.connected)
         return bool(key in self._stages and self._stages[key].connected)
+
+    def _require_scan_connections(self, phase: str) -> None:
+        """Abort at a safe boundary if any required scan handle is lost."""
+
+        missing = [
+            key for key, _ in self.DEVICE_NAMES if not self._device_connected(key)
+        ]
+        if missing:
+            self._motion_cancel.set()
+            raise RuntimeError(
+                "Required device connection lost during scan "
+                f"({phase}): {', '.join(missing)}. Completed measurements remain saved."
+            )
 
     def _shutter_closed(self) -> bool:
         return bool(self._shutter and self._shutter.connected and self._shutter.is_closed)
