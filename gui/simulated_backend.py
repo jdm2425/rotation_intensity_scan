@@ -13,6 +13,7 @@ import numpy as np
 
 from analysis.measurement import Measurement
 from data.data_writer import DataWriter
+from experiments.waveplate_calibration import snapshot_calibration_for_experiment
 from gui.state import (
     ConnectionState,
     DeviceSnapshot,
@@ -599,6 +600,10 @@ class SimulatedCampaignBackend:
             ) as writer:
                 if publish_run_directory is not None:
                     publish_run_directory(str(writer.experiment_directory.resolve()))
+                calibration_snapshot = snapshot_calibration_for_experiment(
+                    request.power_calibration_path,
+                    writer.experiment_directory,
+                )
                 writer.save_metadata(
                     config={
                         "simulation": True,
@@ -613,6 +618,13 @@ class SimulatedCampaignBackend:
                         "integration_time_ms": request.integration_time_ms,
                         "averages": request.averages,
                         "acquire_background": request.acquire_background,
+                        "power_calibration_file": (
+                            None
+                            if calibration_snapshot is None
+                            else calibration_snapshot.relative_to(
+                                writer.experiment_directory
+                            ).as_posix()
+                        ),
                         "driving_wavelength_nm": request.driving_wavelength_nm,
                         "harmonic_windows": [
                             {

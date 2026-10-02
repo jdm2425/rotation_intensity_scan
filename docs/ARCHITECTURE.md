@@ -73,6 +73,22 @@ of emitted canonical measurements: it groups by intensity coordinate and
 sample angle to calculate replicate means and sample-SEM display values. This
 does not alter or replace incrementally persisted raw measurements.
 
+`gui/campaign_project.py` owns the portable multi-session project manifest.
+The `.risproject` JSON stores only paths relative to its own directory and is
+saved with flush, `fsync`, and atomic replacement. Its sibling `*_data`
+directory separates `runs/`, `calibrations/`, and `live_spectra/`. The GUI
+records a run as soon as `DataWriter` creates it, saves scan-form state and the
+active calibration, reopens the last project through machine-local `QSettings`,
+discovers run directories which survived a crash before their manifest update,
+and loads the project's latest run summary. Moving the project file together
+with its sibling data directory preserves every reference on another computer.
+
+When a GUI scan uses a Malus calibration, the backend validates and snapshots
+it into the new experiment at `calibration/malus_calibration.json`. The request
+used by target feedback points to that snapshot, while `config.json` stores the
+portable relative filename `power_calibration_file`. The original calibration
+source string is provenance only and is not required to reopen or use the run.
+
 `ScanRequest` carries a validated `rotation_target` (`sample` or
 `polarization_half_waveplate`), explicit driving wavelength, and canonical
 `HarmonicWindow` definitions alongside resolved coordinate tuples. Both target
@@ -560,7 +576,7 @@ Generated experimental files belong in `results/`.
 
 ```text
 results/
-└── ExperimentName_YYYYMMDD_HHMMSS/
+└── ExperimentName_YYYYMMDD_HHMMSS_ffffff/
     ├── metadata.json
     ├── config.json
     ├── hardware.json
@@ -622,6 +638,15 @@ interpreted as an empty background collection.
 * Persist a power attempt before any corresponding spectrum.
 * Validate each measurement's summary fields against its raw trace statistics.
 * Save each unique raw power trace only once and reject ID collisions.
+* Atomically replace spectrum, background, power-trace, JSON-index, and run-state
+  files after flushing them to disk.
+* Flush and `fsync` the measurement index after every successful spectrum.
+
+Every new experiment contains `run_state.json`. It is `open` while the writer
+owns the run, is refreshed after durable data additions, and changes to
+`closed` or `failed` when the context exits. An `open` state after process or
+machine failure identifies a potentially interrupted run without discarding
+the already indexed measurements.
 
 A spectrum archive should use fields such as:
 

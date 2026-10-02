@@ -285,7 +285,7 @@ The persistence layer:
 
 ```text
 results/
-└── ExperimentName_YYYYMMDD_HHMMSS/
+└── ExperimentName_YYYYMMDD_HHMMSS_ffffff/
     ├── metadata.json
     ├── config.json
     ├── hardware.json
@@ -297,6 +297,10 @@ results/
     ├── power_measurements.json
     └── power_measurements/
 ```
+
+New runs also contain an atomic `run_state.json` (`open`, `closed`, or
+`failed`). If a Malus-law calibration is used, a validated copy is stored at
+`calibration/malus_calibration.json` inside the experiment.
 
 Each spectrum row may include:
 
@@ -331,15 +335,23 @@ mode is inert; `Connect alignment devices` performs the physical connections,
 attempting the shutter first and then every configured device independently.
 Unavailable devices do not roll back successful connections or prevent later
 devices from being attempted. Connection progress is shown immediately in the
-persistent safety heading. Hardware
-mode supports absolute manual rotation, guarded probe/power operations, and
-angle-controlled and bounded closed-loop target-power scans. Calibration
-execution remains disabled. Install and launch:
+persistent safety heading. Hardware mode supports absolute manual rotation,
+guarded probe/power operations, Ocean SR live view, guarded waveplate
+calibration, and angle-controlled and bounded closed-loop target-power scans.
+The recommended launcher creates or reuses `.venv`, installs any missing GUI
+and (on Windows) hardware Python packages, checks the environment, and starts
+the GUI with the virtual-environment interpreter:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
-.\.venv\Scripts\python.exe run_gui.py
+python start_gui.py
 ```
+
+Use `python start_gui.py --gui-only` for an offline/simulation installation, or
+`python start_gui.py --check-only` to prepare and verify the environment without
+opening the GUI. Vendor runtimes and drivers (Thorlabs Kinesis, Ocean Insight
+SeaBreeze, PI Software Suite, and Ophir StarLab) must still be installed using
+their vendor installers. The launcher never connects to hardware; connection
+remains an explicit GUI action.
 
 The current interface provides a persistent safety header, simulated connection
 and manual-control panels, a continuous Alignment / Live Spectrum workspace,
@@ -348,6 +360,16 @@ safe cancellation, and saved-experiment summary loading. The alignment view
 supports live integration-time and averaging changes, background capture and
 subtraction, axis limits, autoscaling, pause/resume, and pickle-free manual
 spectrum saves. A prominent banner identifies the active mode.
+
+The Saved Data tab can create or open a portable `.risproject` campaign file.
+The manifest uses relative paths only; its sibling `*_data` directory contains
+separate `runs/`, `calibrations/`, and `live_spectra/` directories. Scan form
+state, the active calibration, and every created run are saved atomically. The
+last opened project is reopened at GUI startup on that PC, and its latest run is
+loaded into Saved Data. Unindexed run directories with a measurement index are
+recovered when the project opens. Move the project file and its sibling data
+directory together to open the campaign on another PC. New-project browsing
+defaults to `results/`.
 
 Motion and incident-power controls are duplicated intentionally in the
 Alignment workspace so initial setup does not require switching tabs. Simulated
@@ -405,7 +427,9 @@ direction, tolerance, iteration/angle-step bounds, and an optional saved
 Malus-law calibration. Each target starts with fresh endpoint measurements and
 keeps the probe inserted only for its bounded feedback block. Every feedback
 attempt and trace is persisted before sample spectra; calibration supplies only
-an initial guess and never replaces measured feedback.
+an initial guess and never replaces measured feedback. A validated copy of the
+selected calibration is saved inside each run, and `config.json` records its
+experiment-relative path rather than a machine-specific absolute path.
 
 The Calibration tab can build that file from a reviewed start/stop/step map.
 It plots measurements live, saves raw traces and the growing CSV, identifies the
@@ -477,5 +501,6 @@ one decimal place by default; change this with, for example,
 - `docs/TARGET_POWER_SCAN.md`: target-power operation and commissioning.
 - `docs/TODAY_RUN_CHECKLIST.md`: staged commands for immediate commissioning.
 
-Generated data belong in `results/`. The `data/` directory is Python source
-code only.
+Generated data default to `results/`. Portable GUI projects keep their generated
+data in the sibling `*_data` directory chosen with the project file. The Python
+`data/` directory remains source code only.

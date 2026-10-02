@@ -531,6 +531,7 @@ def main() -> None:
     })
     with tempfile.TemporaryDirectory(prefix="gui_target_scan_fake_") as temporary:
         output = Path(temporary)
+        published_manual_runs = []
         manual_power = target_backend.set_power(
             TargetPowerRequest(
                 target_power_mw=12.0,
@@ -542,9 +543,11 @@ def main() -> None:
             ),
             snapshots.append,
             publish_log=logs.append,
+            publish_run_directory=published_manual_runs.append,
         )
         assert manual_power == 12.0
         manual_run = next(output.glob("manual_target_power_*"))
+        assert published_manual_runs == [str(manual_run.resolve())]
         manual_dataset = load_experiment(manual_run)
         assert len(manual_dataset.measurements) == 0
         assert len(manual_dataset.power_attempts) == 3

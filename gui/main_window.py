@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from data.data_loader import load_experiment
+from gui.campaign_project import CampaignProject, PROJECT_SUFFIX
 from gui.hardware_worker import HardwareWorker
 from gui.state import (
     CalibrationRequest,
@@ -63,7 +64,7 @@ from hardware.config import POWER_METER_STAGE
 
 
 class CampaignMainWindow(QMainWindow):
-    """Operator-facing window for the safe simulated campaign workflow."""
+    """Operator-facing window with strictly separated hardware/simulation modes."""
 
     connect_requested = Signal()
     connect_configuration_requested = Signal(object)
@@ -96,6 +97,7 @@ class CampaignMainWindow(QMainWindow):
             "ROTATION_GUI_DISABLE_SETTINGS", ""
         ).strip() not in {"1", "true", "TRUE"}
         self._mode = "hardware"
+        self._project: CampaignProject | None = None
         self._theme = self._load_theme()
         self._operator_settings = self._load_operator_settings()
         remembered_rotation_target = (
@@ -145,6 +147,7 @@ class CampaignMainWindow(QMainWindow):
         self._build_ui()
         self._apply_rotation_target_labels()
         self._install_wheel_guards()
+        self._open_last_project()
         self._start_worker()
         self._apply_style()
         self._ensure_button_text_visible()
@@ -211,6 +214,10 @@ class CampaignMainWindow(QMainWindow):
         self.tabs.addTab(self.settings_page, "7  Settings")
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
+        # _build_banner() runs before the tab widgets exist. Apply the initial
+        # Hardware-mode labels again now so no synthetic wording survives at
+        # startup.
+        self._update_mode_visuals()
         self.statusBar().showMessage(
             "Hardware mode selected; no devices connect until explicitly requested."
         )
@@ -376,6 +383,7 @@ class CampaignMainWindow(QMainWindow):
         layout.addWidget(self.device_table, 3)
 
         manual = QGroupBox("Safe manual controls — simulation")
+        self.manual_controls_group = manual
         grid = QGridLayout(manual)
         self.waveplate_position = self._angle_box()
         self.sample_position = self._angle_box()
@@ -441,9 +449,10 @@ class CampaignMainWindow(QMainWindow):
         self.manual_stage_buttons = (waveplate_move, sample_move)
         self.manual_probe_buttons = (insert_probe, retract_probe)
         note = QLabel(
-            "The real implementation will route probe motion through the existing "
-            "shutter interlock. Unrestricted PI motion will not be a routine control."
+            "Hardware probe and PI motion use the verified shutter-closed interlock. "
+            "Simulation is available only when Simulation mode is explicitly selected."
         )
+        self.manual_controls_note = note
         note.setWordWrap(True)
         grid.addWidget(note, 7, 0, 1, 3)
         layout.addWidget(manual)
@@ -471,6 +480,7 @@ class CampaignMainWindow(QMainWindow):
         outer = QHBoxLayout(page)
 
         controls = QGroupBox("Live spectrometer controls — simulation")
+        self.live_controls_group = controls
         form = QFormLayout(controls)
         self._configure_form(form)
         self.live_integration_time = QDoubleSpinBox()
@@ -502,9 +512,9 @@ class CampaignMainWindow(QMainWindow):
         output_layout = QHBoxLayout(output_row)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.addWidget(self.live_output)
-        output_browse = QPushButton("Browse…")
-        output_browse.clicked.connect(self._browse_live_output)
-        output_layout.addWidget(output_browse)
+        self.live_output_browse = QPushButton("Browse…")
+        self.live_output_browse.clicked.connect(self._browse_live_output)
+        output_layout.addWidget(self.live_output_browse)
         form.addRow("Integration time", self.live_integration_time)
         form.addRow("Internal averages", self.live_averages)
         self.live_refresh_label = QLabel("Refresh interval")
@@ -870,13 +880,13 @@ class CampaignMainWindow(QMainWindow):
         self.experiment_name = QLineEdit("campaign_scan")
         self.output_directory = QLineEdit(str(Path("results").resolve()))
         self.output_directory.setMinimumWidth(420)
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._browse_output)
+        self.output_browse = QPushButton("Browse…")
+        self.output_browse.clicked.connect(self._browse_output)
         output_row = QWidget()
         output_layout = QHBoxLayout(output_row)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.addWidget(self.output_directory)
-        output_layout.addWidget(browse)
+        output_layout.addWidget(self.output_browse)
         self.notes = QTextEdit()
         self.notes.setMaximumHeight(80)
         form.addRow("Second rotation stage carries", self.rotation_target)
@@ -1073,6 +1083,34 @@ class CampaignMainWindow(QMainWindow):
     def _build_data_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        project_group = QGroupBox("Portable campaign project")
+        project_layout = QVBoxLayout(project_group)
+        self.project_status = QLabel(
+            "No project open. Runs use the output directory from Scan Setup."
+        )
+        self.project_status.setWordWrap(True)
+        project_layout.addWidget(self.project_status)
+        project_buttons = QHBoxLayout()
+        self.new_project_button = QPushButton("New project…")
+        self.open_project_button = QPushButton("Open project…")
+        self.save_project_button = QPushButton("Save project")
+        self.save_project_button.setEnabled(False)
+        self.new_project_button.clicked.connect(self._new_project)
+        self.open_project_button.clicked.connect(self._choose_project)
+        self.save_project_button.clicked.connect(self._save_project)
+        project_buttons.addWidget(self.new_project_button)
+        project_buttons.addWidget(self.open_project_button)
+        project_buttons.addWidget(self.save_project_button)
+        project_buttons.addStretch()
+        project_layout.addLayout(project_buttons)
+        project_note = QLabel(
+            "The .risproject manifest stores only relative paths. Its sibling "
+            "*_data folder contains separate run, calibration, and live-spectrum "
+            "directories, so the complete folder can be moved to another PC."
+        )
+        project_note.setWordWrap(True)
+        project_layout.addWidget(project_note)
+        layout.addWidget(project_group)
         title = QLabel("Inspect a saved experiment")
         title.setFont(self._section_font())
         layout.addWidget(title)
@@ -1179,8 +1217,8 @@ class CampaignMainWindow(QMainWindow):
         defaults = {
             "rotation_readback_tolerance_deg": 0.05,
             "saturation_warning_counts": 65_535.0,
-            "probe_in_position_mm": 12.0,
-            "probe_out_position_mm": -12.0,
+            "probe_in_position_mm": float(POWER_METER_STAGE.in_position_mm),
+            "probe_out_position_mm": float(POWER_METER_STAGE.out_position_mm),
             "power_measurement_duration_s": 10.0,
             "power_settle_time_s": 3.0,
             "power_poll_interval_s": 0.1,
@@ -1199,7 +1237,8 @@ class CampaignMainWindow(QMainWindow):
             ]
         if not 1.0 <= loaded["saturation_warning_counts"] <= 1_000_000.0:
             loaded["saturation_warning_counts"] = defaults["saturation_warning_counts"]
-        lower, upper = -12.0, 12.0
+        lower = float(POWER_METER_STAGE.application_min_mm)
+        upper = float(POWER_METER_STAGE.application_max_mm)
         if not lower <= loaded["probe_in_position_mm"] <= upper:
             loaded["probe_in_position_mm"] = defaults["probe_in_position_mm"]
         if not lower <= loaded["probe_out_position_mm"] <= upper:
@@ -1287,8 +1326,8 @@ class CampaignMainWindow(QMainWindow):
     def _reset_operator_settings(self) -> None:
         self.rotation_tolerance_setting.setValue(0.05)
         self.saturation_setting.setValue(65_535.0)
-        self.probe_in_setting.setValue(12.0)
-        self.probe_out_setting.setValue(-12.0)
+        self.probe_in_setting.setValue(float(POWER_METER_STAGE.in_position_mm))
+        self.probe_out_setting.setValue(float(POWER_METER_STAGE.out_position_mm))
         self.power_duration_setting.setValue(10.0)
         self.power_settle_setting.setValue(3.0)
         self.power_poll_setting.setValue(0.1)
@@ -1399,6 +1438,23 @@ class CampaignMainWindow(QMainWindow):
             )
             self.statusBar().showMessage("Simulation mode: no real devices can connect.")
         if hasattr(self, "tabs"):
+            self.manual_controls_group.setTitle(
+                "Safe manual controls — physical hardware"
+                if hardware
+                else "Safe manual controls — simulation"
+            )
+            self.manual_controls_note.setText(
+                "These buttons command physical devices. Probe and PI motion first "
+                "close and verify the shutter; every move is checked by live readback."
+                if hardware
+                else "These buttons affect synthetic devices only. No physical driver "
+                "is constructed in Simulation mode."
+            )
+            self.live_controls_group.setTitle(
+                "Live spectrometer controls — physical Ocean SR"
+                if hardware
+                else "Live spectrometer controls — simulation"
+            )
             self.live_refresh_label.setText(
                 "Refresh rate" if hardware else "Refresh interval"
             )
@@ -1672,6 +1728,8 @@ class CampaignMainWindow(QMainWindow):
         )
 
     def _start_calibration(self) -> None:
+        if self._project is not None:
+            self._save_project()
         self._update_calibration_summary()
         if not self.calibration_run_button.isEnabled():
             return
@@ -1723,6 +1781,16 @@ class CampaignMainWindow(QMainWindow):
             if direction_index >= 0:
                 self.target_direction.setCurrentIndex(direction_index)
             self.power_calibration.setText(str(result["calibration_path"]))
+            if self._project is not None:
+                try:
+                    self._project.record_calibration(result["calibration_path"])
+                    self._project.set_scan_settings(self._project_scan_settings())
+                    self._project.save()
+                except Exception as error:
+                    self._show_error(
+                        f"Calibration succeeded but the campaign project could not "
+                        f"be updated: {error}"
+                    )
             self._log(
                 "Calibration complete; recommended branch and calibration file "
                 "copied into Scan Setup."
@@ -1830,6 +1898,8 @@ class CampaignMainWindow(QMainWindow):
             return
         if not self._update_preflight():
             return
+        if self._project is not None:
+            self._save_project()
         request = self._request_from_form()
         if not self._latest_snapshot or not self._latest_snapshot.all_connected:
             self._show_error("Connect all configured devices before starting a scan.")
@@ -2105,7 +2175,25 @@ class CampaignMainWindow(QMainWindow):
             self.set_power_requested.emit(target)
 
     def _alignment_measure_power(self) -> None:
-        if not self._require_alignment_connection():
+        if self._mode == "hardware":
+            connected = {
+                device.key
+                for device in (
+                    self._latest_snapshot.devices if self._latest_snapshot else ()
+                )
+                if device.connection is ConnectionState.CONNECTED
+            }
+            missing = sorted(
+                {"shutter", "power_meter_stage", "power_meter"} - connected
+            )
+            if missing:
+                self._show_error(
+                    "Incident-power measurement requires connected: "
+                    + ", ".join(missing)
+                    + "."
+                )
+                return
+        elif not self._require_alignment_connection():
             return
         if self._live_running:
             self.worker.queue_live_measure_power()
@@ -2121,13 +2209,33 @@ class CampaignMainWindow(QMainWindow):
         return False
 
     def _start_live_view(self) -> None:
-        if not self._latest_snapshot or not self._latest_snapshot.all_connected:
+        snapshot = self._latest_snapshot
+        connected_keys = {
+            device.key
+            for device in (snapshot.devices if snapshot is not None else ())
+            if device.connection is ConnectionState.CONNECTED
+        }
+        live_ready = bool(
+            snapshot
+            and (
+                snapshot.all_connected
+                if self._mode != "hardware"
+                else (
+                    "spectrometer" in connected_keys
+                    and snapshot.probe_out is True
+                )
+            )
+        )
+        if not live_ready:
             self._show_error(
-                "Connect the simulated hardware before starting live view."
+                "Hardware live view requires the Ocean SR and a connected PI stage "
+                "with the power probe live-verified at its configured out position."
+                if self._mode == "hardware"
+                else "Connect the simulated devices before starting live view."
             )
             return
-        if self._latest_snapshot.busy:
-            self._show_error("Another simulated hardware operation is active.")
+        if snapshot.busy:
+            self._show_error("Another device operation is active.")
             return
         request = LiveViewRequest(
             integration_time_ms=self.live_integration_time.value(),
@@ -2159,7 +2267,21 @@ class CampaignMainWindow(QMainWindow):
     def _live_finished(self) -> None:
         self._live_running = False
         self.live_stop_button.setEnabled(False)
-        connected = bool(self._latest_snapshot and self._latest_snapshot.all_connected)
+        connected_keys = {
+            device.key
+            for device in (
+                self._latest_snapshot.devices if self._latest_snapshot else ()
+            )
+            if device.connection is ConnectionState.CONNECTED
+        }
+        connected = bool(
+            self._latest_snapshot
+            and (
+                self._latest_snapshot.all_connected
+                if self._mode != "hardware"
+                else "spectrometer" in connected_keys
+            )
+        )
         probe_safe = bool(
             self._mode != "hardware"
             or (self._latest_snapshot and self._latest_snapshot.probe_out is True)
@@ -2434,9 +2556,13 @@ class CampaignMainWindow(QMainWindow):
             for button in (self.manual_stage_buttons[1], self.alignment_stage_buttons[1]):
                 button.setEnabled("sample" in connected_keys and not snapshot.busy)
             self.safe_button.setEnabled(bool(connected_keys))
-        self.live_start_button.setEnabled(
+        live_devices_ready = (
             snapshot.all_connected
-            and (not hardware or snapshot.probe_out is True)
+            if not hardware
+            else "spectrometer" in connected_keys and snapshot.probe_out is True
+        )
+        self.live_start_button.setEnabled(
+            live_devices_ready
             and not snapshot.busy
             and not self._live_running
         )
@@ -2665,7 +2791,7 @@ class CampaignMainWindow(QMainWindow):
 
     def _safe_disconnect_all(self) -> None:
         self._log(
-            "Requesting Ocean SR disconnect."
+            "Requesting safe disconnect of every connected physical device."
             if self._mode == "hardware"
             else "Requesting safe disconnect of the complete simulated stack."
         )
@@ -2914,6 +3040,17 @@ class CampaignMainWindow(QMainWindow):
     def _set_run_directory(self, path: str) -> None:
         self._active_run_directory = str(path)
         self.run_directory_label.setText(self._active_run_directory)
+        self.data_path.setText(self._active_run_directory)
+        if self._project is not None:
+            try:
+                self._project.record_run(path)
+                self._project.set_scan_settings(self._project_scan_settings())
+                self._project.save()
+            except Exception as error:
+                self._show_error(
+                    f"Run directory was created but the campaign project could not "
+                    f"record it: {error}"
+                )
 
     def _copy_run_status(self) -> None:
         QApplication.clipboard().setText(
@@ -2958,6 +3095,8 @@ class CampaignMainWindow(QMainWindow):
         )
         if self._latest_snapshot is not None:
             self._show_snapshot(self._latest_snapshot)
+        if self._project is not None:
+            self._save_project()
         self._update_preflight()
 
     def _show_error(self, message: str) -> None:
@@ -2987,6 +3126,11 @@ class CampaignMainWindow(QMainWindow):
         self.device_log.appendPlainText(entry)
 
     def _browse_output(self) -> None:
+        if self._project is not None:
+            self.statusBar().showMessage(
+                "Run output is managed by the open campaign project.", 4000
+            )
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "Choose output directory", self.output_directory.text()
         )
@@ -2995,6 +3139,11 @@ class CampaignMainWindow(QMainWindow):
             self._update_preflight()
 
     def _browse_live_output(self) -> None:
+        if self._project is not None:
+            self.statusBar().showMessage(
+                "Live-spectrum output is managed by the open campaign project.", 4000
+            )
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "Choose live-spectrum save directory", self.live_output.text()
         )
@@ -3008,11 +3157,212 @@ class CampaignMainWindow(QMainWindow):
         if directory:
             self.data_path.setText(directory)
 
-    def _load_summary(self) -> None:
+    def _new_project(self) -> None:
+        if self._project is not None:
+            self._save_project()
+        current_settings = self._project_scan_settings()
+        current_calibration = self.power_calibration.text().strip()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Create portable campaign project",
+            str((Path("results") / "campaign.risproject").resolve()),
+            f"Rotation Intensity project (*{PROJECT_SUFFIX})",
+        )
+        if not path:
+            return
+        try:
+            project = CampaignProject.create(path)
+            project.set_scan_settings(current_settings)
+            project.save()
+        except Exception as error:
+            self._show_error(f"Could not create campaign project: {error}")
+            return
+        self._activate_project(project)
+        if current_calibration:
+            self.power_calibration.setText(current_calibration)
+        self._save_project()
+
+    def _choose_project(self) -> None:
+        if self._project is not None:
+            self._save_project()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open portable campaign project",
+            str(Path.cwd()),
+            f"Rotation Intensity project (*{PROJECT_SUFFIX})",
+        )
+        if not path:
+            return
+        try:
+            project = CampaignProject.load(path)
+        except Exception as error:
+            self._show_error(f"Could not open campaign project: {error}")
+            return
+        self._activate_project(project)
+
+    def _open_last_project(self) -> None:
+        if not self._settings_enabled:
+            return
+        value = str(self.settings.value("project/last_path", "")).strip()
+        if not value:
+            return
+        try:
+            project = CampaignProject.load(value)
+        except Exception as error:
+            self.settings.remove("project/last_path")
+            self._log(f"Last campaign project was not opened: {error}")
+            return
+        self._activate_project(project)
+
+    def _activate_project(self, project: CampaignProject) -> None:
+        self._project = project
+        self._apply_project_scan_settings(project.scan_settings)
+        self.output_directory.setText(str(project.runs_directory))
+        self.calibration_output.setText(str(project.calibrations_directory))
+        self.live_output.setText(str(project.live_spectra_directory))
+        calibration = project.active_calibration
+        self.power_calibration.setText(
+            "" if calibration is None else str(calibration)
+        )
+        for field in (self.output_directory, self.calibration_output, self.live_output):
+            field.setReadOnly(True)
+        self.output_browse.setEnabled(False)
+        self.live_output_browse.setEnabled(False)
+        self.save_project_button.setEnabled(True)
+        self.project_status.setText(
+            f"Open project: {project.name}\n{project.path}\n"
+            f"Runs: {project.runs_directory}\n"
+            f"Recorded sessions: {len(project.run_directories)}"
+        )
+        if self._settings_enabled:
+            self.settings.setValue("project/last_path", str(project.path))
+        latest = project.latest_run
+        if latest is not None and latest.is_dir():
+            self.data_path.setText(str(latest))
+            self._load_summary(show_error=False)
+        self._update_preflight()
+        self._update_calibration_summary()
+        self._log(f"Campaign project opened: {project.path}")
+
+    def _save_project(self) -> None:
+        project = self._project
+        if project is None:
+            return
+        try:
+            project.set_scan_settings(self._project_scan_settings())
+            calibration_text = self.power_calibration.text().strip()
+            if calibration_text:
+                calibration_path = Path(calibration_text).expanduser().resolve()
+                try:
+                    calibration_path.relative_to(project.root.resolve())
+                except ValueError:
+                    from experiments.waveplate_calibration import MalusLawCalibration
+
+                    imported_directory = project.calibrations_directory / (
+                        "imported_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    )
+                    imported_path = imported_directory / "malus_calibration.json"
+                    MalusLawCalibration.load(calibration_path).save(imported_path)
+                    calibration_path = imported_path
+                    self.power_calibration.setText(str(calibration_path))
+                project.record_calibration(calibration_path)
+            else:
+                project.active_calibration_value = None
+            project.save()
+        except Exception as error:
+            self._show_error(f"Could not save campaign project: {error}")
+            return
+        self.project_status.setText(
+            f"Open project: {project.name}\n{project.path}\n"
+            f"Runs: {project.runs_directory}\n"
+            f"Recorded sessions: {len(project.run_directories)}"
+        )
+        self.statusBar().showMessage(f"Campaign project saved: {project.path}", 4000)
+
+    def _project_scan_settings(self) -> dict[str, object]:
+        return {
+            "rotation_target": self._rotation_target_mode,
+            "sample_definition": str(self.sample_definition.currentData()),
+            "sample_angles": self.sample_angles.text(),
+            "sample_range_start": self.sample_range_start.value(),
+            "sample_range_stop": self.sample_range_stop.value(),
+            "sample_range_step": self.sample_range_step.value(),
+            "intensity_mode": str(self.intensity_mode.currentData()),
+            "intensity_definition": str(self.intensity_definition.currentData()),
+            "intensity_values": self.intensity_values.text(),
+            "intensity_range_start": self.intensity_range_start.value(),
+            "intensity_range_stop": self.intensity_range_stop.value(),
+            "intensity_range_step": self.intensity_range_step.value(),
+            "driving_wavelength_nm": self.driving_wavelength.value(),
+            "harmonic_orders": self.harmonic_orders.text(),
+            "harmonic_half_width_nm": self.harmonic_half_width.value(),
+            "auto_harmonic_windows": self.auto_harmonic_windows.isChecked(),
+            "harmonic_windows": self.harmonic_windows.text(),
+            "waveplate_min_deg": self.target_branch_min.value(),
+            "waveplate_max_deg": self.target_branch_max.value(),
+            "monotonic_direction": str(self.target_direction.currentData()),
+            "target_tolerance_mw": self.target_tolerance.value(),
+            "target_maximum_iterations": self.target_iterations.value(),
+            "target_minimum_angle_step_deg": self.target_minimum_step.value(),
+            "spectra_per_point": self.spectra_per_point.value(),
+            "integration_time_ms": self.integration_time.value(),
+            "averages": self.averages.value(),
+            "acquire_background": self.background.isChecked(),
+            "experiment_name": self.experiment_name.text(),
+            "notes": self.notes.toPlainText(),
+        }
+
+    def _apply_project_scan_settings(self, values: dict[str, object]) -> None:
+        if not values:
+            return
+        self._set_combo_data(self.rotation_target, values.get("rotation_target"))
+        self._set_combo_data(self.sample_definition, values.get("sample_definition"))
+        self.sample_angles.setText(str(values.get("sample_angles", self.sample_angles.text())))
+        self.sample_range_start.setValue(float(values.get("sample_range_start", self.sample_range_start.value())))
+        self.sample_range_stop.setValue(float(values.get("sample_range_stop", self.sample_range_stop.value())))
+        self.sample_range_step.setValue(float(values.get("sample_range_step", self.sample_range_step.value())))
+        self._set_combo_data(self.intensity_mode, values.get("intensity_mode"))
+        self._set_combo_data(self.intensity_definition, values.get("intensity_definition"))
+        self.intensity_values.setText(str(values.get("intensity_values", self.intensity_values.text())))
+        self.intensity_range_start.setValue(float(values.get("intensity_range_start", self.intensity_range_start.value())))
+        self.intensity_range_stop.setValue(float(values.get("intensity_range_stop", self.intensity_range_stop.value())))
+        self.intensity_range_step.setValue(float(values.get("intensity_range_step", self.intensity_range_step.value())))
+        self.driving_wavelength.setValue(float(values.get("driving_wavelength_nm", self.driving_wavelength.value())))
+        self.harmonic_orders.setText(str(values.get("harmonic_orders", self.harmonic_orders.text())))
+        self.harmonic_half_width.setValue(float(values.get("harmonic_half_width_nm", self.harmonic_half_width.value())))
+        self.auto_harmonic_windows.setChecked(bool(values.get("auto_harmonic_windows", self.auto_harmonic_windows.isChecked())))
+        self.harmonic_windows.setText(str(values.get("harmonic_windows", self.harmonic_windows.text())))
+        self.target_branch_min.setValue(float(values.get("waveplate_min_deg", self.target_branch_min.value())))
+        self.target_branch_max.setValue(float(values.get("waveplate_max_deg", self.target_branch_max.value())))
+        self._set_combo_data(self.target_direction, values.get("monotonic_direction"))
+        self.target_tolerance.setValue(float(values.get("target_tolerance_mw", self.target_tolerance.value())))
+        self.target_iterations.setValue(int(values.get("target_maximum_iterations", self.target_iterations.value())))
+        self.target_minimum_step.setValue(float(values.get("target_minimum_angle_step_deg", self.target_minimum_step.value())))
+        self.spectra_per_point.setValue(int(values.get("spectra_per_point", self.spectra_per_point.value())))
+        self.integration_time.setValue(float(values.get("integration_time_ms", self.integration_time.value())))
+        self.averages.setValue(int(values.get("averages", self.averages.value())))
+        self.background.setChecked(bool(values.get("acquire_background", self.background.isChecked())))
+        self.experiment_name.setText(str(values.get("experiment_name", self.experiment_name.text())))
+        self.notes.setPlainText(str(values.get("notes", self.notes.toPlainText())))
+        self._set_rotation_target(str(self.rotation_target.currentData()))
+        self._update_scan_definition_visibility()
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value: object) -> None:
+        if value is None:
+            return
+        index = combo.findData(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _load_summary(self, _checked: bool = False, *, show_error: bool = True) -> None:
         try:
             dataset = load_experiment(Path(self.data_path.text()))
         except Exception as error:
-            self._show_error(f"Could not load experiment: {error}")
+            if show_error:
+                self._show_error(f"Could not load experiment: {error}")
+            else:
+                self._log(f"Latest project run could not be loaded: {error}")
             return
         summary = dataset.summary()
         lines = [f"{key}: {value}" for key, value in summary.items()]
@@ -3624,12 +3974,14 @@ class CampaignMainWindow(QMainWindow):
             self.worker.request_cancel()
         if self._live_running:
             self.worker.request_live_stop()
+        if self._project is not None:
+            self._save_project()
         self.worker_thread.quit()
         if not self.worker_thread.wait(3000):
             QMessageBox.warning(
                 self,
                 "Campaign GUI",
-                "The simulation worker did not stop promptly. The window will remain open.",
+                "The device worker did not stop promptly. The window will remain open.",
             )
             event.ignore()
             return

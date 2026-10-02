@@ -186,6 +186,33 @@ def main() -> None:
         assert snapshots[-1].shutter_closed is True
         assert snapshots[-1].probe_out is True
 
+        calibrated_output = Path(temporary) / "calibrated_runs"
+        calibrated_request = ScanRequest(
+            sample_angles_deg=(0.0,),
+            intensity_values=(5.0,),
+            spectra_per_point=1,
+            acquire_background=False,
+            output_directory=calibrated_output,
+            experiment_name="CalibrationSnapshot",
+            power_calibration_path=Path(calibration_result["calibration_path"]),
+        )
+        assert backend.run_scan(
+            calibrated_request,
+            publish_snapshot=snapshots.append,
+            publish_measurement=lambda *_: None,
+            publish_log=logs.append,
+        )
+        calibrated_experiment = next(calibrated_output.iterdir())
+        calibrated_dataset = load_experiment(calibrated_experiment)
+        assert calibrated_dataset.config["power_calibration_file"] == (
+            "calibration/malus_calibration.json"
+        )
+        assert (
+            calibrated_experiment
+            / calibrated_dataset.config["power_calibration_file"]
+        ).is_file()
+        assert "power_calibration_path" not in calibrated_dataset.config
+
         live_spectra = []
         live_directory = Path(temporary) / "live"
         live_thread = threading.Thread(

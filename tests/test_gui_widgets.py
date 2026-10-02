@@ -15,6 +15,7 @@ from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from gui.campaign_project import CampaignProject
 from gui.main_window import CampaignMainWindow
 
 
@@ -26,6 +27,10 @@ def main() -> None:
 
     assert "HARDWARE" in window.windowTitle()
     assert window._mode == "hardware"
+    assert "physical hardware" in window.manual_controls_group.title()
+    assert "physical Ocean SR" in window.live_controls_group.title()
+    assert "simulat" not in window.run_button.text().lower()
+    assert "simulat" not in window.calibration_run_button.text().lower()
     assert window.tabs.count() == 7
     assert window.run_button.isEnabled() is False
 
@@ -387,6 +392,20 @@ def main() -> None:
     assert window.devices_open_shutter.isEnabled() is False
     assert window.live_refresh.isEnabled() is False
     assert "every spectrum" in window.live_refresh.toolTip()
+    partially_connected = replace(
+        window._latest_snapshot,
+        devices=tuple(
+            replace(device, connection=type(device.connection).CONNECTED)
+            if device.key in {"spectrometer", "power_meter_stage"}
+            else device
+            for device in window._latest_snapshot.devices
+        ),
+        probe_out=True,
+    )
+    window._show_snapshot(partially_connected)
+    assert window.live_start_button.isEnabled()
+    assert not window.calibration_run_button.isEnabled()
+    assert not window.run_button.isEnabled()
     assert window.tabs.isTabEnabled(6)
     window.tabs.setCurrentWidget(window.settings_page)
     window.rotation_tolerance_setting.setValue(0.125)
@@ -399,6 +418,34 @@ def main() -> None:
     assert window._operator_settings["rotation_readback_tolerance_deg"] == 0.125
     assert window._operator_settings["probe_in_position_mm"] == 11.5
     assert window._operator_settings["power_measurement_duration_s"] == 8.0
+
+    with tempfile.TemporaryDirectory(prefix="gui_last_project_") as temporary:
+        project = CampaignProject.create(Path(temporary) / "portable.risproject")
+        project.set_scan_settings({"experiment_name": "remembered_campaign"})
+        project.save()
+
+        class FakeSettings:
+            def __init__(self, path: Path):
+                self.values = {"project/last_path": str(path)}
+
+            def value(self, key: str, default=None, **_kwargs):
+                return self.values.get(key, default)
+
+            def setValue(self, key: str, value) -> None:
+                self.values[key] = value
+
+            def remove(self, key: str) -> None:
+                self.values.pop(key, None)
+
+        window.settings = FakeSettings(project.path)
+        window._settings_enabled = True
+        window._open_last_project()
+        assert window._project is not None
+        assert window._project.path == project.path
+        assert window.experiment_name.text() == "remembered_campaign"
+        assert Path(window.output_directory.text()) == project.runs_directory
+        window._settings_enabled = False
+        window._project = None
 
     window.close()
     application.processEvents()

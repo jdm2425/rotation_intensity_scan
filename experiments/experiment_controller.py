@@ -16,12 +16,13 @@ Responsibilities
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import logging
 
 from acquisition.acquisition import Acquisition
 from data.data_writer import DataWriter
 from experiments.scan_runner import ScanRunner
+from experiments.waveplate_calibration import snapshot_calibration_for_experiment
 from hardware.hardware_manager import HardwareManager
 from monitor.experiment_monitor import ExperimentMonitor
 from plotting.plot_manager import PlotManager
@@ -131,8 +132,26 @@ class ExperimentController:
                 experiment_name=self.config.saving.experiment_name,
             ) as writer:
 
+                calibration_snapshot = snapshot_calibration_for_experiment(
+                    self.config.target_power.calibration_path,
+                    writer.experiment_directory,
+                )
+                config_record = asdict(self.config)
+                if calibration_snapshot is not None:
+                    self.experiment.target_power_config = replace(
+                        self.config.target_power,
+                        calibration_path=calibration_snapshot,
+                    )
+                    target_power_record = config_record["target_power"]
+                    target_power_record["calibration_path"] = None
+                    target_power_record["calibration_file"] = (
+                        calibration_snapshot.relative_to(
+                            writer.experiment_directory
+                        ).as_posix()
+                    )
+
                 writer.save_metadata(
-                    config=self.config,
+                    config=config_record,
                     hardware_info=hardware.summary(),
                     extra_metadata={
                         "experimental_metadata": asdict(

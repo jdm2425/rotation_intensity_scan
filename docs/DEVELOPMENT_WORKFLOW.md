@@ -13,19 +13,34 @@ python -m tests.test_gui_spectrometer_backend
 python -m tests.test_gui_widgets
 python -m tests.test_pi_reference_workflow
 python -m tests.test_ocean_sr_health
+python -m tests.test_campaign_project
+python -m tests.test_start_gui
 ```
 
 The first test uses synthetic spectra and temporary-directory persistence. The
 spectrometer-backend test injects a fake Ocean SR and verifies single-threaded
 ownership, live acquisition, saving, and capability rejection. The widget test
 uses the offscreen Qt platform and requires `requirements-gui.txt`. No test
-connects hardware. Launching starts in Simulation mode; selecting Hardware is
-also inert, but pressing `Connect alignment devices` attempts physical shutter,
-rotation-stage, and Ocean SR connections.
+connects hardware. Launching starts in Hardware mode without connecting
+anything; selecting Hardware is also inert, but pressing `Connect alignment
+devices` attempts physical shutter, rotation-stage, and Ocean SR connections.
+
+For routine setup and launch, run `python start_gui.py`. The standard-library
+launcher creates/reuses `.venv`, satisfies the appropriate requirement files,
+runs dependency and import checks, and starts the GUI through the environment's
+interpreter. `--gui-only` skips hardware Python packages and `--check-only`
+performs preparation without opening the application. Neither preflight path
+imports a hardware driver or connects a device.
 
 The Ocean SR test injects fake implementations of the SeaBreeze API and covers
 `pyseabreeze`, `cseabreeze`/`seabreeze`, and `auto` fallback. Importing the
 driver and running this test do not import a vendor backend or enumerate USB.
+
+`tests.test_campaign_project` moves a complete project tree between two
+temporary "computers" and verifies that its run and calibration paths still
+resolve. It also rejects paths which escape the project directory. The GUI
+simulation regression verifies that a selected calibration is copied into the
+experiment and recorded with a relative path.
 
 `tests.test_gui_widgets` also iterates across all tabs at 1920×1080 and calls
 the window's layout audit. It rejects clipped button labels, undersized visible

@@ -5,7 +5,36 @@
 
 ## Campaign GUI
 
-A campaign GUI is implemented under `gui/` and launched by `run_gui.py`. It
+Hardware and Simulation now have an explicit boundary throughout the complete
+widget tree. After all tabs are built, Hardware mode reapplies physical-device
+titles and action labels so no synthetic wording remains from widget
+construction. The worker constructs `SpectrometerCampaignBackend` at startup;
+`SimulatedCampaignBackend` is constructed only after the operator selects
+Simulation. GUI probe defaults come from `POWER_METER_STAGE` rather than a
+second hard-coded representation, and hardware power/probe logs no longer
+describe physical operations as simulated.
+
+Hardware Ocean SR live view requires its actual dependencies: the connected
+spectrometer and a connected PI stage reporting the probe at the configured out
+position. Missing sample/waveplate stages or Ophir meter no longer disable live
+view. The backend retains the live probe-out guard. Calibration similarly
+depends only on waveplate, shutter, PI stage, and Ophir connections; it does not
+require the spectrometer or second rotation stage.
+
+Saved Data manages portable `.risproject` campaign files. A project stores
+relative paths and scan settings, with sibling `*_data/runs`, `calibrations`,
+and `live_spectra` directories. It is atomically saved before runs, records a
+new run immediately when its directory is created, remembers the active
+calibration, reopens the last project at GUI startup, and loads its latest run
+summary. Calibration files selected for acquisition are also snapshotted into
+each experiment and referenced relatively from `config.json`.
+
+A campaign GUI is implemented under `gui/` and launched directly by
+`run_gui.py`. The recommended `start_gui.py` entry point creates/reuses the
+project `.venv`, installs and checks the applicable GUI/hardware Python
+requirements, and then invokes `run_gui.py` with that interpreter. It does not
+import drivers or connect devices during preflight; vendor runtimes still use
+their vendor installers. The GUI
 starts in Hardware mode but performs no automatic connection. Hardware mode owns the Ocean SR, waveplate
 and sample stages, and shutter; drivers are imported lazily on an
 operator-requested connection. Selecting Hardware mode alone connects nothing.
@@ -236,7 +265,7 @@ error bars (sample standard deviation divided by the square root of the number
 of spectra). This path has been verified only with hardware-free tests; no live
 spectrometer or scan was run for this change.
 
-Last reviewed: 25 September 2026
+Last reviewed: 2 October 2026
 
 Update this file whenever a feature is verified, abandoned, or materially redesigned.
 
@@ -366,6 +395,9 @@ The writer:
   `power_measurements.json`, with no object arrays or pickle.
 * Validates saved summary fields against raw trace statistics and enforces
   attempt/trace referential integrity.
+* Saves NumPy archives through flushed atomic replacement, `fsync`s the CSV
+  after every measurement, and maintains atomic `run_state.json` status so an
+  interrupted multi-day session is distinguishable from a clean close.
 
 The loader:
 

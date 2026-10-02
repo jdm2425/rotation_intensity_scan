@@ -1,7 +1,8 @@
-"""Spectrometer-only campaign backend with lazy real-driver construction."""
+"""Physical campaign backend with lazy, operator-triggered driver construction."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -18,7 +19,10 @@ from analysis.measurement import Measurement
 from data.data_writer import DataWriter
 from data.power_measurement import PowerMeasurementAttempt
 from experiments.power_targeting import TargetPowerController
-from experiments.waveplate_calibration import MalusLawCalibration
+from experiments.waveplate_calibration import (
+    MalusLawCalibration,
+    snapshot_calibration_for_experiment,
+)
 from gui.state import (
     ConnectionState,
     DeviceSnapshot,
@@ -97,7 +101,7 @@ class PIReferenceRequired(RuntimeError):
 
 
 class SpectrometerCampaignBackend:
-    """Own the staged subset of real hardware enabled in the campaign GUI."""
+    """Own only real laboratory devices while Hardware mode is selected."""
 
     ROTATION_READBACK_TOLERANCE_DEG = 0.05
 
@@ -582,6 +586,7 @@ class SpectrometerCampaignBackend:
         publish,
         *,
         publish_log=None,
+        publish_run_directory=None,
     ) -> float:
         """Run one persisted, bounded manual target-power feedback operation."""
 
@@ -609,6 +614,16 @@ class SpectrometerCampaignBackend:
                 output_directory=request.output_directory,
                 experiment_name=run_name,
             ) as writer:
+                if publish_run_directory is not None:
+                    publish_run_directory(str(writer.experiment_directory.resolve()))
+                calibration_snapshot = snapshot_calibration_for_experiment(
+                    request.power_calibration_path,
+                    writer.experiment_directory,
+                )
+                run_request = replace(
+                    request,
+                    power_calibration_path=calibration_snapshot,
+                )
                 writer.save_metadata(
                     config={
                         "operation": "manual_target_power",
@@ -619,7 +634,13 @@ class SpectrometerCampaignBackend:
                         "target_tolerance_mw": request.target_tolerance_mw,
                         "target_maximum_iterations": request.target_maximum_iterations,
                         "target_minimum_angle_step_deg": request.target_minimum_angle_step_deg,
-                        "power_calibration_path": request.power_calibration_path,
+                        "power_calibration_file": (
+                            None
+                            if calibration_snapshot is None
+                            else calibration_snapshot.relative_to(
+                                writer.experiment_directory
+                            ).as_posix()
+                        ),
                     },
                     hardware_info={
                         device.key: {
@@ -632,7 +653,7 @@ class SpectrometerCampaignBackend:
                 )
                 log(f"Saving manual target-power traces to {writer.experiment_directory}")
                 waveplate_angle, _, trace = self._target_power_block(
-                    request=request,
+                    request=run_request,
                     target_power_mw=request.target_power_mw,
                     writer=writer,
                     publish_snapshot=publish,
@@ -769,6 +790,14 @@ class SpectrometerCampaignBackend:
             ) as writer:
                 if publish_run_directory is not None:
                     publish_run_directory(str(writer.experiment_directory.resolve()))
+                calibration_snapshot = snapshot_calibration_for_experiment(
+                    request.power_calibration_path,
+                    writer.experiment_directory,
+                )
+                run_request = replace(
+                    request,
+                    power_calibration_path=calibration_snapshot,
+                )
                 writer.save_metadata(
                     config={
                         "simulation": False,
@@ -793,7 +822,13 @@ class SpectrometerCampaignBackend:
                         "target_tolerance_mw": request.target_tolerance_mw,
                         "target_maximum_iterations": request.target_maximum_iterations,
                         "target_minimum_angle_step_deg": request.target_minimum_angle_step_deg,
-                        "power_calibration_path": request.power_calibration_path,
+                        "power_calibration_file": (
+                            None
+                            if calibration_snapshot is None
+                            else calibration_snapshot.relative_to(
+                                writer.experiment_directory
+                            ).as_posix()
+                        ),
                         "driving_wavelength_nm": request.driving_wavelength_nm,
                         "harmonic_windows": [
                             {
@@ -840,7 +875,7 @@ class SpectrometerCampaignBackend:
                     if request.intensity_mode == "target_power_mw":
                         target_power_mw = float(intensity_value)
                         waveplate_angle, attempt, trace = self._target_power_block(
-                            request=request,
+                            request=run_request,
                             target_power_mw=target_power_mw,
                             writer=writer,
                             publish_snapshot=publish_snapshot,

@@ -1,4 +1,4 @@
-"""Qt worker that owns the simulated backend outside the GUI thread."""
+"""Qt worker that exclusively owns the selected real or simulated backend."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from gui.simulated_backend import SimulatedCampaignBackend
 from gui.spectrometer_backend import PIReferenceRequired, SpectrometerCampaignBackend
 from gui.state import CalibrationRequest, LiveViewRequest, ScanRequest, TargetPowerRequest
+from hardware.config import POWER_METER_STAGE
 
 
 class HardwareWorker(QObject):
@@ -36,8 +37,8 @@ class HardwareWorker(QObject):
         self.operator_settings = {
             "rotation_readback_tolerance_deg": 0.05,
             "saturation_warning_counts": 65_535.0,
-            "probe_in_position_mm": 12.0,
-            "probe_out_position_mm": -12.0,
+            "probe_in_position_mm": float(POWER_METER_STAGE.in_position_mm),
+            "probe_out_position_mm": float(POWER_METER_STAGE.out_position_mm),
             "power_measurement_duration_s": 10.0,
             "power_settle_time_s": 3.0,
             "power_poll_interval_s": 0.1,
@@ -299,7 +300,7 @@ class HardwareWorker(QObject):
     @Slot(bool)
     def set_probe_out(self, out: bool) -> None:
         self._execute(
-            "Move simulated probe",
+            "Move power probe",
             lambda: self.backend.set_probe(
                 out=out,
                 publish=self.snapshot_changed.emit,
@@ -308,13 +309,23 @@ class HardwareWorker(QObject):
 
     @Slot(object)
     def set_power(self, request: float | TargetPowerRequest) -> None:
-        self._execute(
-            "Set target power",
-            lambda: self.backend.set_power(
+        def operation():
+            if isinstance(request, TargetPowerRequest):
+                return self.backend.set_power(
+                    request,
+                    self.snapshot_changed.emit,
+                    publish_log=self.log_message.emit,
+                    publish_run_directory=self.run_directory_changed.emit,
+                )
+            return self.backend.set_power(
                 request,
                 self.snapshot_changed.emit,
                 publish_log=self.log_message.emit,
-            ),
+            )
+
+        self._execute(
+            "Set target power",
+            operation,
         )
 
     @Slot()
@@ -322,10 +333,10 @@ class HardwareWorker(QObject):
         try:
             value = self.backend.measure_power(self.snapshot_changed.emit)
         except Exception as error:
-            self.operation_failed.emit(f"Measure simulated power failed: {error}")
+            self.operation_failed.emit(f"Measure incident power failed: {error}")
         else:
             self.log_message.emit(
-                f"Simulated incident power measured: {value:.3f} mW."
+                f"Incident power measured: {value:.3f} mW."
             )
 
     @Slot(object)

@@ -6,7 +6,7 @@ Save complete experiments to disk.
 Each experiment is stored in its own timestamped directory:
 
     results/
-        ExperimentName_YYYYMMDD_HHMMSS/
+        ExperimentName_YYYYMMDD_HHMMSS_ffffff/
             metadata.json
             config.json
             hardware.json
@@ -89,7 +89,7 @@ class DataWriter:
         self.experiment_name = str(experiment_name)
 
         timestamp = datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
+            "%Y%m%d_%H%M%S_%f"
         )
 
         self.root = (
@@ -120,6 +120,7 @@ class DataWriter:
 
         self._csv_file = None
         self._csv_writer = None
+        self._opened_at = ""
 
     # ------------------------------------------------------------------
     # Context manager
@@ -152,6 +153,9 @@ class DataWriter:
 
         self._csv_writer.writeheader()
         self._csv_file.flush()
+        os.fsync(self._csv_file.fileno())
+        self._opened_at = datetime.now().isoformat()
+        self._write_run_state("open")
 
         return self
 
@@ -162,7 +166,20 @@ class DataWriter:
         traceback,
     ) -> bool:
 
-        self.close()
+        try:
+            try:
+                self._write_run_state(
+                    "closed" if exc_type is None else "failed",
+                    error=None if exc_value is None else str(exc_value),
+                )
+            except Exception:
+                # Never hide the acquisition exception with a secondary status
+                # bookkeeping failure. A clean exit still reports the write
+                # failure because no earlier exception needs preserving.
+                if exc_type is None:
+                    raise
+        finally:
+            self.close()
 
         return False
 
@@ -388,7 +405,7 @@ class DataWriter:
             self.spectra_directory / filename
         )
 
-        np.savez_compressed(
+        self._write_npz(
             filepath,
             wavelengths=wavelengths,
             intensities=intensities,
@@ -544,6 +561,8 @@ class DataWriter:
         # Flush after every measurement so completed data survive
         # if a later acquisition fails or the scan is interrupted.
         self._csv_file.flush()
+        os.fsync(self._csv_file.fileno())
+        self._write_run_state("open")
 
         return filepath
 
@@ -587,7 +606,7 @@ class DataWriter:
         filename = f"power_{len(self._power_trace_records) + 1:06d}.npz"
         filepath = self.power_measurements_directory / filename
 
-        np.savez_compressed(
+        self._write_npz(
             filepath,
             batch_sizes=batch_sizes,
             batch_index=np.asarray(
@@ -713,6 +732,7 @@ class DataWriter:
             self._power_attempt_records.pop()
             self._power_attempt_objects.pop(attempt_id, None)
             raise
+        self._write_run_state("open")
 
     @staticmethod
     def _validate_power_summary(measurement, trace) -> None:
@@ -809,7 +829,7 @@ class DataWriter:
 
         filepath = self.backgrounds_directory / filename
 
-        np.savez_compressed(
+        self._write_npz(
             filepath,
             wavelengths=wavelengths,
             intensities=intensities,
@@ -844,6 +864,7 @@ class DataWriter:
             "backgrounds.json",
             {"backgrounds": self._background_records},
         )
+        self._write_run_state("open")
 
         return filepath
 
@@ -861,6 +882,7 @@ class DataWriter:
 
         try:
             self._csv_file.flush()
+            os.fsync(self._csv_file.fileno())
 
         finally:
             self._csv_file.close()
@@ -910,6 +932,33 @@ class DataWriter:
             file.flush()
             os.fsync(file.fileno())
 
+        temporary_path.replace(filepath)
+
+    def _write_run_state(self, status: str, *, error: str | None = None) -> None:
+        """Atomically record whether a run is open, closed, or failed."""
+
+        self._write_json(
+            "run_state.json",
+            {
+                "status": str(status),
+                "opened": self._opened_at,
+                "updated": datetime.now().isoformat(),
+                "measurement_count": self._measurement_number,
+                "power_attempt_count": len(self._power_attempt_records),
+                "power_trace_count": len(self._power_trace_records),
+                "error": error,
+            },
+        )
+
+    @staticmethod
+    def _write_npz(filepath: Path, **arrays: Any) -> None:
+        """Write one pickle-free NumPy archive using an atomic replacement."""
+
+        temporary_path = filepath.with_suffix(filepath.suffix + ".tmp")
+        with temporary_path.open("wb") as file:
+            np.savez_compressed(file, **arrays)
+            file.flush()
+            os.fsync(file.fileno())
         temporary_path.replace(filepath)
 
     @classmethod

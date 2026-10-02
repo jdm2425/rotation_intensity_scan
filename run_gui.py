@@ -1,4 +1,4 @@
-"""Launch the campaign graphical interface in safe simulation mode."""
+"""Launch the campaign GUI without automatically connecting any hardware."""
 
 from __future__ import annotations
 

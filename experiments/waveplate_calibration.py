@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -62,13 +63,40 @@ class MalusLawCalibration:
         return float(angles[index])
 
     def save(self, path: Path) -> None:
-        with Path(path).open("w", encoding="utf-8") as file:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = destination.with_suffix(destination.suffix + ".tmp")
+        with temporary_path.open("w", encoding="utf-8") as file:
             json.dump(asdict(self), file, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary_path.replace(destination)
 
     @classmethod
     def load(cls, path: Path):
         with Path(path).open("r", encoding="utf-8") as file:
             return cls(**json.load(file))
+
+
+def snapshot_calibration_for_experiment(
+    calibration_path: str | Path | None,
+    experiment_directory: str | Path,
+) -> Path | None:
+    """Save a validated, self-contained calibration copy with one run.
+
+    The returned path is inside the experiment directory.  The calibration's
+    original ``source`` remains provenance text only; acquisition never needs
+    that source file when the experiment is moved to another computer.
+    """
+
+    if calibration_path is None:
+        return None
+    calibration = MalusLawCalibration.load(Path(calibration_path))
+    destination = (
+        Path(experiment_directory) / "calibration" / "malus_calibration.json"
+    )
+    calibration.save(destination)
+    return destination
 
 
 def fit_malus_calibration(

@@ -27,12 +27,30 @@ starts in Hardware mode but connects nothing until the operator explicitly
 requests it. Simulation mode remains available and uses synthetic device state
 and spectra while exercising the real measurement persistence format.
 
-Install and launch:
+Recommended setup and launch (from the repository root):
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
-.\.venv\Scripts\python.exe run_gui.py
+python start_gui.py
 ```
+
+`start_gui.py` requires Python 3.11 or newer. It creates or repairs `.venv`,
+uses pip to satisfy `requirements-gui.txt` and, on Windows,
+`requirements-hardware.txt`, runs `pip check`, verifies the GUI import, and
+launches `run_gui.py` with the virtual-environment interpreter. This direct use
+of the interpreter is equivalent to activation for the launched process, so no
+activation command is needed. Useful variants are:
+
+```powershell
+python start_gui.py --gui-only
+python start_gui.py --check-only
+```
+
+`--gui-only` skips physical-device Python packages. On non-Windows systems this
+mode is selected automatically because the hardware stack contains Windows-only
+drivers. `--check-only` installs/checks dependencies but does not open the GUI.
+The script cannot install vendor runtimes (Kinesis, SeaBreeze, PI Software
+Suite, or Ophir StarLab); install those separately for the corresponding
+physical devices. Preflight imports no hardware driver and connects nothing.
 
 The title and banner must say `HARDWARE` at startup. The operating-mode
 selector offers `Hardware`. Selecting it does not connect;
@@ -54,6 +72,13 @@ hardware-validated. Do not use them without an approved, supervised test.
 Probe, power, angle-scan, and bounded closed-loop target-power controls are
 enabled.
 
+Hardware-mode controls and logs refer only to physical devices; synthetic
+actions are available only after explicitly selecting Simulation. Ocean SR live
+view requires the connected spectrometer and a connected PI stage with the
+probe live-verified out. It does not require the unrelated sample/waveplate
+stage or Ophir connection. Calibration requires waveplate, shutter, PI stage,
+and Ophir only.
+
 `Open shutter` and `Close shutter` controls are present on both Devices and
 Alignment. Close is enabled whenever the shutter is connected. Open proceeds
 directly when probe-out is live-verified. If it is unknown or not out, a stopped
@@ -65,8 +90,9 @@ The PI stage can be moved to any absolute position within the intersection of
 the configured application envelope and controller-reported live limits. Each
 move requires confirmation, closes and verifies the shutter first, and verifies
 final readback. Settings contains insertion and retraction positions; defaults
-are `+12 mm` and `-12 mm`. Changing them affects GUI classification and guarded
-probe actions but does not expand travel limits.
+come directly from the reviewed `POWER_METER_STAGE` configuration (currently
+candidate values `+1 mm` and `-1 mm`). Changing them affects GUI classification
+and guarded probe actions but does not expand travel limits.
 
 If PI connection reports axis 1 unreferenced, the GUI retains the controller
 and shutter connection, logs `PI REFERENCE REQUIRED`, and automatically offers
@@ -130,6 +156,17 @@ and the growing CSV, recommends the largest monotonic branch, saves the map and
 `malus_calibration.json`, returns the waveplate to its starting angle, and
 copies the recommended settings into Scan Setup. The laser-off Simulation mode
 exercises the same GUI and output products with deterministic power values.
+
+The Saved Data tab can create or open a `.risproject` campaign file. By default
+the new-project dialog starts under `results/`. The JSON manifest and its sibling
+`*_data` directory must be moved together; all manifest references are relative,
+so the complete pair opens on another PC. The data directory contains separate
+`runs`, `calibrations`, and `live_spectra` folders. The last opened project is
+reopened on the same PC at startup and its latest run summary is selected.
+Project state is saved before acquisition and whenever a run or calibration is
+created. Runs with an existing `measurements.csv` are rediscovered if a crash
+prevented their manifest update. Each run also snapshots its selected Malus
+calibration and records the relative `calibration/malus_calibration.json` path.
 
 The `Live Run` tab displays replicate-mean spectra with SEM bands and integrated
 signal curves with SEM error bars, separated by target power or waveplate

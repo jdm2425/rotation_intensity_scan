@@ -8,6 +8,7 @@ losing spectrum data or metadata.
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -145,6 +146,14 @@ def main() -> None:
             experiment_directory = writer.experiment_directory
 
         print(f"Saved to: {experiment_directory}")
+
+        with (experiment_directory / "run_state.json").open(
+            "r", encoding="utf-8"
+        ) as file:
+            run_state = json.load(file)
+        assert run_state["status"] == "closed"
+        assert run_state["measurement_count"] == len(originals)
+        assert not tuple(experiment_directory.rglob("*.tmp"))
 
         dataset = load_experiment(
             experiment_directory
